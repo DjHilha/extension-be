@@ -20,6 +20,31 @@ let tasksData = {
 
 let trailQueue = [];
 
+let wallets = {};
+
+function normalizeViewer(viewer) {
+    return String(viewer || "")
+        .trim()
+        .toLowerCase();
+}
+
+function getWallet(viewer) {
+    const key = normalizeViewer(viewer);
+
+    if (!key) {
+        return null;
+    }
+
+    if (!wallets[key]) {
+        wallets[key] = {
+            viewer: key,
+            dirt: 0
+        };
+    }
+
+    return wallets[key];
+}
+
 function requireApiKey(req, res, next) {
     const key = req.headers["x-api-key"];
 
@@ -78,6 +103,106 @@ app.post("/tasks", requireApiKey, (req, res) => {
         ok: true,
         active: tasksData.active,
         count: tasksData.tasks.length
+    });
+});
+
+app.get("/wallet/:viewer", (req, res) => {
+    const wallet = getWallet(req.params.viewer);
+
+    if (!wallet) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing viewer"
+        });
+    }
+
+    res.json({
+        ok: true,
+        viewer: wallet.viewer,
+        dirt: wallet.dirt
+    });
+});
+
+app.post("/wallet/add", requireApiKey, (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const amount = Number(req.body.amount || 0);
+    const reason = String(req.body.reason || "manual");
+
+    if (!viewer) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing viewer"
+        });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({
+            ok: false,
+            error: "Invalid amount"
+        });
+    }
+
+    const wallet = getWallet(viewer);
+
+    wallet.dirt += Math.floor(amount);
+
+    console.log(
+        `[WALLET] +${Math.floor(amount)} Dirt to ${viewer} | Reason: ${reason} | Balance: ${wallet.dirt}`
+    );
+
+    res.json({
+        ok: true,
+        viewer: wallet.viewer,
+        dirt: wallet.dirt,
+        added: Math.floor(amount),
+        reason
+    });
+});
+
+app.post("/wallet/spend", requireApiKey, (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const amount = Number(req.body.amount || 0);
+    const reason = String(req.body.reason || "spend");
+
+    if (!viewer) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing viewer"
+        });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({
+            ok: false,
+            error: "Invalid amount"
+        });
+    }
+
+    const wallet = getWallet(viewer);
+    const cost = Math.floor(amount);
+
+    if (wallet.dirt < cost) {
+        return res.status(400).json({
+            ok: false,
+            error: "Not enough Dirt",
+            viewer: wallet.viewer,
+            dirt: wallet.dirt,
+            required: cost
+        });
+    }
+
+    wallet.dirt -= cost;
+
+    console.log(
+        `[WALLET] -${cost} Dirt from ${viewer} | Reason: ${reason} | Balance: ${wallet.dirt}`
+    );
+
+    res.json({
+        ok: true,
+        viewer: wallet.viewer,
+        dirt: wallet.dirt,
+        spent: cost,
+        reason
     });
 });
 
