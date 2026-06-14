@@ -82,28 +82,24 @@ app.post("/tasks", requireApiKey, (req, res) => {
 });
 
 app.post("/shop/trail", (req, res) => {
-    const viewer = String(req.body.viewer || "").trim();
-    const color = String(req.body.color || "").trim().toLowerCase();
 
-    const allowedColors = new Set([
-        "white",
-        "orange",
-        "magenta",
-        "light_blue",
-        "yellow",
-        "lime",
-        "pink",
-        "cyan",
-        "purple",
-        "blue",
-        "gold",
-        "green",
-        "red",
-        "black",
-        "gray",
-        "light_gray",
-        "brown"
-    ]);
+    const viewer =
+            String(req.body.viewer || "").trim();
+
+    const trailType =
+            Number(req.body.trailType);
+
+    const color =
+            Number(req.body.color);
+
+    const trailTypeName =
+            String(req.body.trailTypeName || "").trim();
+
+    const colorName =
+            String(req.body.colorName || "").trim();
+
+    const allowedTrailTypes =
+            new Set([0, 1, 2, 3]);
 
     if (!viewer) {
         return res.status(400).json({
@@ -112,21 +108,39 @@ app.post("/shop/trail", (req, res) => {
         });
     }
 
-    if (!allowedColors.has(color)) {
+    if (!allowedTrailTypes.has(trailType)) {
         return res.status(400).json({
             ok: false,
-            error: "Invalid trail color"
+            error: "Invalid trail type"
+        });
+    }
+
+    if (Number.isNaN(color)) {
+        return res.status(400).json({
+            ok: false,
+            error: "Invalid color"
         });
     }
 
     const request = {
         id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+
         viewer,
+
+        trailType,
+        trailTypeName,
+
         color,
+        colorName,
+
         createdAt: new Date().toISOString()
     };
 
     trailQueue.push(request);
+
+    console.log(
+        `[SHOP] ${viewer} bought ${colorName} ${trailTypeName}`
+    );
 
     res.json({
         ok: true,
@@ -142,9 +156,13 @@ app.get("/shop/trail/queue", requireApiKey, (req, res) => {
 });
 
 app.post("/shop/trail/queue/clear", requireApiKey, (req, res) => {
-    const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+    const ids =
+            Array.isArray(req.body.ids)
+                    ? req.body.ids
+                    : [];
 
-    trailQueue = trailQueue.filter(item => !ids.includes(item.id));
+    trailQueue =
+            trailQueue.filter(item => !ids.includes(item.id));
 
     res.json({
         ok: true,
