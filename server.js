@@ -10,6 +10,7 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 const PRICES = {
+    CREATE_COMPANION: 1000,
     BUY_TRAIL: 100,
     BUY_RELIC: 125,
     BUY_ANCIENT_RELIC: 200,
@@ -245,6 +246,54 @@ app.post("/wallet/spend", requireApiKey, (req, res) => {
     }
 
     res.json(result);
+});
+
+app.post("/shop/create-companion", (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const companionName = String(req.body.companionName || "").trim();
+
+    if (!viewer || !companionName) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing viewer or companion name"
+        });
+    }
+
+    const alreadyExists =
+        Array.isArray(companionsData.companions)
+            && companionsData.companions.some(companion =>
+                String(companion.name || "").toLowerCase() === companionName.toLowerCase()
+            );
+
+    if (alreadyExists) {
+        return res.status(400).json({
+            ok: false,
+            error: "A companion with that name already exists"
+        });
+    }
+
+    const spend = spendDirt(
+        viewer,
+        PRICES.CREATE_COMPANION,
+        "create_companion"
+    );
+
+    if (!spend.ok) {
+        return res.status(400).json(spend);
+    }
+
+    const request = queueShopAction({
+        action: "create_companion",
+        viewer,
+        companionName,
+        cost: PRICES.CREATE_COMPANION
+    });
+
+    res.json({
+        ok: true,
+        request,
+        wallet: spend
+    });
 });
 
 app.post("/shop/buy-trail", (req, res) => {
