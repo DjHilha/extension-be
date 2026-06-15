@@ -21,7 +21,10 @@ const PRICES = {
     BUY_RELIC: 125,
     BUY_ANCIENT_RELIC: 200,
     REROLL_RELIC: 150,
-    REROLL_ANCIENT_RELIC: 200
+    REROLL_ANCIENT_RELIC: 200,
+    BOTTLE_RHUM: 100,
+    PAY_DEBT: 300,
+    REROLL_LEGENDARY: 500
 };
 
 let companionsData = { companions: [] };
@@ -481,7 +484,7 @@ app.post("/shop/buy-trail", (req, res) => {
     if (Number.isNaN(color)) return res.status(400).json({ ok: false, error: "Invalid color" });
     const spend = spendDirt(viewer, PRICES.BUY_TRAIL, "buy_trail");
     if (!spend.ok) return res.status(400).json(spend);
-    const request = queueShopAction({ action: "buy_trail", viewer, companionName, trailType, trailTypeName, color, colorName, cost: PRICES.BUY_TRAIL });
+    const request = queueShopAction({ action: "buy_trail", viewer, companionName, trailType, trailTypeName, color, colorName, slot: Number.isInteger(Number(req.body.slot)) ? Number(req.body.slot) : -1, cost: PRICES.BUY_TRAIL });
     res.json({ ok: true, request, wallet: spend });
 });
 app.post("/shop/trail", (req, res) => { req.body.companionName = req.body.companionName || req.body.viewer; return app._router.handle({ ...req, url: "/shop/buy-trail", method: "POST" }, res, () => {}); });
@@ -525,6 +528,65 @@ app.post("/shop/reroll-ancient-relic", (req, res) => {
     const request = queueShopAction({ action: "reroll_ancient_relic", viewer, companionName, slot, cost: PRICES.REROLL_ANCIENT_RELIC });
     res.json({ ok: true, request, wallet: spend });
 });
+
+function createPaidShopRoute(path, actionName, price, extraBuilder) {
+    app.post(path, (req, res) => {
+        const viewer = normalizeViewer(req.body.viewer);
+        const companionName = String(req.body.companionName || req.body.viewer || "").trim();
+        if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
+
+        const spend = spendDirt(viewer, price, actionName);
+        if (!spend.ok) return res.status(400).json(spend);
+
+        const extra = extraBuilder ? extraBuilder(req) : {};
+        const request = queueShopAction({ action: actionName, viewer, companionName, cost: price, ...extra });
+        res.json({ ok: true, request, wallet: spend });
+    });
+}
+
+createPaidShopRoute("/shop/bottle-rhum", "bottle_rhum", PRICES.BOTTLE_RHUM);
+createPaidShopRoute("/shop/pay-debt", "pay_debt", PRICES.PAY_DEBT);
+createPaidShopRoute("/shop/reroll-legendary", "reroll_legendary", PRICES.REROLL_LEGENDARY);
+
+app.post("/shop/switch-skin", (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const companionName = String(req.body.companionName || "").trim();
+    const skinName = String(req.body.skinName || "").trim();
+    if (!viewer || !companionName || !skinName) return res.status(400).json({ ok: false, error: "Missing viewer, companion, or skin" });
+    const request = queueShopAction({ action: "switch_skin", viewer, companionName, skinName, cost: 0 });
+    res.json({ ok: true, request });
+});
+
+app.post("/shop/crew-quarters", (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const companionName = String(req.body.companionName || "").trim();
+    if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
+    const request = queueShopAction({ action: "crew_quarters", viewer, companionName, cost: 0 });
+    res.json({ ok: true, request });
+});
+
+app.post("/shop/back-to-work", (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const companionName = String(req.body.companionName || "").trim();
+    if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
+    const request = queueShopAction({ action: "back_to_work", viewer, companionName, cost: 0 });
+    res.json({ ok: true, request });
+});
+
+let taskVotes = {};
+
+app.post("/tasks/vote", (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const vote = String(req.body.vote || "").toLowerCase();
+    if (!viewer || !["support", "doubt"].includes(vote)) return res.status(400).json({ ok: false, error: "Invalid vote" });
+    const key = "current";
+    if (!taskVotes[key]) taskVotes[key] = {};
+    if (taskVotes[key][viewer]) return res.status(400).json({ ok: false, error: "You already voted" });
+    taskVotes[key][viewer] = vote;
+    res.json({ ok: true, vote });
+});
+
+
 app.get("/shop/actions/queue", requireApiKey, (req, res) => res.json({ ok: true, queue: shopActionQueue }));
 app.post("/shop/actions/queue/clear", requireApiKey, (req, res) => {
     const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
