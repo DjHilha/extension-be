@@ -153,6 +153,43 @@ function getWallet(viewer) {
     return wallets[key];
 }
 
+function transferWalletBalance(fromViewer, toViewer) {
+    const fromKey = normalizeViewer(fromViewer);
+    const toKey = normalizeViewer(toViewer);
+
+    if (!fromKey || !toKey || fromKey === toKey) {
+        return {
+            ok: true,
+            from: fromKey,
+            to: toKey,
+            transferred: 0
+        };
+    }
+
+    const fromWallet = getWallet(fromKey);
+    const toWallet = getWallet(toKey);
+
+    const amount = Number(fromWallet.dirt || 0);
+
+    if (amount > 0) {
+        toWallet.dirt += amount;
+        fromWallet.dirt = 0;
+        saveWallets();
+
+        console.log(`[WALLET] Transferred ${amount} Dirt from ${fromKey} to ${toKey}.`);
+    }
+
+    return {
+        ok: true,
+        from: fromKey,
+        to: toKey,
+        transferred: amount,
+        fromDirt: fromWallet.dirt,
+        toDirt: toWallet.dirt
+    };
+}
+
+
 function spendDirt(viewer, amount, reason) {
     const wallet = getWallet(viewer);
     const cost = Math.floor(Number(amount || 0));
@@ -215,11 +252,60 @@ app.post("/wallet/add", requireApiKey, (req, res) => {
     console.log(`[WALLET] +${added} Dirt to ${viewer} | Reason: ${reason} | Balance: ${wallet.dirt}`);
     res.json({ ok: true, viewer: wallet.viewer, dirt: wallet.dirt, added, reason });
 });
+
+app.post("/wallet/add-all", requireApiKey, (req, res) => {
+    const amount = Number(req.body.amount || 0);
+    const reason = String(req.body.reason || "manual_all");
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({
+            ok: false,
+            error: "Invalid amount"
+        });
+    }
+
+    const added = Math.floor(amount);
+    const keys = Object.keys(wallets);
+
+    for (const key of keys) {
+        const wallet = getWallet(key);
+        wallet.dirt += added;
+    }
+
+    saveWallets();
+
+    console.log(`[WALLET] +${added} Dirt to all wallets. Count: ${keys.length} | Reason: ${reason}`);
+
+    res.json({
+        ok: true,
+        added,
+        count: keys.length,
+        reason
+    });
+});
+
 app.post("/wallet/spend", requireApiKey, (req, res) => {
     const result = spendDirt(req.body.viewer, req.body.amount, String(req.body.reason || "spend"));
     if (!result.ok) return res.status(400).json(result);
     res.json(result);
 });
+
+app.post("/wallet/transfer", requireApiKey, (req, res) => {
+    const fromViewer = normalizeViewer(req.body.fromViewer || req.body.from);
+    const toViewer = normalizeViewer(req.body.toViewer || req.body.to);
+
+    if (!fromViewer || !toViewer) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing fromViewer or toViewer"
+        });
+    }
+
+    const result = transferWalletBalance(fromViewer, toViewer);
+
+    res.json(result);
+});
+
 app.post("/wallet/reset-all", requireApiKey, (req, res) => {
     const count = Object.keys(wallets).length;
     for (const key of Object.keys(wallets)) wallets[key].dirt = 0;
@@ -468,8 +554,33 @@ app.post("/shop/create-companion", (req, res) => {
     if (alreadyExists) return res.status(400).json({ ok: false, error: "A companion with that name already exists" });
     const spend = spendDirt(viewer, PRICES.CREATE_COMPANION, "create_companion");
     if (!spend.ok) return res.status(400).json(spend);
-    const request = queueShopAction({ action: "create_companion", viewer, companionName, cost: PRICES.CREATE_COMPANION });
-    res.json({ ok: true, request, wallet: spend });
+
+    const transfer =
+            viewer.toLowerCase() !== companionName.toLowerCase()
+                    ? transferWalletBalance(viewer, companionName)
+                    : { ok: true, transferred: 0 };
+
+    const request = queueShopAction({
+        action: "create_companion",
+        viewer,
+        companionName,
+        cost: PRICES.CREATE_COMPANION,
+        transferredDirt: transfer.transferred || 0
+    });
+
+    const companionWallet = getWallet(companionName);
+
+    res.json({
+        ok: true,
+        request,
+        wallet: {
+            ok: true,
+            viewer: companionWallet.viewer,
+            dirt: companionWallet.dirt,
+            spent: spend.spent,
+            transferred: transfer.transferred || 0
+        }
+    });
 });
 app.post("/shop/buy-trail", (req, res) => {
     const viewer = normalizeViewer(req.body.viewer);
