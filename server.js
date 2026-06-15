@@ -10,6 +10,7 @@ const API_KEY = process.env.API_KEY || "change-me";
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, "data");
 const WALLETS_FILE = path.join(DATA_DIR, "wallets.json");
 const QUEUE_FILE = path.join(DATA_DIR, "shop_queue.json");
+const WATCHERS_FILE = path.join(DATA_DIR, "watchers.json");
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -27,6 +28,7 @@ let companionsData = { companions: [] };
 let tasksData = { active: false, tasks: [] };
 let shopActionQueue = [];
 let wallets = {};
+let watchers = {};
 
 function ensureDataDir() {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -62,13 +64,81 @@ function readJsonFile(file, fallback) {
 function loadPersistentData() {
     wallets = readJsonFile(WALLETS_FILE, {});
     shopActionQueue = readJsonFile(QUEUE_FILE, []);
-    console.log(`[DATA] Loaded ${Object.keys(wallets).length} wallets and ${shopActionQueue.length} queued shop actions.`);
+    watchers = readJsonFile(WATCHERS_FILE, {});
+    console.log(`[DATA] Loaded ${Object.keys(wallets).length} wallets and ${shopActionQueue.length} queued shop actions and ${Object.keys(watchers).length} watchers.`);
 }
 
 function saveWallets() { writeJsonFile(WALLETS_FILE, wallets); }
 function saveQueue() { writeJsonFile(QUEUE_FILE, shopActionQueue); }
+function saveWatchers() { writeJsonFile(WATCHERS_FILE, watchers); }
 
 function normalizeViewer(viewer) { return String(viewer || "").trim().toLowerCase(); }
+
+function nowMs() {
+    return Date.now();
+}
+
+function getWatcher(viewer) {
+    const key = normalizeViewer(viewer);
+
+    if (!key) return null;
+
+    if (!watchers[key]) {
+        watchers[key] = {
+            viewer: key,
+            twitchId: "",
+            displayName: key,
+            identityShared: false,
+            lastHeartbeatAt: 0,
+            lastRewardAt: 0,
+            pendingCheck: false,
+            checkId: "",
+            checkExpiresAt: 0,
+            sleeping: false,
+            totalWatchMinutes: 0
+        };
+
+        saveWatchers();
+    }
+
+    return watchers[key];
+}
+
+function makeCheckId() {
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function shouldSpawnAfkCheck(watcher, now) {
+    if (watcher.pendingCheck) return false;
+    if (watcher.sleeping) return false;
+
+    const lastRewardAt = Number(watcher.lastRewardAt || 0);
+
+    if (lastRewardAt <= 0) return false;
+
+    const minutesSinceReward =
+        (now - lastRewardAt) / 60000;
+
+    if (minutesSinceReward < 8) return false;
+
+    return Math.random() < 0.18;
+}
+
+function publicWatchState(watcher) {
+    return {
+        viewer: watcher.viewer,
+        displayName: watcher.displayName,
+        identityShared: !!watcher.identityShared,
+        dirt: getWallet(watcher.viewer)?.dirt || 0,
+        pendingCheck: !!watcher.pendingCheck,
+        checkId: watcher.checkId || "",
+        checkExpiresAt: watcher.checkExpiresAt || 0,
+        sleeping: !!watcher.sleeping,
+        nextRewardInMs: Math.max(0, 300000 - (nowMs() - Number(watcher.lastRewardAt || 0))),
+        totalWatchMinutes: watcher.totalWatchMinutes || 0
+    };
+}
+
 
 function getWallet(viewer) {
     const key = normalizeViewer(viewer);
@@ -163,6 +233,229 @@ app.post("/wallet/reset", requireApiKey, (req, res) => {
     console.log(`[WALLET] Reset ${viewer} to 0 Dirt.`);
     res.json({ ok: true, viewer: wallet.viewer, dirt: wallet.dirt });
 });
+
+
+app.post("/watch/identity", (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const twitchId = String(req.body.twitchId || "").trim();
+    const displayName = String(req.body.displayName || viewer).trim();
+
+    if (!viewer) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing viewer"
+        });
+    }
+
+    const watcher = getWatcher(viewer);
+
+    watcher.twitchId = twitchId;
+    watcher.displayName = displayName || viewer;
+    watcher.identityShared = true;
+    watcher.sleeping = false;
+
+    saveWatchers();
+
+    res.json({
+        ok: true,
+        watch: publicWatchState(watcher)
+    });
+});
+
+app.post("/watch/heartbeat", (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const twitchId = String(req.body.twitchId || "").trim();
+    const displayName = String(req.body.displayName || viewer).trim();
+
+    if (!viewer) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing viewer"
+        });
+    }
+
+    const watcher = getWatcher(viewer);
+    const now = nowMs();
+
+    watcher.twitchId = twitchId || watcher.twitchId || "";
+    watcher.displayName = displayName || watcher.displayName || viewer;
+    watcher.identityShared = !!watcher.identityShared || !!twitchId;
+    watcher.lastHeartbeatAt = now;
+
+    if (watcher.pendingCheck && now > Number(watcher.checkExpiresAt || 0)) {
+        watcher.pendingCheck = false;
+        watcher.checkId = "";
+        watcher.checkExpiresAt = 0;
+        watcher.sleeping = true;
+        saveWatchers();
+
+        return res.json({
+            ok: true,
+            awarded: false,
+            reason: "sleeping_on_duty",
+            watch: publicWatchState(watcher)
+        });
+    }
+
+    if (watcher.sleeping) {
+        saveWatchers();
+
+        return res.json({
+            ok: true,
+            awarded: false,
+            reason: "sleeping_on_duty",
+            watch: publicWatchState(watcher)
+        });
+    }
+
+    if (watcher.pendingCheck) {
+        saveWatchers();
+
+        return res.json({
+            ok: true,
+            awarded: false,
+            reason: "afk_check_pending",
+            watch: publicWatchState(watcher)
+        });
+    }
+
+    if (shouldSpawnAfkCheck(watcher, now)) {
+        watcher.pendingCheck = true;
+        watcher.checkId = makeCheckId();
+        watcher.checkExpiresAt = now + 120000;
+        saveWatchers();
+
+        return res.json({
+            ok: true,
+            awarded: false,
+            reason: "afk_check_required",
+            watch: publicWatchState(watcher)
+        });
+    }
+
+    const lastRewardAt = Number(watcher.lastRewardAt || 0);
+
+    if (lastRewardAt <= 0) {
+        watcher.lastRewardAt = now;
+        saveWatchers();
+
+        return res.json({
+            ok: true,
+            awarded: false,
+            reason: "watch_started",
+            watch: publicWatchState(watcher)
+        });
+    }
+
+    if (now - lastRewardAt >= 300000) {
+        const wallet = getWallet(viewer);
+
+        wallet.dirt += 1;
+        watcher.lastRewardAt = now;
+        watcher.totalWatchMinutes = Number(watcher.totalWatchMinutes || 0) + 5;
+
+        saveWallets();
+        saveWatchers();
+
+        console.log(`[WATCH] +1 Dirt to ${viewer} for watchtime. Balance: ${wallet.dirt}`);
+
+        return res.json({
+            ok: true,
+            awarded: true,
+            amount: 1,
+            reason: "watchtime_5_minutes",
+            wallet,
+            watch: publicWatchState(watcher)
+        });
+    }
+
+    saveWatchers();
+
+    res.json({
+        ok: true,
+        awarded: false,
+        reason: "waiting",
+        watch: publicWatchState(watcher)
+    });
+});
+
+app.post("/watch/confirm", (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const checkId = String(req.body.checkId || "").trim();
+
+    if (!viewer) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing viewer"
+        });
+    }
+
+    const watcher = getWatcher(viewer);
+    const now = nowMs();
+
+    if (!watcher.pendingCheck) {
+        watcher.sleeping = false;
+        saveWatchers();
+
+        return res.json({
+            ok: true,
+            confirmed: true,
+            watch: publicWatchState(watcher)
+        });
+    }
+
+    if (watcher.checkId !== checkId) {
+        return res.status(400).json({
+            ok: false,
+            error: "Wrong duty check"
+        });
+    }
+
+    if (now > Number(watcher.checkExpiresAt || 0)) {
+        watcher.pendingCheck = false;
+        watcher.checkId = "";
+        watcher.checkExpiresAt = 0;
+        watcher.sleeping = true;
+        saveWatchers();
+
+        return res.status(400).json({
+            ok: false,
+            error: "Too late, sleeping on duty",
+            watch: publicWatchState(watcher)
+        });
+    }
+
+    watcher.pendingCheck = false;
+    watcher.checkId = "";
+    watcher.checkExpiresAt = 0;
+    watcher.sleeping = false;
+    watcher.lastRewardAt = now;
+
+    saveWatchers();
+
+    res.json({
+        ok: true,
+        confirmed: true,
+        watch: publicWatchState(watcher)
+    });
+});
+
+app.get("/watch/:viewer", (req, res) => {
+    const watcher = getWatcher(req.params.viewer);
+
+    if (!watcher) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing viewer"
+        });
+    }
+
+    res.json({
+        ok: true,
+        watch: publicWatchState(watcher)
+    });
+});
+
 
 app.post("/shop/create-companion", (req, res) => {
     const viewer = normalizeViewer(req.body.viewer);
