@@ -177,7 +177,13 @@ async function syncAllWalletsToSupabase() {
         return;
     }
 
-    const rows = Object.values(wallets).map(walletToSupabaseRow);
+    const rows = Object.values(wallets)
+        .filter(wallet => {
+            return String(wallet.twitchId || "").trim()
+                || String(wallet.companionName || "").trim()
+                || /^\d+$/.test(String(wallet.viewer || ""));
+        })
+        .map(walletToSupabaseRow);
 
     if (rows.length === 0) {
         return;
@@ -567,7 +573,16 @@ app.post("/wallet/add", requireApiKey, (req, res) => {
     if (!requestedViewer) return res.status(400).json({ ok: false, error: "Missing viewer" });
     if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ ok: false, error: "Invalid amount" });
 
-    const wallet = getWalletResolved(requestedViewer, true);
+    const wallet = getWalletResolved(requestedViewer, false);
+
+    if (!wallet) {
+        return res.status(404).json({
+            ok: false,
+            error: "Wallet not found. Viewer must log in with Twitch first, or the companion must be linked.",
+            requestedViewer
+        });
+    }
+
     const added = Math.floor(amount);
 
     wallet.dirt += added;
@@ -649,7 +664,16 @@ app.post("/wallet/reset-all", requireApiKey, (req, res) => {
 app.post("/wallet/reset", requireApiKey, (req, res) => {
     const viewer = normalizeViewer(req.body.viewer);
     if (!viewer) return res.status(400).json({ ok: false, error: "Missing viewer" });
-    const wallet = getWallet(viewer);
+    const wallet = getWalletResolved(viewer, false);
+
+    if (!wallet) {
+        return res.status(404).json({
+            ok: false,
+            error: "Wallet not found",
+            viewer
+        });
+    }
+
     wallet.dirt = 0;
     saveWallets();
     console.log(`[WALLET] Reset ${viewer} to 0 Dirt.`);
