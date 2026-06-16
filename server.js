@@ -12,11 +12,15 @@ const WALLETS_FILE = path.join(DATA_DIR, "wallets.json");
 const QUEUE_FILE = path.join(DATA_DIR, "shop_queue.json");
 const WATCHERS_FILE = path.join(DATA_DIR, "watchers.json");
 
+const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const USE_SUPABASE = !!(SUPABASE_URL && SUPABASE_SECRET_KEY);
+
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 const PRICES = {
-    CREATE_COMPANION: 1000,
+    CREATE_COMPANION: 500,
     BUY_TRAIL: 100,
     BUY_RELIC: 125,
     BUY_ANCIENT_RELIC: 200,
@@ -64,16 +68,170 @@ function readJsonFile(file, fallback) {
     }
 }
 
-function loadPersistentData() {
+async function loadPersistentData() {
     wallets = readJsonFile(WALLETS_FILE, {});
     shopActionQueue = readJsonFile(QUEUE_FILE, []);
     watchers = readJsonFile(WATCHERS_FILE, {});
+
+    await loadWalletsFromSupabase();
+
     console.log(`[DATA] Loaded ${Object.keys(wallets).length} wallets and ${shopActionQueue.length} queued shop actions and ${Object.keys(watchers).length} watchers.`);
 }
 
-function saveWallets() { writeJsonFile(WALLETS_FILE, wallets); }
+
+function saveWallets() {
+    writeJsonFile(WALLETS_FILE, wallets);
+    syncWalletsToSupabaseSoon();
+}
+
 function saveQueue() { writeJsonFile(QUEUE_FILE, shopActionQueue); }
 function saveWatchers() { writeJsonFile(WATCHERS_FILE, watchers); }
+
+function walletToSupabaseRow(wallet) {
+    return {
+        viewer: String(wallet.viewer || "").toLowerCase(),
+        dirt: Number(wallet.dirt || 0),
+        twitch_id: String(wallet.twitchId || ""),
+        display_name: String(wallet.displayName || wallet.viewer || ""),
+        companion_name: String(wallet.companionName || ""),
+        updated_at: wallet.updatedAt || new Date().toISOString()
+    };
+}
+
+function supabaseRowToWallet(row) {
+    const viewer = String(row.viewer || "").toLowerCase();
+
+    return {
+        viewer,
+        dirt: Number(row.dirt || 0),
+        twitchId: String(row.twitch_id || ""),
+        displayName: String(row.display_name || viewer),
+        companionName: String(row.companion_name || ""),
+        updatedAt: String(row.updated_at || new Date().toISOString())
+    };
+}
+
+async function supabaseRequest(pathname, options = {}) {
+    if (!USE_SUPABASE) {
+        throw new Error("Supabase is not configured.");
+    }
+
+    const url = SUPABASE_URL + "/rest/v1" + pathname;
+
+    const response = await fetch(url, {
+        ...options,
+        headers: {
+            apikey: SUPABASE_SECRET_KEY,
+            Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+            "Content-Type": "application/json",
+            Prefer: "return=representation",
+            ...(options.headers || {})
+        }
+    });
+
+    const text = await response.text();
+
+    if (!response.ok) {
+        throw new Error(`Supabase ${response.status}: ${text}`);
+    }
+
+    if (!text) {
+        return null;
+    }
+
+    return JSON.parse(text);
+}
+
+let walletSyncTimer = null;
+
+function syncWalletsToSupabaseSoon() {
+    if (!USE_SUPABASE) {
+        return;
+    }
+
+    if (walletSyncTimer) {
+        clearTimeout(walletSyncTimer);
+    }
+
+    walletSyncTimer = setTimeout(() => {
+        walletSyncTimer = null;
+        syncAllWalletsToSupabase().catch(error => {
+            console.error("[SUPABASE] Failed syncing wallets.", error);
+        });
+    }, 500);
+}
+
+async function syncAllWalletsToSupabase() {
+    if (!USE_SUPABASE) {
+        return;
+    }
+
+    const rows = Object.values(wallets).map(walletToSupabaseRow);
+
+    if (rows.length === 0) {
+        return;
+    }
+
+    await supabaseRequest("/wallets?on_conflict=viewer", {
+        method: "POST",
+        headers: {
+            Prefer: "resolution=merge-duplicates"
+        },
+        body: JSON.stringify(rows)
+    });
+
+    console.log(`[SUPABASE] Synced ${rows.length} wallet(s).`);
+}
+
+async function syncViewerLinkToSupabase(wallet) {
+    if (!USE_SUPABASE || !wallet) {
+        return;
+    }
+
+    const row = walletToSupabaseRow(wallet);
+
+    await supabaseRequest("/viewer_links?on_conflict=viewer", {
+        method: "POST",
+        headers: {
+            Prefer: "resolution=merge-duplicates"
+        },
+        body: JSON.stringify([row])
+    });
+
+    console.log(`[SUPABASE] Synced viewer link for ${row.viewer}.`);
+}
+
+async function loadWalletsFromSupabase() {
+    if (!USE_SUPABASE) {
+        console.log("[SUPABASE] Not configured. Using local JSON wallets.");
+        return;
+    }
+
+    try {
+        const rows = await supabaseRequest("/wallets?select=*", {
+            method: "GET"
+        });
+
+        if (!Array.isArray(rows)) {
+            return;
+        }
+
+        for (const row of rows) {
+            const wallet = supabaseRowToWallet(row);
+
+            if (wallet.viewer) {
+                wallets[wallet.viewer] = wallet;
+            }
+        }
+
+        writeJsonFile(WALLETS_FILE, wallets);
+
+        console.log(`[SUPABASE] Loaded ${rows.length} wallet(s).`);
+
+    } catch (error) {
+        console.error("[SUPABASE] Failed loading wallets. Falling back to local JSON.", error);
+    }
+}
 
 function normalizeViewer(viewer) { return String(viewer || "").trim().toLowerCase(); }
 
@@ -182,6 +340,10 @@ function updateWalletIdentity(viewer, twitchId, displayName) {
     wallet.updatedAt = new Date().toISOString();
     saveWallets();
 
+    syncViewerLinkToSupabase(wallet).catch(error => {
+        console.error("[SUPABASE] Failed syncing wallet identity.", error);
+    });
+
     return wallet;
 }
 
@@ -197,6 +359,10 @@ function linkWalletCompanion(viewer, twitchId, displayName, companionName) {
 
     wallet.updatedAt = new Date().toISOString();
     saveWallets();
+
+    syncViewerLinkToSupabase(wallet).catch(error => {
+        console.error("[SUPABASE] Failed syncing viewer link.", error);
+    });
 
     console.log(`[LINK] ${wallet.viewer} | ${wallet.displayName || "-"} | ${wallet.companionName || "-"}`);
 
@@ -309,7 +475,7 @@ function requireApiKey(req, res, next) {
     next();
 }
 
-loadPersistentData();
+// Data is loaded before the server starts at the bottom of this file.
 
 app.get("/", (req, res) => res.json({ ok: true, service: "Meowtys backend", prices: PRICES, persistence: { dataDir: DATA_DIR, wallets: Object.keys(wallets).length, queuedActions: shopActionQueue.length } }));
 app.get("/prices", (req, res) => res.json({ ok: true, prices: PRICES }));
@@ -868,6 +1034,10 @@ app.post("/wallet/alias", requireApiKey, (req, res) => {
 
     saveWallets();
 
+    syncViewerLinkToSupabase(wallet).catch(error => {
+        console.error("[SUPABASE] Failed syncing wallet alias.", error);
+    });
+
     console.log(`[WALLET] Alias set: ${identifier} -> ${displayName} | Wallet: ${wallet.viewer}`);
 
     res.json({
@@ -1010,4 +1180,11 @@ app.post("/shop/trail/queue/clear", requireApiKey, (req, res) => {
     saveQueue();
     res.json({ ok: true, remaining: shopActionQueue.length });
 });
-app.listen(PORT, () => console.log(`Meowtys backend running on port ${PORT}`));
+loadPersistentData()
+    .then(() => {
+        app.listen(PORT, () => console.log(`Meowtys backend running on port ${PORT}`));
+    })
+    .catch(error => {
+        console.error("[DATA] Failed during startup.", error);
+        app.listen(PORT, () => console.log(`Meowtys backend running on port ${PORT} with fallback data`));
+    });
