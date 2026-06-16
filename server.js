@@ -842,6 +842,41 @@ app.post("/viewer-link", (req, res) => {
     });
 });
 
+app.post("/wallet/alias", requireApiKey, (req, res) => {
+    const identifier = String(req.body.identifier || req.body.viewer || "").trim();
+    const displayName = String(req.body.displayName || req.body.twitchName || "").trim();
+
+    if (!identifier || !displayName) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing identifier or displayName"
+        });
+    }
+
+    const wallet = getWalletResolved(identifier, false);
+
+    if (!wallet) {
+        return res.status(404).json({
+            ok: false,
+            error: "Wallet not found",
+            identifier
+        });
+    }
+
+    wallet.displayName = displayName;
+    wallet.updatedAt = new Date().toISOString();
+
+    saveWallets();
+
+    console.log(`[WALLET] Alias set: ${identifier} -> ${displayName} | Wallet: ${wallet.viewer}`);
+
+    res.json({
+        ok: true,
+        wallet: publicWallet(wallet)
+    });
+});
+
+
 app.get("/wallet/resolve/:identifier", requireApiKey, (req, res) => {
     const identifier = String(req.params.identifier || "").trim();
     const wallet = getWalletResolved(identifier, false);
