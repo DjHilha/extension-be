@@ -384,15 +384,42 @@ function resolveWalletKey(identifier) {
     const wanted = normalizeViewer(identifier);
     if (!wanted) return "";
 
-    if (wallets[wanted]) {
-        return wanted;
+    /*
+     * IMPORTANT:
+     * Resolve companion/display aliases BEFORE direct wallet keys.
+     *
+     * This prevents old/fake rows like:
+     *   viewer = "hilha"
+     * from stealing rewards that should go to:
+     *   viewer = "145555184", companionName = "Hilha"
+     */
+
+    for (const [key, wallet] of Object.entries(wallets)) {
+        if (wallet.companionName && normalizeViewer(wallet.companionName) === wanted) {
+            return key;
+        }
     }
 
     for (const [key, wallet] of Object.entries(wallets)) {
-        if (normalizeViewer(wallet.viewer) === wanted) return key;
-        if (normalizeViewer(wallet.twitchId) === wanted) return key;
-        if (normalizeViewer(wallet.displayName) === wanted) return key;
-        if (normalizeViewer(wallet.companionName) === wanted) return key;
+        if (wallet.displayName && normalizeViewer(wallet.displayName) === wanted) {
+            return key;
+        }
+    }
+
+    for (const [key, wallet] of Object.entries(wallets)) {
+        if (wallet.twitchId && normalizeViewer(wallet.twitchId) === wanted) {
+            return key;
+        }
+    }
+
+    for (const [key, wallet] of Object.entries(wallets)) {
+        if (wallet.viewer && normalizeViewer(wallet.viewer) === wanted) {
+            return key;
+        }
+    }
+
+    if (wallets[wanted]) {
+        return wanted;
     }
 
     return "";
