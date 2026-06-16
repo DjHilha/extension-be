@@ -705,6 +705,7 @@ let taskVotes = {};
 
 app.post("/tasks/join", (req, res) => {
     const viewer = normalizeViewer(req.body.viewer);
+    const companionName = String(req.body.companionName || "").trim();
     const voteKey = String(req.body.voteKey || "current");
 
     if (!viewer) {
@@ -714,9 +715,17 @@ app.post("/tasks/join", (req, res) => {
         });
     }
 
+    if (!companionName) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing companionName"
+        });
+    }
+
     const request = queueShopAction({
         action: "task_join",
         viewer,
+        companionName,
         voteKey,
         cost: 0
     });
@@ -730,6 +739,7 @@ app.post("/tasks/join", (req, res) => {
 
 app.post("/tasks/vote", (req, res) => {
     const viewer = normalizeViewer(req.body.viewer);
+    const companionName = String(req.body.companionName || "").trim();
     const vote = String(req.body.vote || "").toLowerCase();
     const voteKey = String(req.body.voteKey || "current");
 
@@ -737,6 +747,13 @@ app.post("/tasks/vote", (req, res) => {
         return res.status(400).json({
             ok: false,
             error: "Invalid vote"
+        });
+    }
+
+    if (!companionName) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing companionName"
         });
     }
 
@@ -757,6 +774,7 @@ app.post("/tasks/vote", (req, res) => {
     const request = queueShopAction({
         action: "task_vote",
         viewer,
+        companionName,
         vote,
         voteKey,
         cost: 0
