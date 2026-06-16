@@ -344,6 +344,10 @@ function getWallet(viewer) {
     return wallets[key];
 }
 
+function looksLikeNumericId(value) {
+    return /^\d+$/.test(String(value || "").trim());
+}
+
 function updateWalletIdentity(viewer, twitchId, displayName) {
     const wallet = getWallet(viewer);
     if (!wallet) return null;
@@ -351,8 +355,18 @@ function updateWalletIdentity(viewer, twitchId, displayName) {
     const cleanTwitchId = String(twitchId || "").trim();
     const cleanDisplayName = String(displayName || "").trim();
 
-    if (cleanTwitchId) wallet.twitchId = cleanTwitchId;
-    if (cleanDisplayName) wallet.displayName = cleanDisplayName;
+    if (cleanTwitchId) {
+        wallet.twitchId = cleanTwitchId;
+    }
+
+    /*
+     * Twitch mobile often sends the numeric Twitch ID as displayName.
+     * Do NOT let that overwrite a real readable Twitch name set by walletalias
+     * or by the extension manual Twitch-name box.
+     */
+    if (cleanDisplayName && !looksLikeNumericId(cleanDisplayName)) {
+        wallet.displayName = cleanDisplayName;
+    }
 
     wallet.updatedAt = new Date().toISOString();
     saveWallets();
