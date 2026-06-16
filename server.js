@@ -703,9 +703,6 @@ app.post("/shop/back-to-work", (req, res) => {
 
 let taskVotes = {};
 
-
-let taskVotes = {};
-
 app.post("/tasks/join", (req, res) => {
     const viewer = normalizeViewer(req.body.viewer);
     const voteKey = String(req.body.voteKey || "current");
