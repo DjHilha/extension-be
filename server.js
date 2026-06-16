@@ -343,8 +343,16 @@ app.post("/tasks", requireApiKey, (req, res) => {
     res.json({ ok: true, active: tasksData.active, count: tasksData.tasks.length });
 });
 app.get("/wallet/:viewer", (req, res) => {
-    const wallet = getWalletResolved(req.params.viewer, true);
-    if (!wallet) return res.status(400).json({ ok: false, error: "Missing viewer" });
+    const wallet = getWalletResolved(req.params.viewer, false);
+
+    if (!wallet) {
+        return res.status(404).json({
+            ok: false,
+            error: "Wallet not found",
+            viewer: req.params.viewer
+        });
+    }
+
     res.json({ ok: true, ...publicWallet(wallet) });
 });
 app.post("/wallet/add", requireApiKey, (req, res) => {
