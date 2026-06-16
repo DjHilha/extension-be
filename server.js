@@ -146,11 +146,102 @@ function publicWatchState(watcher) {
 function getWallet(viewer) {
     const key = normalizeViewer(viewer);
     if (!key) return null;
+
     if (!wallets[key]) {
-        wallets[key] = { viewer: key, dirt: 0 };
+        wallets[key] = {
+            viewer: key,
+            dirt: 0,
+            twitchId: "",
+            displayName: key,
+            companionName: "",
+            updatedAt: new Date().toISOString()
+        };
         saveWallets();
+    } else {
+        wallets[key].viewer = wallets[key].viewer || key;
+        wallets[key].dirt = Number(wallets[key].dirt || 0);
+        wallets[key].twitchId = String(wallets[key].twitchId || "");
+        wallets[key].displayName = String(wallets[key].displayName || key);
+        wallets[key].companionName = String(wallets[key].companionName || "");
+        wallets[key].updatedAt = wallets[key].updatedAt || new Date().toISOString();
     }
+
     return wallets[key];
+}
+
+function updateWalletIdentity(viewer, twitchId, displayName) {
+    const wallet = getWallet(viewer);
+    if (!wallet) return null;
+
+    const cleanTwitchId = String(twitchId || "").trim();
+    const cleanDisplayName = String(displayName || "").trim();
+
+    if (cleanTwitchId) wallet.twitchId = cleanTwitchId;
+    if (cleanDisplayName) wallet.displayName = cleanDisplayName;
+
+    wallet.updatedAt = new Date().toISOString();
+    saveWallets();
+
+    return wallet;
+}
+
+function linkWalletCompanion(viewer, twitchId, displayName, companionName) {
+    const wallet = updateWalletIdentity(viewer, twitchId, displayName);
+    if (!wallet) return null;
+
+    const cleanCompanionName = String(companionName || "").trim();
+
+    if (cleanCompanionName) {
+        wallet.companionName = cleanCompanionName;
+    }
+
+    wallet.updatedAt = new Date().toISOString();
+    saveWallets();
+
+    console.log(`[LINK] ${wallet.viewer} | ${wallet.displayName || "-"} | ${wallet.companionName || "-"}`);
+
+    return wallet;
+}
+
+function resolveWalletKey(identifier) {
+    const wanted = normalizeViewer(identifier);
+    if (!wanted) return "";
+
+    if (wallets[wanted]) {
+        return wanted;
+    }
+
+    for (const [key, wallet] of Object.entries(wallets)) {
+        if (normalizeViewer(wallet.viewer) === wanted) return key;
+        if (normalizeViewer(wallet.twitchId) === wanted) return key;
+        if (normalizeViewer(wallet.displayName) === wanted) return key;
+        if (normalizeViewer(wallet.companionName) === wanted) return key;
+    }
+
+    return "";
+}
+
+function getWalletResolved(identifier, createIfMissing = false) {
+    const resolvedKey = resolveWalletKey(identifier);
+
+    if (resolvedKey) {
+        return getWallet(resolvedKey);
+    }
+
+    return createIfMissing ? getWallet(identifier) : null;
+}
+
+function publicWallet(wallet) {
+    if (!wallet) return null;
+
+    return {
+        viewer: wallet.viewer,
+        dirt: Number(wallet.dirt || 0),
+        twitchId: String(wallet.twitchId || ""),
+        displayName: String(wallet.displayName || wallet.viewer || ""),
+        companionName: String(wallet.companionName || ""),
+        updatedAt: String(wallet.updatedAt || "")
+    };
 }
 
 function transferWalletBalance(fromViewer, toViewer) {
@@ -252,22 +343,35 @@ app.post("/tasks", requireApiKey, (req, res) => {
     res.json({ ok: true, active: tasksData.active, count: tasksData.tasks.length });
 });
 app.get("/wallet/:viewer", (req, res) => {
-    const wallet = getWallet(req.params.viewer);
+    const wallet = getWalletResolved(req.params.viewer, true);
     if (!wallet) return res.status(400).json({ ok: false, error: "Missing viewer" });
-    res.json({ ok: true, viewer: wallet.viewer, dirt: wallet.dirt });
+    res.json({ ok: true, ...publicWallet(wallet) });
 });
 app.post("/wallet/add", requireApiKey, (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const requestedViewer = String(req.body.viewer || "").trim();
     const amount = Number(req.body.amount || 0);
     const reason = String(req.body.reason || "manual");
-    if (!viewer) return res.status(400).json({ ok: false, error: "Missing viewer" });
+
+    if (!requestedViewer) return res.status(400).json({ ok: false, error: "Missing viewer" });
     if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ ok: false, error: "Invalid amount" });
-    const wallet = getWallet(viewer);
+
+    const wallet = getWalletResolved(requestedViewer, true);
     const added = Math.floor(amount);
+
     wallet.dirt += added;
+    wallet.updatedAt = new Date().toISOString();
+
     saveWallets();
-    console.log(`[WALLET] +${added} Dirt to ${viewer} | Reason: ${reason} | Balance: ${wallet.dirt}`);
-    res.json({ ok: true, viewer: wallet.viewer, dirt: wallet.dirt, added, reason });
+
+    console.log(`[WALLET] +${added} Dirt to ${wallet.viewer} via "${requestedViewer}" | Reason: ${reason} | Balance: ${wallet.dirt}`);
+
+    res.json({
+        ok: true,
+        ...publicWallet(wallet),
+        requestedViewer,
+        added,
+        reason
+    });
 });
 
 app.post("/wallet/add-all", requireApiKey, (req, res) => {
@@ -360,10 +464,13 @@ app.post("/watch/identity", (req, res) => {
     watcher.identityShared = true;
     watcher.sleeping = false;
 
+    const wallet = updateWalletIdentity(viewer, twitchId, displayName || viewer);
+
     saveWatchers();
 
     res.json({
         ok: true,
+        wallet: publicWallet(wallet),
         watch: publicWatchState(watcher)
     });
 });
@@ -387,6 +494,8 @@ app.post("/watch/heartbeat", (req, res) => {
     watcher.displayName = displayName || watcher.displayName || viewer;
     watcher.identityShared = !!watcher.identityShared || !!twitchId;
     watcher.lastHeartbeatAt = now;
+
+    updateWalletIdentity(viewer, watcher.twitchId, watcher.displayName);
 
     if (watcher.pendingCheck && now > Number(watcher.checkExpiresAt || 0)) {
         watcher.pendingCheck = false;
@@ -572,30 +681,28 @@ app.post("/shop/create-companion", (req, res) => {
     const spend = spendDirt(viewer, PRICES.CREATE_COMPANION, "create_companion");
     if (!spend.ok) return res.status(400).json(spend);
 
-    const transfer =
-            viewer.toLowerCase() !== companionName.toLowerCase()
-                    ? transferWalletBalance(viewer, companionName)
-                    : { ok: true, transferred: 0 };
+    const linkedWallet =
+            linkWalletCompanion(
+                    viewer,
+                    req.body.twitchId || "",
+                    req.body.displayName || viewer,
+                    companionName
+            );
 
     const request = queueShopAction({
         action: "create_companion",
         viewer,
         companionName,
-        cost: PRICES.CREATE_COMPANION,
-        transferredDirt: transfer.transferred || 0
+        cost: PRICES.CREATE_COMPANION
     });
-
-    const companionWallet = getWallet(companionName);
 
     res.json({
         ok: true,
         request,
         wallet: {
             ok: true,
-            viewer: companionWallet.viewer,
-            dirt: companionWallet.dirt,
-            spent: spend.spent,
-            transferred: transfer.transferred || 0
+            ...publicWallet(linkedWallet || getWallet(viewer)),
+            spent: spend.spent
         }
     });
 });
@@ -699,6 +806,64 @@ app.post("/shop/back-to-work", (req, res) => {
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     const request = queueShopAction({ action: "back_to_work", viewer, companionName, cost: 0 });
     res.json({ ok: true, request });
+});
+
+app.post("/viewer-link", (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const twitchId = String(req.body.twitchId || "").trim();
+    const displayName = String(req.body.displayName || viewer).trim();
+    const companionName = String(req.body.companionName || "").trim();
+
+    if (!viewer) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing viewer"
+        });
+    }
+
+    const wallet = linkWalletCompanion(
+            viewer,
+            twitchId,
+            displayName,
+            companionName
+    );
+
+    res.json({
+        ok: true,
+        wallet: publicWallet(wallet)
+    });
+});
+
+app.get("/wallet/resolve/:identifier", requireApiKey, (req, res) => {
+    const identifier = String(req.params.identifier || "").trim();
+    const wallet = getWalletResolved(identifier, false);
+
+    if (!wallet) {
+        return res.status(404).json({
+            ok: false,
+            error: "Wallet not found",
+            identifier
+        });
+    }
+
+    res.json({
+        ok: true,
+        identifier,
+        wallet: publicWallet(wallet)
+    });
+});
+
+app.get("/wallets", requireApiKey, (req, res) => {
+    const list =
+            Object.values(wallets)
+                    .map(publicWallet)
+                    .sort((a, b) => String(a.displayName || a.viewer).localeCompare(String(b.displayName || b.viewer)));
+
+    res.json({
+        ok: true,
+        count: list.length,
+        wallets: list
+    });
 });
 
 let taskVotes = {};
