@@ -16,6 +16,12 @@ const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const USE_SUPABASE = !!(SUPABASE_URL && SUPABASE_SECRET_KEY);
 
+if (USE_SUPABASE) {
+    console.log("[SUPABASE] Enabled. Wallets will load from Supabase, not local JSON.");
+} else {
+    console.log("[SUPABASE] Disabled. Wallets will use local JSON and may reset on redeploy.");
+}
+
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
@@ -69,7 +75,12 @@ function readJsonFile(file, fallback) {
 }
 
 async function loadPersistentData() {
-    wallets = readJsonFile(WALLETS_FILE, {});
+    if (USE_SUPABASE) {
+        wallets = {};
+    } else {
+        wallets = readJsonFile(WALLETS_FILE, {});
+    }
+
     shopActionQueue = readJsonFile(QUEUE_FILE, []);
     watchers = readJsonFile(WATCHERS_FILE, {});
 
