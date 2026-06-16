@@ -231,7 +231,24 @@ app.post("/companions", requireApiKey, (req, res) => {
 app.get("/tasks", (req, res) => res.json(tasksData));
 app.post("/tasks", requireApiKey, (req, res) => {
     if (!req.body || typeof req.body.active !== "boolean" || !Array.isArray(req.body.tasks)) return res.status(400).json({ ok: false, error: "Expected body with active boolean and tasks array" });
+
+    const previousSignature =
+        Array.isArray(tasksData.tasks)
+            ? tasksData.tasks.map(task => task.description || "").join("|")
+            : "";
+
+    const nextSignature =
+        req.body.tasks.map(task => task.description || "").join("|");
+
     tasksData = req.body;
+
+    if (tasksData.active && !tasksData.startedAt) {
+        tasksData.startedAt =
+            previousSignature === nextSignature && tasksData.startedAt
+                ? tasksData.startedAt
+                : Date.now();
+    }
+
     res.json({ ok: true, active: tasksData.active, count: tasksData.tasks.length });
 });
 app.get("/wallet/:viewer", (req, res) => {
@@ -686,15 +703,73 @@ app.post("/shop/back-to-work", (req, res) => {
 
 let taskVotes = {};
 
+
+let taskVotes = {};
+
+app.post("/tasks/join", (req, res) => {
+    const viewer = normalizeViewer(req.body.viewer);
+    const voteKey = String(req.body.voteKey || "current");
+
+    if (!viewer) {
+        return res.status(400).json({
+            ok: false,
+            error: "Missing viewer"
+        });
+    }
+
+    const request = queueShopAction({
+        action: "task_join",
+        viewer,
+        voteKey,
+        cost: 0
+    });
+
+    res.json({
+        ok: true,
+        joined: true,
+        request
+    });
+});
+
 app.post("/tasks/vote", (req, res) => {
     const viewer = normalizeViewer(req.body.viewer);
     const vote = String(req.body.vote || "").toLowerCase();
-    if (!viewer || !["support", "doubt"].includes(vote)) return res.status(400).json({ ok: false, error: "Invalid vote" });
-    const key = "current";
-    if (!taskVotes[key]) taskVotes[key] = {};
-    if (taskVotes[key][viewer]) return res.status(400).json({ ok: false, error: "You already voted" });
-    taskVotes[key][viewer] = vote;
-    res.json({ ok: true, vote });
+    const voteKey = String(req.body.voteKey || "current");
+
+    if (!viewer || !["support", "doubt"].includes(vote)) {
+        return res.status(400).json({
+            ok: false,
+            error: "Invalid vote"
+        });
+    }
+
+    if (!taskVotes[voteKey]) {
+        taskVotes[voteKey] = {};
+    }
+
+    if (taskVotes[voteKey][viewer]) {
+        return res.json({
+            ok: true,
+            alreadyVoted: true,
+            vote: taskVotes[voteKey][viewer]
+        });
+    }
+
+    taskVotes[voteKey][viewer] = vote;
+
+    const request = queueShopAction({
+        action: "task_vote",
+        viewer,
+        vote,
+        voteKey,
+        cost: 0
+    });
+
+    res.json({
+        ok: true,
+        vote,
+        request
+    });
 });
 
 
