@@ -1160,6 +1160,8 @@ let taskVotes = {};
 app.post("/tasks/join", (req, res) => {
     const viewer = normalizeViewer(req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
+    const displayName = String(req.body.displayName || "").trim();
+    const twitchId = String(req.body.twitchId || "").trim();
     const voteKey = String(req.body.voteKey || "current");
 
     if (!viewer) {
@@ -1169,17 +1171,16 @@ app.post("/tasks/join", (req, res) => {
         });
     }
 
-    if (!companionName) {
-        return res.status(400).json({
-            ok: false,
-            error: "Missing companionName"
-        });
+    if (twitchId || displayName) {
+        updateWalletIdentity(viewer, twitchId, displayName || viewer);
     }
 
     const request = queueShopAction({
         action: "task_join",
         viewer,
         companionName,
+        displayName,
+        twitchId,
         voteKey,
         cost: 0
     });
@@ -1194,6 +1195,8 @@ app.post("/tasks/join", (req, res) => {
 app.post("/tasks/vote", (req, res) => {
     const viewer = normalizeViewer(req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
+    const displayName = String(req.body.displayName || "").trim();
+    const twitchId = String(req.body.twitchId || "").trim();
     const vote = String(req.body.vote || "").toLowerCase();
     const voteKey = String(req.body.voteKey || "current");
 
@@ -1204,11 +1207,8 @@ app.post("/tasks/vote", (req, res) => {
         });
     }
 
-    if (!companionName) {
-        return res.status(400).json({
-            ok: false,
-            error: "Missing companionName"
-        });
+    if (twitchId || displayName) {
+        updateWalletIdentity(viewer, twitchId, displayName || viewer);
     }
 
     if (!taskVotes[voteKey]) {
@@ -1229,6 +1229,8 @@ app.post("/tasks/vote", (req, res) => {
         action: "task_vote",
         viewer,
         companionName,
+        displayName,
+        twitchId,
         vote,
         voteKey,
         cost: 0
