@@ -11,6 +11,7 @@ const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : pat
 const WALLETS_FILE = path.join(DATA_DIR, "wallets.json");
 const QUEUE_FILE = path.join(DATA_DIR, "shop_queue.json");
 const WATCHERS_FILE = path.join(DATA_DIR, "watchers.json");
+const FORGERY_FILE = path.join(DATA_DIR, "forgery.json");
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
@@ -34,7 +35,10 @@ const PRICES = {
     REROLL_ANCIENT_RELIC: 200,
     BOTTLE_RHUM: 100,
     PAY_DEBT: 300,
-    REROLL_LEGENDARY: 500
+    REROLL_LEGENDARY: 500,
+    FORGERY_CUSTOM_RELIC: 200,
+    FORGERY_MODIFIER: 100,
+    FORGERY_REROLL: 200
 };
 
 let companionsData = { companions: [] };
@@ -42,6 +46,7 @@ let tasksData = { active: false, tasks: [] };
 let shopActionQueue = [];
 let wallets = {};
 let watchers = {};
+let forgeryData = {};
 
 function ensureDataDir() {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -83,6 +88,7 @@ async function loadPersistentData() {
 
     shopActionQueue = readJsonFile(QUEUE_FILE, []);
     watchers = readJsonFile(WATCHERS_FILE, {});
+    forgeryData = readJsonFile(FORGERY_FILE, {});
 
     await loadWalletsFromSupabase();
 
@@ -97,6 +103,7 @@ function saveWallets() {
 
 function saveQueue() { writeJsonFile(QUEUE_FILE, shopActionQueue); }
 function saveWatchers() { writeJsonFile(WATCHERS_FILE, watchers); }
+function saveForgery() { writeJsonFile(FORGERY_FILE, forgeryData); }
 
 function walletToSupabaseRow(wallet) {
     return {
@@ -466,6 +473,102 @@ function publicWallet(wallet) {
         companionName: String(wallet.companionName || ""),
         updatedAt: String(wallet.updatedAt || "")
     };
+}
+
+const FORGERY_MODIFIERS = new Set([
+    "companion_challenge",
+    "extended",
+    "gilded_cascade",
+    "living_cascade",
+    "ornate_cascade",
+    "coin_cascade",
+    "wooden_cascade",
+    "gilded",
+    "living",
+    "ornate",
+    "wooden_bonus",
+    "coin_pile",
+    "phoenix",
+    "plentiful",
+    "xp_gain",
+    "pandoras_box"
+]);
+
+function forgeryKey(viewer, companionName) {
+    return `${normalizeViewer(viewer)}::${String(companionName || "").trim().toLowerCase()}`;
+}
+
+function rollForgerySlots() {
+    /* Lower numbers are common, 8-9 are very rare. */
+    const weighted = [
+        { slots: 1, weight: 360 },
+        { slots: 2, weight: 260 },
+        { slots: 3, weight: 170 },
+        { slots: 4, weight: 95 },
+        { slots: 5, weight: 55 },
+        { slots: 6, weight: 30 },
+        { slots: 7, weight: 16 },
+        { slots: 8, weight: 8 },
+        { slots: 9, weight: 3 }
+    ];
+    const total = weighted.reduce((sum, entry) => sum + entry.weight, 0);
+    let roll = Math.random() * total;
+    for (const entry of weighted) {
+        roll -= entry.weight;
+        if (roll <= 0) return entry.slots;
+    }
+    return 1;
+}
+
+function getForgeryState(viewer, companionName) {
+    const key = forgeryKey(viewer, companionName);
+    if (!key || key === "::") return null;
+
+    if (!forgeryData[key]) {
+        forgeryData[key] = {
+            viewer: normalizeViewer(viewer),
+            companionName: String(companionName || "").trim(),
+            customRelic: null,
+            history: [],
+            updatedAt: new Date().toISOString()
+        };
+        saveForgery();
+    }
+
+    return forgeryData[key];
+}
+
+function publicForgeryState(state) {
+    if (!state) return null;
+    return {
+        viewer: state.viewer,
+        companionName: state.companionName,
+        customRelic: state.customRelic || null,
+        updatedAt: state.updatedAt || ""
+    };
+}
+
+function makeCustomRelic(viewer, companionName) {
+    const slots = rollForgerySlots();
+    return {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        slots,
+        modifiers: Array(slots).fill(null),
+        spentOnModifiers: 0,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        viewer: normalizeViewer(viewer),
+        companionName: String(companionName || "").trim()
+    };
+}
+
+function validateForgeryBody(req) {
+    const viewer = normalizeViewer(req.body.viewer);
+    const companionName = String(req.body.companionName || "").trim();
+    if (!viewer || !companionName) {
+        return { ok: false, status: 400, error: "Missing viewer or companion" };
+    }
+    return { ok: true, viewer, companionName };
 }
 
 function transferWalletBalance(fromViewer, toViewer) {
@@ -1056,6 +1159,126 @@ app.post("/shop/back-to-work", (req, res) => {
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     const request = queueShopAction({ action: "back_to_work", viewer, companionName, cost: 0 });
     res.json({ ok: true, request });
+});
+
+
+app.get("/forgery/:viewer/:companionName", (req, res) => {
+    const viewer = normalizeViewer(req.params.viewer);
+    const companionName = String(req.params.companionName || "").trim();
+    if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
+    const state = getForgeryState(viewer, companionName);
+    res.json({ ok: true, forgery: publicForgeryState(state) });
+});
+
+app.post("/forgery/create", (req, res) => {
+    const valid = validateForgeryBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+
+    const level = Number(req.body.level || 0);
+    if (level < 10) return res.status(400).json({ ok: false, error: "Forgery unlocks at companion level 10." });
+
+    const state = getForgeryState(valid.viewer, valid.companionName);
+    if (state.customRelic && Array.isArray(state.customRelic.modifiers)) {
+        return res.status(400).json({ ok: false, error: "You already have a custom relic in progress.", forgery: publicForgeryState(state) });
+    }
+
+    const spend = spendDirt(valid.viewer, PRICES.FORGERY_CUSTOM_RELIC, "forgery_custom_relic");
+    if (!spend.ok) return res.status(400).json(spend);
+
+    state.customRelic = makeCustomRelic(valid.viewer, valid.companionName);
+    state.updatedAt = new Date().toISOString();
+    saveForgery();
+
+    res.json({ ok: true, wallet: spend, forgery: publicForgeryState(state) });
+});
+
+app.post("/forgery/buy-modifier", (req, res) => {
+    const valid = validateForgeryBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+
+    const slot = Number(req.body.slot);
+    const modifier = String(req.body.modifier || "").trim();
+    if (!FORGERY_MODIFIERS.has(modifier)) return res.status(400).json({ ok: false, error: "Invalid modifier" });
+
+    const state = getForgeryState(valid.viewer, valid.companionName);
+    const relic = state.customRelic;
+    if (!relic) return res.status(400).json({ ok: false, error: "Create a custom relic first." });
+    if (!Number.isInteger(slot) || slot < 0 || slot >= Number(relic.slots || 0)) return res.status(400).json({ ok: false, error: "Invalid custom relic slot." });
+    if (relic.modifiers[slot]) return res.status(400).json({ ok: false, error: "That slot is already filled." });
+
+    const spend = spendDirt(valid.viewer, PRICES.FORGERY_MODIFIER, "forgery_modifier");
+    if (!spend.ok) return res.status(400).json(spend);
+
+    relic.modifiers[slot] = modifier;
+    relic.spentOnModifiers = Number(relic.spentOnModifiers || 0) + PRICES.FORGERY_MODIFIER;
+    relic.updatedAt = new Date().toISOString();
+    state.updatedAt = relic.updatedAt;
+    saveForgery();
+
+    res.json({ ok: true, wallet: spend, forgery: publicForgeryState(state) });
+});
+
+app.post("/forgery/reroll", (req, res) => {
+    const valid = validateForgeryBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+
+    const state = getForgeryState(valid.viewer, valid.companionName);
+    const oldRelic = state.customRelic;
+    const refund = oldRelic ? Number(oldRelic.spentOnModifiers || 0) : 0;
+
+    if (refund > 0) {
+        const wallet = getWallet(valid.viewer);
+        wallet.dirt += refund;
+        wallet.updatedAt = new Date().toISOString();
+        saveWallets();
+        console.log(`[FORGERY] Refunded ${refund} modifier Dirt to ${valid.viewer} before reroll.`);
+    }
+
+    const spend = spendDirt(valid.viewer, PRICES.FORGERY_REROLL, "forgery_reroll_slots");
+    if (!spend.ok) return res.status(400).json(spend);
+
+    state.customRelic = makeCustomRelic(valid.viewer, valid.companionName);
+    state.history = Array.isArray(state.history) ? state.history : [];
+    if (oldRelic) state.history.push({ ...oldRelic, rerolledAt: new Date().toISOString(), refundedModifiers: refund });
+    state.updatedAt = new Date().toISOString();
+    saveForgery();
+
+    const wallet = getWallet(valid.viewer);
+    res.json({ ok: true, refunded: refund, wallet: { ok: true, ...publicWallet(wallet), spent: PRICES.FORGERY_REROLL }, forgery: publicForgeryState(state) });
+});
+
+app.post("/forgery/forge", (req, res) => {
+    const valid = validateForgeryBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+
+    const replaceSlot = Number(req.body.replaceSlot);
+    const relicsFilled = Number(req.body.relicsFilled || 0);
+    if (!Number.isInteger(replaceSlot) || replaceSlot < 0 || replaceSlot > 3) return res.status(400).json({ ok: false, error: "Invalid relic slot to replace." });
+    if (relicsFilled < 4) return res.status(400).json({ ok: false, error: "All 4 relic slots must be filled before forging." });
+
+    const state = getForgeryState(valid.viewer, valid.companionName);
+    const relic = state.customRelic;
+    if (!relic) return res.status(400).json({ ok: false, error: "Create a custom relic first." });
+    if (!Array.isArray(relic.modifiers) || relic.modifiers.length !== Number(relic.slots || 0) || relic.modifiers.some(mod => !mod)) {
+        return res.status(400).json({ ok: false, error: "Fill every custom relic slot before forging." });
+    }
+
+    const request = queueShopAction({
+        action: "forge_custom_relic",
+        viewer: valid.viewer,
+        companionName: valid.companionName,
+        replaceSlot,
+        modifiers: relic.modifiers,
+        customSlots: relic.slots,
+        cost: 0
+    });
+
+    state.lastForgedRelic = { ...relic, replaceSlot, forgedAt: new Date().toISOString(), queueId: request.id };
+    state.customRelic = null;
+    state.updatedAt = new Date().toISOString();
+    saveForgery();
+
+    res.json({ ok: true, request, forgery: publicForgeryState(state) });
 });
 
 app.post("/viewer-link", (req, res) => {
