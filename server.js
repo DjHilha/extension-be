@@ -12,6 +12,7 @@ const WALLETS_FILE = path.join(DATA_DIR, "wallets.json");
 const QUEUE_FILE = path.join(DATA_DIR, "shop_queue.json");
 const WATCHERS_FILE = path.join(DATA_DIR, "watchers.json");
 const FORGERY_FILE = path.join(DATA_DIR, "forgery.json");
+const TRAINING_FILE = path.join(DATA_DIR, "training_center.json");
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
@@ -38,7 +39,18 @@ const PRICES = {
     REROLL_LEGENDARY: 500,
     FORGERY_CUSTOM_RELIC: 200,
     FORGERY_MODIFIER: 100,
-    FORGERY_REROLL: 200
+    FORGERY_REROLL: 200,
+    TRAINING_BASIC: 50,
+    TRAINING_ADVANCED: 150,
+    TRAINING_ELITE: 300,
+    TRAINING_STUDY: 120,
+    TRAINING_AGILITY: 150,
+    TRAINING_RELIC_RESEARCH: 150,
+    TRAINING_MODIFIER_RESEARCH: 200,
+    TRAINING_REST: 100,
+    TRAINING_MINIGAME: 75,
+    TRAINING_SPARRING: 125,
+    TRAINING_SPECIALIZATION: 250
 };
 
 let companionsData = { companions: [] };
@@ -47,6 +59,7 @@ let shopActionQueue = [];
 let wallets = {};
 let watchers = {};
 let forgeryData = {};
+let trainingData = {};
 
 function ensureDataDir() {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -89,6 +102,7 @@ async function loadPersistentData() {
     shopActionQueue = readJsonFile(QUEUE_FILE, []);
     watchers = readJsonFile(WATCHERS_FILE, {});
     forgeryData = readJsonFile(FORGERY_FILE, {});
+    trainingData = readJsonFile(TRAINING_FILE, {});
 
     await loadWalletsFromSupabase();
 
@@ -104,6 +118,7 @@ function saveWallets() {
 function saveQueue() { writeJsonFile(QUEUE_FILE, shopActionQueue); }
 function saveWatchers() { writeJsonFile(WATCHERS_FILE, watchers); }
 function saveForgery() { writeJsonFile(FORGERY_FILE, forgeryData); }
+function saveTraining() { writeJsonFile(TRAINING_FILE, trainingData); }
 
 function walletToSupabaseRow(wallet) {
     return {
@@ -1279,6 +1294,329 @@ app.post("/forgery/forge", (req, res) => {
     saveForgery();
 
     res.json({ ok: true, request, forgery: publicForgeryState(state) });
+});
+
+
+/* =========================
+   Companion Training Center
+   ========================= */
+const TRAINING_TIERS = {
+    basic: { label: "Basic Combat Training", cost: PRICES.TRAINING_BASIC, xpPercent: 0.03, cooldownMs: 2 * 60 * 60 * 1000 },
+    advanced: { label: "Advanced Combat Training", cost: PRICES.TRAINING_ADVANCED, xpPercent: 0.08, cooldownMs: 4 * 60 * 60 * 1000 },
+    elite: { label: "Elite Combat Training", cost: PRICES.TRAINING_ELITE, xpPercent: 0.15, cooldownMs: 8 * 60 * 60 * 1000 }
+};
+
+const STUDY_FOCUSES = ["vault_xp", "watchtime_dirt", "quest_rewards"];
+const SPECIALIZATIONS = ["explorer", "blacksmith", "alchemist", "treasure_hunter", "scholar"];
+const TRAINING_MODIFIERS = Array.from(FORGERY_MODIFIERS || []);
+
+function trainingKey(viewer, companionName) {
+    return `${normalizeViewer(viewer)}::${String(companionName || "").trim().toLowerCase()}`;
+}
+
+function getTrainingState(viewer, companionName) {
+    const key = trainingKey(viewer, companionName);
+    if (!key || key === "::") return null;
+    if (!trainingData[key]) {
+        trainingData[key] = {
+            viewer: normalizeViewer(viewer),
+            companionName: String(companionName || "").trim(),
+            academyLevel: 1,
+            masteryXp: 0,
+            masteryLevel: 1,
+            specialization: "none",
+            cooldowns: {},
+            dailyLastAt: 0,
+            study: { vault_xp: 0, watchtime_dirt: 0, quest_rewards: 0 },
+            relicFragments: 0,
+            modifierKnowledge: {},
+            agilityFinds: 0,
+            sparWins: 0,
+            sparLosses: 0,
+            history: [],
+            updatedAt: new Date().toISOString()
+        };
+        saveTraining();
+    }
+    return trainingData[key];
+}
+
+function publicTrainingState(state) {
+    if (!state) return null;
+    return {
+        viewer: state.viewer,
+        companionName: state.companionName,
+        academyLevel: Number(state.academyLevel || 1),
+        masteryXp: Number(state.masteryXp || 0),
+        masteryLevel: Number(state.masteryLevel || 1),
+        specialization: state.specialization || "none",
+        cooldowns: state.cooldowns || {},
+        dailyLastAt: Number(state.dailyLastAt || 0),
+        dailyReady: Date.now() - Number(state.dailyLastAt || 0) >= 24 * 60 * 60 * 1000,
+        study: state.study || {},
+        relicFragments: Number(state.relicFragments || 0),
+        modifierKnowledge: state.modifierKnowledge || {},
+        agilityFinds: Number(state.agilityFinds || 0),
+        sparWins: Number(state.sparWins || 0),
+        sparLosses: Number(state.sparLosses || 0),
+        history: Array.isArray(state.history) ? state.history.slice(-8).reverse() : [],
+        updatedAt: state.updatedAt || "",
+        tiers: TRAINING_TIERS,
+        prices: {
+            study: PRICES.TRAINING_STUDY,
+            agility: PRICES.TRAINING_AGILITY,
+            relicResearch: PRICES.TRAINING_RELIC_RESEARCH,
+            modifierResearch: PRICES.TRAINING_MODIFIER_RESEARCH,
+            rest: PRICES.TRAINING_REST,
+            minigame: PRICES.TRAINING_MINIGAME,
+            sparring: PRICES.TRAINING_SPARRING,
+            specialization: PRICES.TRAINING_SPECIALIZATION
+        }
+    };
+}
+
+function validateTrainingBody(req) {
+    const viewer = normalizeViewer(req.body.viewer);
+    const companionName = String(req.body.companionName || "").trim();
+    if (!viewer || !companionName) return { ok: false, status: 400, error: "Missing viewer or companion." };
+    return { ok: true, viewer, companionName };
+}
+
+function addTrainingHistory(state, text) {
+    state.history = Array.isArray(state.history) ? state.history : [];
+    state.history.push({ at: new Date().toISOString(), text });
+    state.history = state.history.slice(-30);
+    state.updatedAt = new Date().toISOString();
+}
+
+function addMastery(state, amount) {
+    state.masteryXp = Number(state.masteryXp || 0) + Math.max(1, amount);
+    state.masteryLevel = Math.max(1, Math.floor(state.masteryXp / 100) + 1);
+}
+
+function randomItem(list) {
+    return list[Math.floor(Math.random() * list.length)];
+}
+
+function maybeApplySpecializationBonus(state, basePercent) {
+    const academyBonus = Math.min(0.20, (Number(state.academyLevel || 1) - 1) * 0.015);
+    const scholarBonus = state.specialization === "scholar" ? 0.03 : 0;
+    return Number((basePercent + academyBonus + scholarBonus).toFixed(4));
+}
+
+function setCooldown(state, key, ms) {
+    state.cooldowns = state.cooldowns || {};
+    state.cooldowns[key] = Date.now() + ms;
+}
+
+function isOnCooldown(state, key) {
+    return Number(state.cooldowns?.[key] || 0) > Date.now();
+}
+
+function secondsLeft(state, key) {
+    return Math.ceil(Math.max(0, Number(state.cooldowns?.[key] || 0) - Date.now()) / 1000);
+}
+
+app.get("/training/:viewer/:companionName", (req, res) => {
+    const viewer = normalizeViewer(req.params.viewer);
+    const companionName = String(req.params.companionName || "").trim();
+    if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
+    res.json({ ok: true, training: publicTrainingState(getTrainingState(viewer, companionName)) });
+});
+
+app.post("/training/combat", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const tierName = String(req.body.tier || "basic").toLowerCase();
+    const tier = TRAINING_TIERS[tierName];
+    if (!tier) return res.status(400).json({ ok: false, error: "Invalid training tier." });
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    if (isOnCooldown(state, `combat_${tierName}`)) return res.status(400).json({ ok: false, error: `Training cooldown: ${secondsLeft(state, `combat_${tierName}`)}s left.` });
+    const spend = spendDirt(valid.viewer, tier.cost, `training_combat_${tierName}`);
+    if (!spend.ok) return res.status(400).json(spend);
+    const xpPercent = maybeApplySpecializationBonus(state, tier.xpPercent);
+    const request = queueShopAction({ action: "training_xp", viewer: valid.viewer, companionName: valid.companionName, xpPercent, trainingType: tierName, cost: tier.cost });
+    addMastery(state, tierName === "elite" ? 35 : tierName === "advanced" ? 20 : 10);
+    setCooldown(state, `combat_${tierName}`, tier.cooldownMs);
+    addTrainingHistory(state, `${tier.label}: queued ${Math.round(xpPercent * 100)}% TNL XP.`);
+    saveTraining();
+    res.json({ ok: true, request, wallet: spend, training: publicTrainingState(state) });
+});
+
+app.post("/training/daily", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    if (Date.now() - Number(state.dailyLastAt || 0) < 24 * 60 * 60 * 1000) return res.status(400).json({ ok: false, error: "Daily training is not ready yet." });
+    const rewards = ["xp", "dirt", "fragment", "modifier"];
+    const reward = randomItem(rewards);
+    let request = null;
+    let wallet = publicWallet(getWallet(valid.viewer));
+    if (reward === "xp") {
+        request = queueShopAction({ action: "training_xp", viewer: valid.viewer, companionName: valid.companionName, xpPercent: 0.05, trainingType: "daily", cost: 0 });
+        addTrainingHistory(state, "Daily Training: +5% TNL XP queued.");
+    } else if (reward === "dirt") {
+        const amount = 25 + Math.floor(Math.random() * 51);
+        const w = getWallet(valid.viewer); w.dirt += amount; w.updatedAt = new Date().toISOString(); saveWallets(); wallet = publicWallet(w);
+        addTrainingHistory(state, `Daily Training: found ${amount} Dirt.`);
+    } else if (reward === "fragment") {
+        state.relicFragments = Number(state.relicFragments || 0) + 1;
+        addTrainingHistory(state, "Daily Training: found 1 relic research fragment.");
+    } else {
+        const mod = randomItem(TRAINING_MODIFIERS);
+        state.modifierKnowledge = state.modifierKnowledge || {}; state.modifierKnowledge[mod] = true;
+        addTrainingHistory(state, `Daily Training: discovered ${mod.replace('the_vault:', '')} knowledge.`);
+    }
+    state.dailyLastAt = Date.now();
+    addMastery(state, 15);
+    saveTraining();
+    res.json({ ok: true, request, wallet: { ok: true, ...wallet }, training: publicTrainingState(state) });
+});
+
+app.post("/training/study", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const focus = String(req.body.focus || "vault_xp").toLowerCase();
+    if (!STUDY_FOCUSES.includes(focus)) return res.status(400).json({ ok: false, error: "Invalid study focus." });
+    const spend = spendDirt(valid.viewer, PRICES.TRAINING_STUDY, "training_study");
+    if (!spend.ok) return res.status(400).json(spend);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    state.study = state.study || {};
+    state.study[focus] = Math.min(10, Number(state.study[focus] || 0) + 0.25);
+    addMastery(state, 12);
+    addTrainingHistory(state, `Study: ${focus.replace(/_/g, ' ')} improved to ${state.study[focus]}%.`);
+    saveTraining();
+    res.json({ ok: true, wallet: spend, training: publicTrainingState(state) });
+});
+
+app.post("/training/agility", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    const spend = spendDirt(valid.viewer, PRICES.TRAINING_AGILITY, "training_agility");
+    if (!spend.ok) return res.status(400).json(spend);
+    const chance = Math.min(0.30, 0.08 + Number(state.academyLevel || 1) * 0.015);
+    const success = Math.random() < chance;
+    if (success) state.agilityFinds = Number(state.agilityFinds || 0) + 1;
+    addMastery(state, 14);
+    addTrainingHistory(state, success ? "Agility Training: discovered trail knowledge." : "Agility Training: no discovery this time.");
+    saveTraining();
+    res.json({ ok: true, success, wallet: spend, training: publicTrainingState(state) });
+});
+
+app.post("/training/relic-research", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const spend = spendDirt(valid.viewer, PRICES.TRAINING_RELIC_RESEARCH, "training_relic_research");
+    if (!spend.ok) return res.status(400).json(spend);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    const gain = state.specialization === "blacksmith" ? 2 : 1;
+    state.relicFragments = Number(state.relicFragments || 0) + gain;
+    addMastery(state, 16);
+    addTrainingHistory(state, `Relic Research: gained ${gain} fragment${gain === 1 ? "" : "s"}.`);
+    saveTraining();
+    res.json({ ok: true, wallet: spend, training: publicTrainingState(state) });
+});
+
+app.post("/training/modifier-research", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const spend = spendDirt(valid.viewer, PRICES.TRAINING_MODIFIER_RESEARCH, "training_modifier_research");
+    if (!spend.ok) return res.status(400).json(spend);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    const known = state.modifierKnowledge || {};
+    const unknown = TRAINING_MODIFIERS.filter(mod => !known[mod]);
+    const discovered = unknown.length ? randomItem(unknown) : randomItem(TRAINING_MODIFIERS);
+    state.modifierKnowledge = known;
+    state.modifierKnowledge[discovered] = true;
+    addMastery(state, 18);
+    addTrainingHistory(state, `Modifier Research: unlocked ${discovered.replace('the_vault:', '')}.`);
+    saveTraining();
+    res.json({ ok: true, discovered, wallet: spend, training: publicTrainingState(state) });
+});
+
+app.post("/training/specialize", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const specialization = String(req.body.specialization || "").toLowerCase();
+    if (!SPECIALIZATIONS.includes(specialization)) return res.status(400).json({ ok: false, error: "Invalid specialization." });
+    const spend = spendDirt(valid.viewer, PRICES.TRAINING_SPECIALIZATION, "training_specialization");
+    if (!spend.ok) return res.status(400).json(spend);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    state.specialization = specialization;
+    addMastery(state, 10);
+    addTrainingHistory(state, `Specialization selected: ${specialization.replace(/_/g, ' ')}.`);
+    saveTraining();
+    res.json({ ok: true, wallet: spend, training: publicTrainingState(state) });
+});
+
+app.post("/training/rest", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const spend = spendDirt(valid.viewer, PRICES.TRAINING_REST, "training_rest");
+    if (!spend.ok) return res.status(400).json(spend);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    const request = queueShopAction({ action: "training_rest", viewer: valid.viewer, companionName: valid.companionName, cost: PRICES.TRAINING_REST });
+    state.cooldowns = {};
+    addMastery(state, 8);
+    addTrainingHistory(state, "Rest: cooldowns cleared and healing queued.");
+    saveTraining();
+    res.json({ ok: true, request, wallet: spend, training: publicTrainingState(state) });
+});
+
+app.post("/training/minigame", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const style = String(req.body.style || "power").toLowerCase();
+    const spend = spendDirt(valid.viewer, PRICES.TRAINING_MINIGAME, "training_minigame");
+    if (!spend.ok) return res.status(400).json(spend);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    const roll = Math.random();
+    let xpPercent = 0.03;
+    let event = "Success";
+    if (roll > 0.95) { xpPercent = 0.15; event = "Critical Success"; }
+    else if (roll > 0.75) { xpPercent = 0.08; event = "Great Success"; }
+    else if (roll < 0.12) { xpPercent = 0.01; event = "Failure, but learned something"; }
+    const request = queueShopAction({ action: "training_xp", viewer: valid.viewer, companionName: valid.companionName, xpPercent, trainingType: `minigame_${style}`, cost: PRICES.TRAINING_MINIGAME });
+    addMastery(state, Math.round(xpPercent * 200));
+    addTrainingHistory(state, `Mini-game ${style}: ${event}, ${Math.round(xpPercent * 100)}% TNL XP queued.`);
+    saveTraining();
+    res.json({ ok: true, event, request, wallet: spend, training: publicTrainingState(state) });
+});
+
+app.post("/training/spar", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const opponent = String(req.body.opponent || "Training Dummy").trim() || "Training Dummy";
+    const spend = spendDirt(valid.viewer, PRICES.TRAINING_SPARRING, "training_sparring");
+    if (!spend.ok) return res.status(400).json(spend);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    const power = Math.random() + Number(state.masteryLevel || 1) * 0.02;
+    const enemy = Math.random() + 0.25;
+    const won = power >= enemy;
+    if (won) state.sparWins = Number(state.sparWins || 0) + 1; else state.sparLosses = Number(state.sparLosses || 0) + 1;
+    const xpPercent = won ? 0.07 : 0.025;
+    const request = queueShopAction({ action: "training_xp", viewer: valid.viewer, companionName: valid.companionName, xpPercent, trainingType: "sparring", cost: PRICES.TRAINING_SPARRING });
+    addMastery(state, won ? 18 : 7);
+    addTrainingHistory(state, `Sparring vs ${opponent}: ${won ? "won" : "lost"}, ${Math.round(xpPercent * 100)}% TNL XP queued.`);
+    saveTraining();
+    res.json({ ok: true, won, request, wallet: spend, training: publicTrainingState(state) });
+});
+
+app.post("/training/upgrade-academy", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    const level = Number(state.academyLevel || 1);
+    if (level >= 10) return res.status(400).json({ ok: false, error: "Academy is already level 10." });
+    const cost = 250 * level;
+    const spend = spendDirt(valid.viewer, cost, "training_upgrade_academy");
+    if (!spend.ok) return res.status(400).json(spend);
+    state.academyLevel = level + 1;
+    addMastery(state, 25);
+    addTrainingHistory(state, `Academy upgraded to level ${state.academyLevel}.`);
+    saveTraining();
+    res.json({ ok: true, wallet: spend, training: publicTrainingState(state) });
 });
 
 app.post("/viewer-link", (req, res) => {
