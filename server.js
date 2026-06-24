@@ -1953,6 +1953,260 @@ app.post("/training/upgrade-academy", (req, res) => {
 });
 
 
+/* =========================
+   Admin Testing Endpoints
+   All require x-api-key
+   ========================= */
+function adminTrainingAndForgeryState(viewer, companionName) {
+    const training = getTrainingState(viewer, companionName);
+    const forgery = getForgeryState(viewer, companionName);
+    finalizeTrainingState(training);
+    return {
+        training: publicTrainingState(training),
+        forgery: publicForgeryState(forgery),
+        wallet: publicWallet(getWallet(viewer))
+    };
+}
+
+function validateAdminCompanionBody(req) {
+    const viewer = normalizeViewer(req.body.viewer || req.body.identifier);
+    const companionName = String(req.body.companionName || req.body.companion || "").trim();
+    if (!viewer || !companionName) {
+        return { ok: false, status: 400, error: "Missing viewer or companionName." };
+    }
+    return { ok: true, viewer, companionName };
+}
+
+app.get("/admin/training/:viewer/:companionName", requireApiKey, (req, res) => {
+    const viewer = normalizeViewer(req.params.viewer);
+    const companionName = String(req.params.companionName || "").trim();
+    if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companionName." });
+    res.json({ ok: true, ...adminTrainingAndForgeryState(viewer, companionName) });
+});
+
+app.post("/admin/companion/reset", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+
+    const tKey = trainingKey(valid.viewer, valid.companionName);
+    const fKey = forgeryKey(valid.viewer, valid.companionName);
+    const resetTraining = req.body.resetTraining !== false;
+    const resetForgery = req.body.resetForgery !== false;
+
+    if (resetTraining) delete trainingData[tKey];
+    if (resetForgery) delete forgeryData[fKey];
+
+    saveTraining();
+    saveForgery();
+
+    res.json({
+        ok: true,
+        resetTraining,
+        resetForgery,
+        ...adminTrainingAndForgeryState(valid.viewer, valid.companionName)
+    });
+});
+
+app.post("/admin/training/reset", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    delete trainingData[trainingKey(valid.viewer, valid.companionName)];
+    saveTraining();
+    res.json({ ok: true, ...adminTrainingAndForgeryState(valid.viewer, valid.companionName) });
+});
+
+app.post("/admin/forgery/reset", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    delete forgeryData[forgeryKey(valid.viewer, valid.companionName)];
+    saveForgery();
+    res.json({ ok: true, ...adminTrainingAndForgeryState(valid.viewer, valid.companionName) });
+});
+
+app.post("/admin/daily/reset", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    state.dailyLastAt = 0;
+    addTrainingHistory(state, "Admin: daily training reset.");
+    saveTraining();
+    res.json({ ok: true, training: publicTrainingState(state) });
+});
+
+app.post("/admin/cooldowns/clear", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    state.cooldowns = {};
+    state.expedition = null;
+    addTrainingHistory(state, "Admin: cooldowns and expedition cleared.");
+    saveTraining();
+    res.json({ ok: true, training: publicTrainingState(state) });
+});
+
+app.post("/admin/fragments/grant", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const relicFragments = Math.floor(Number(req.body.relicFragments ?? req.body.fragments ?? 0));
+    const ancientRelicFragments = Math.floor(Number(req.body.ancientRelicFragments ?? req.body.ancientFragments ?? 0));
+    if (!Number.isFinite(relicFragments) || !Number.isFinite(ancientRelicFragments)) {
+        return res.status(400).json({ ok: false, error: "Invalid fragment amount." });
+    }
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    state.relicFragments = Math.max(0, Number(state.relicFragments || 0) + relicFragments);
+    state.ancientRelicFragments = Math.max(0, Number(state.ancientRelicFragments || 0) + ancientRelicFragments);
+    addTrainingHistory(state, `Admin: granted ${relicFragments} Relic Fragment(s) and ${ancientRelicFragments} Ancient Relic Fragment(s).`);
+    saveTraining();
+    res.json({ ok: true, training: publicTrainingState(state) });
+});
+
+app.post("/admin/fragments/set", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    if (req.body.relicFragments !== undefined || req.body.fragments !== undefined) {
+        state.relicFragments = Math.max(0, Math.floor(Number(req.body.relicFragments ?? req.body.fragments ?? 0)));
+    }
+    if (req.body.ancientRelicFragments !== undefined || req.body.ancientFragments !== undefined) {
+        state.ancientRelicFragments = Math.max(0, Math.floor(Number(req.body.ancientRelicFragments ?? req.body.ancientFragments ?? 0)));
+    }
+    addTrainingHistory(state, "Admin: fragment counts set.");
+    saveTraining();
+    res.json({ ok: true, training: publicTrainingState(state) });
+});
+
+app.post("/admin/xp/grant", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+
+    const xpPercent = Number(req.body.xpPercent ?? req.body.percent ?? 0);
+    const xpAmount = Math.floor(Number(req.body.xpAmount ?? req.body.amount ?? 0));
+    const masteryXp = Math.floor(Number(req.body.masteryXp ?? 0));
+
+    if ((!Number.isFinite(xpPercent) || xpPercent < 0) && (!Number.isFinite(xpAmount) || xpAmount < 0) && masteryXp <= 0) {
+        return res.status(400).json({ ok: false, error: "Provide xpPercent, xpAmount, or masteryXp." });
+    }
+
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    let request = null;
+
+    if (xpPercent > 0 || xpAmount > 0) {
+        request = queueShopAction({
+            action: "training_xp",
+            viewer: valid.viewer,
+            companionName: valid.companionName,
+            xpPercent: xpPercent > 0 ? xpPercent : 0,
+            xpAmount: xpAmount > 0 ? xpAmount : 0,
+            trainingType: "admin_grant",
+            cost: 0
+        });
+        addTrainingHistory(state, `Admin: queued XP grant${xpPercent > 0 ? ` (${Math.round(xpPercent * 100)}% TNL)` : ""}${xpAmount > 0 ? ` (${xpAmount} raw XP)` : ""}.`);
+    }
+
+    if (masteryXp > 0) {
+        addMastery(state, masteryXp);
+        addTrainingHistory(state, `Admin: granted ${masteryXp} Training Mastery XP.`);
+    }
+
+    saveTraining();
+    res.json({ ok: true, request, training: publicTrainingState(state) });
+});
+
+app.post("/admin/modifier/unlock", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+
+    let modifiers = [];
+    if (req.body.modifier === "all" || req.body.modifiers === "all") {
+        modifiers = Array.from(FORGERY_MODIFIERS);
+    } else if (Array.isArray(req.body.modifiers)) {
+        modifiers = req.body.modifiers.map(m => String(m || "").trim()).filter(Boolean);
+    } else {
+        modifiers = [String(req.body.modifier || "").trim()].filter(Boolean);
+    }
+
+    if (modifiers.length === 0) return res.status(400).json({ ok: false, error: "Missing modifier or modifiers." });
+    const invalid = modifiers.filter(mod => !FORGERY_MODIFIERS.has(mod));
+    if (invalid.length > 0) return res.status(400).json({ ok: false, error: "Invalid modifier(s).", invalid });
+
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    state.modifierKnowledge = state.modifierKnowledge || {};
+    state.modifierKnowledge.companion_challenge = true;
+    for (const modifier of modifiers) state.modifierKnowledge[modifier] = true;
+    state.activeResearch = (state.activeResearch || []).filter(job => !modifiers.includes(job.modifier));
+    addTrainingHistory(state, `Admin: unlocked modifier(s): ${modifiers.map(m => MODIFIER_LABELS[m] || m).join(", ")}.`);
+    saveTraining();
+    res.json({ ok: true, unlocked: modifiers, training: publicTrainingState(state) });
+});
+
+app.post("/admin/modifier/lock", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const modifier = String(req.body.modifier || "").trim();
+    if (!FORGERY_MODIFIERS.has(modifier)) return res.status(400).json({ ok: false, error: "Invalid modifier." });
+    if (modifier === "companion_challenge") return res.status(400).json({ ok: false, error: "Companion Challenge cannot be locked." });
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    state.modifierKnowledge = state.modifierKnowledge || {};
+    delete state.modifierKnowledge[modifier];
+    state.activeResearch = (state.activeResearch || []).filter(job => job.modifier !== modifier);
+    addTrainingHistory(state, `Admin: locked modifier: ${MODIFIER_LABELS[modifier] || modifier}.`);
+    saveTraining();
+    res.json({ ok: true, locked: modifier, training: publicTrainingState(state) });
+});
+
+app.post("/admin/research/complete", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+
+    if (req.body.modifier === "all" || req.body.modifiers === "all") {
+        for (const job of state.activeResearch || []) {
+            state.modifierKnowledge = state.modifierKnowledge || {};
+            state.modifierKnowledge[job.modifier] = true;
+        }
+        state.activeResearch = [];
+        addTrainingHistory(state, "Admin: completed all active research.");
+    } else {
+        const modifier = String(req.body.modifier || "").trim();
+        if (!FORGERY_MODIFIERS.has(modifier)) return res.status(400).json({ ok: false, error: "Invalid modifier." });
+        state.modifierKnowledge = state.modifierKnowledge || {};
+        state.modifierKnowledge[modifier] = true;
+        state.activeResearch = (state.activeResearch || []).filter(job => job.modifier !== modifier);
+        addTrainingHistory(state, `Admin: completed research: ${MODIFIER_LABELS[modifier] || modifier}.`);
+    }
+
+    saveTraining();
+    res.json({ ok: true, training: publicTrainingState(state) });
+});
+
+app.post("/admin/research/cancel", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    const modifier = String(req.body.modifier || "").trim();
+    if (modifier === "all") {
+        state.activeResearch = [];
+        addTrainingHistory(state, "Admin: cancelled all active research.");
+    } else {
+        state.activeResearch = (state.activeResearch || []).filter(job => job.modifier !== modifier);
+        addTrainingHistory(state, `Admin: cancelled research: ${MODIFIER_LABELS[modifier] || modifier}.`);
+    }
+    saveTraining();
+    res.json({ ok: true, training: publicTrainingState(state) });
+});
+
+app.post("/admin/academy/set", requireApiKey, (req, res) => {
+    const valid = validateAdminCompanionBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const level = Math.max(1, Math.min(10, Math.floor(Number(req.body.level || req.body.academyLevel || 1))));
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    state.academyLevel = level;
+    addTrainingHistory(state, `Admin: Academy set to level ${level}.`);
+    saveTraining();
+    res.json({ ok: true, training: publicTrainingState(state) });
+});
+
+
 app.post("/viewer-link", (req, res) => {
     const viewer = normalizeViewer(req.body.viewer);
     const twitchId = String(req.body.twitchId || "").trim();
