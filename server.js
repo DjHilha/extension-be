@@ -104,12 +104,18 @@ async function loadPersistentData() {
 
     shopActionQueue = readJsonFile(QUEUE_FILE, []);
     watchers = readJsonFile(WATCHERS_FILE, {});
+
+    // Local JSON is still used as a fallback/cache, but when Supabase is enabled
+    // Training Center and Forgery state are loaded from Supabase so progress
+    // survives Render restarts/redeploys.
     forgeryData = readJsonFile(FORGERY_FILE, {});
     trainingData = readJsonFile(TRAINING_FILE, {});
 
     await loadWalletsFromSupabase();
+    await loadTrainingFromSupabase();
+    await loadForgeryFromSupabase();
 
-    console.log(`[DATA] Loaded ${Object.keys(wallets).length} wallets and ${shopActionQueue.length} queued shop actions and ${Object.keys(watchers).length} watchers.`);
+    console.log(`[DATA] Loaded ${Object.keys(wallets).length} wallets, ${Object.keys(trainingData).length} training states, ${Object.keys(forgeryData).length} forgery states and ${shopActionQueue.length} queued shop actions and ${Object.keys(watchers).length} watchers.`);
 }
 
 
@@ -120,8 +126,14 @@ function saveWallets() {
 
 function saveQueue() { writeJsonFile(QUEUE_FILE, shopActionQueue); }
 function saveWatchers() { writeJsonFile(WATCHERS_FILE, watchers); }
-function saveForgery() { writeJsonFile(FORGERY_FILE, forgeryData); }
-function saveTraining() { writeJsonFile(TRAINING_FILE, trainingData); }
+function saveForgery() {
+    writeJsonFile(FORGERY_FILE, forgeryData);
+    syncForgeryToSupabaseSoon();
+}
+function saveTraining() {
+    writeJsonFile(TRAINING_FILE, trainingData);
+    syncTrainingToSupabaseSoon();
+}
 
 function walletToSupabaseRow(wallet) {
     return {
@@ -264,6 +276,182 @@ async function loadWalletsFromSupabase() {
     } catch (error) {
         console.error("[SUPABASE] Failed loading wallets. Falling back to local JSON.", error);
     }
+}
+
+
+function stateRowToObject(row, fallbackCompanionName = "") {
+    const key = String(row.key || "");
+    const data = row.data && typeof row.data === "object" ? row.data : {};
+
+    return {
+        ...data,
+        viewer: String(data.viewer || row.viewer || "").toLowerCase(),
+        companionName: String(data.companionName || row.companion_name || fallbackCompanionName || ""),
+        updatedAt: String(data.updatedAt || row.updated_at || new Date().toISOString()),
+        __key: key
+    };
+}
+
+function stateObjectToSupabaseRow(key, state) {
+    const viewer = normalizeViewer(state?.viewer || key.split("::")[0]);
+    const companionName = String(state?.companionName || key.split("::")[1] || "").trim();
+    const cleanState = { ...(state || {}) };
+    delete cleanState.__key;
+
+    return {
+        key,
+        viewer,
+        companion_name: companionName,
+        data: cleanState,
+        updated_at: cleanState.updatedAt || new Date().toISOString()
+    };
+}
+
+async function loadTrainingFromSupabase() {
+    if (!USE_SUPABASE) {
+        console.log("[SUPABASE] Not configured. Using local JSON training state.");
+        return;
+    }
+
+    try {
+        const rows = await supabaseRequest("/training_center?select=*", { method: "GET" });
+
+        if (!Array.isArray(rows)) {
+            return;
+        }
+
+        if (rows.length > 0) {
+            const loaded = {};
+            for (const row of rows) {
+                const key = String(row.key || "");
+                if (!key) continue;
+                loaded[key] = stateRowToObject(row);
+            }
+            trainingData = loaded;
+            writeJsonFile(TRAINING_FILE, trainingData);
+            console.log(`[SUPABASE] Loaded ${rows.length} training state(s).`);
+            return;
+        }
+
+        // First run after creating the table: migrate any local JSON cache into Supabase.
+        const localCount = Object.keys(trainingData || {}).length;
+        if (localCount > 0) {
+            await syncAllTrainingToSupabase();
+            console.log(`[SUPABASE] Migrated ${localCount} local training state(s) to Supabase.`);
+        } else {
+            console.log("[SUPABASE] No training states found yet.");
+        }
+    } catch (error) {
+        console.error("[SUPABASE] Failed loading training states. Falling back to local JSON.", error);
+    }
+}
+
+async function loadForgeryFromSupabase() {
+    if (!USE_SUPABASE) {
+        console.log("[SUPABASE] Not configured. Using local JSON forgery state.");
+        return;
+    }
+
+    try {
+        const rows = await supabaseRequest("/forgery?select=*", { method: "GET" });
+
+        if (!Array.isArray(rows)) {
+            return;
+        }
+
+        if (rows.length > 0) {
+            const loaded = {};
+            for (const row of rows) {
+                const key = String(row.key || "");
+                if (!key) continue;
+                loaded[key] = stateRowToObject(row);
+            }
+            forgeryData = loaded;
+            writeJsonFile(FORGERY_FILE, forgeryData);
+            console.log(`[SUPABASE] Loaded ${rows.length} forgery state(s).`);
+            return;
+        }
+
+        // First run after creating the table: migrate any local JSON cache into Supabase.
+        const localCount = Object.keys(forgeryData || {}).length;
+        if (localCount > 0) {
+            await syncAllForgeryToSupabase();
+            console.log(`[SUPABASE] Migrated ${localCount} local forgery state(s) to Supabase.`);
+        } else {
+            console.log("[SUPABASE] No forgery states found yet.");
+        }
+    } catch (error) {
+        console.error("[SUPABASE] Failed loading forgery states. Falling back to local JSON.", error);
+    }
+}
+
+let trainingSyncTimer = null;
+let forgerySyncTimer = null;
+
+function syncTrainingToSupabaseSoon() {
+    if (!USE_SUPABASE) return;
+
+    if (trainingSyncTimer) {
+        clearTimeout(trainingSyncTimer);
+    }
+
+    trainingSyncTimer = setTimeout(() => {
+        trainingSyncTimer = null;
+        syncAllTrainingToSupabase().catch(error => {
+            console.error("[SUPABASE] Failed syncing training states.", error);
+        });
+    }, 500);
+}
+
+function syncForgeryToSupabaseSoon() {
+    if (!USE_SUPABASE) return;
+
+    if (forgerySyncTimer) {
+        clearTimeout(forgerySyncTimer);
+    }
+
+    forgerySyncTimer = setTimeout(() => {
+        forgerySyncTimer = null;
+        syncAllForgeryToSupabase().catch(error => {
+            console.error("[SUPABASE] Failed syncing forgery states.", error);
+        });
+    }, 500);
+}
+
+async function syncAllTrainingToSupabase() {
+    if (!USE_SUPABASE) return;
+
+    const rows = Object.entries(trainingData || {})
+        .filter(([key, state]) => key && state)
+        .map(([key, state]) => stateObjectToSupabaseRow(key, state));
+
+    if (rows.length === 0) return;
+
+    await supabaseRequest("/training_center?on_conflict=key", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify(rows)
+    });
+
+    console.log(`[SUPABASE] Synced ${rows.length} training state(s).`);
+}
+
+async function syncAllForgeryToSupabase() {
+    if (!USE_SUPABASE) return;
+
+    const rows = Object.entries(forgeryData || {})
+        .filter(([key, state]) => key && state)
+        .map(([key, state]) => stateObjectToSupabaseRow(key, state));
+
+    if (rows.length === 0) return;
+
+    await supabaseRequest("/forgery?on_conflict=key", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify(rows)
+    });
+
+    console.log(`[SUPABASE] Synced ${rows.length} forgery state(s).`);
 }
 
 function normalizeViewer(viewer) { return String(viewer || "").trim().toLowerCase(); }
