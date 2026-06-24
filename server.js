@@ -696,13 +696,25 @@ function makeCustomRelic(viewer, companionName, relicType = "normal") {
     };
 }
 
+function resolveViewerForState(identifier) {
+    const raw = String(identifier || "").trim();
+    const normalized = normalizeViewer(raw);
+    if (!normalized) return "";
+
+    // Important: public extension calls and admin commands may send either
+    // Twitch display names (DjHilha) or Twitch numeric IDs (145555184).
+    // Always resolve through wallets first so training/forgery use the same
+    // profile as Dirt wallets.
+    return resolveWalletKey(raw) || resolveWalletKey(normalized) || normalized;
+}
+
 function validateForgeryBody(req) {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = resolveViewerForState(req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     if (!viewer || !companionName) {
         return { ok: false, status: 400, error: "Missing viewer or companion" };
     }
-    return { ok: true, viewer, companionName };
+    return { ok: true, viewer, companionName, requestedViewer: String(req.body.viewer || "").trim() };
 }
 
 function hasUnlockedModifier(viewer, companionName, modifier) {
@@ -1324,11 +1336,17 @@ app.post("/shop/back-to-work", (req, res) => {
 
 
 app.get("/forgery/:viewer/:companionName", (req, res) => {
-    const viewer = normalizeViewer(req.params.viewer);
+    const requestedViewer = String(req.params.viewer || "").trim();
+    const viewer = resolveViewerForState(requestedViewer);
     const companionName = String(req.params.companionName || "").trim();
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     const state = getForgeryState(viewer, companionName);
-    res.json({ ok: true, forgery: publicForgeryState(state) });
+    res.json({
+        ok: true,
+        requestedViewer,
+        resolvedViewer: viewer,
+        forgery: publicForgeryState(state)
+    });
 });
 
 app.post("/forgery/create", (req, res) => {
@@ -1651,10 +1669,10 @@ function publicTrainingState(state) {
 }
 
 function validateTrainingBody(req) {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = resolveViewerForState(req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     if (!viewer || !companionName) return { ok: false, status: 400, error: "Missing viewer or companion." };
-    return { ok: true, viewer, companionName };
+    return { ok: true, viewer, companionName, requestedViewer: String(req.body.viewer || "").trim() };
 }
 
 function addTrainingHistory(state, text) {
@@ -1692,10 +1710,18 @@ function secondsLeft(state, key) {
 }
 
 app.get("/training/:viewer/:companionName", (req, res) => {
-    const viewer = normalizeViewer(req.params.viewer);
+    const requestedViewer = String(req.params.viewer || "").trim();
+    const viewer = resolveViewerForState(requestedViewer);
     const companionName = String(req.params.companionName || "").trim();
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
-    res.json({ ok: true, training: publicTrainingState(getTrainingState(viewer, companionName)) });
+    const state = getTrainingState(viewer, companionName);
+    finalizeTrainingState(state);
+    res.json({
+        ok: true,
+        requestedViewer,
+        resolvedViewer: viewer,
+        training: publicTrainingState(state)
+    });
 });
 
 app.post("/training/combat", (req, res) => {
