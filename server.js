@@ -40,12 +40,15 @@ const PRICES = {
     FORGERY_CUSTOM_RELIC: 200,
     FORGERY_MODIFIER: 100,
     FORGERY_REROLL: 200,
+    FORGERY_CUSTOM_ANCIENT_RELIC: 300,
+    FORGERY_ANCIENT_MODIFIER: 150,
     TRAINING_BASIC: 50,
     TRAINING_ADVANCED: 150,
     TRAINING_ELITE: 300,
     TRAINING_STUDY: 120,
     TRAINING_AGILITY: 150,
     TRAINING_RELIC_RESEARCH: 150,
+    TRAINING_EXPEDITION: 150,
     TRAINING_MODIFIER_RESEARCH: 200,
     TRAINING_REST: 100,
     TRAINING_MINIGAME: 75,
@@ -509,6 +512,98 @@ const FORGERY_MODIFIERS = new Set([
     "pandoras_box"
 ]);
 
+const STARTER_FORGING_MODIFIERS = new Set([
+    "wooden_cascade",
+    "living_cascade",
+    "gilded_cascade",
+    "ornate_cascade"
+]);
+
+const MODIFIER_RESEARCH = {
+    common: {
+        costDirt: 250,
+        costFragments: 5,
+        durationMs: 30 * 60 * 1000,
+        modifiers: [
+            "companion_challenge",
+            "wooden_cascade",
+            "living_cascade",
+            "gilded_cascade",
+            "ornate_cascade",
+            "coin_cascade",
+            "plentiful"
+        ]
+    },
+    rare: {
+        costDirt: 500,
+        costFragments: 15,
+        durationMs: 2 * 60 * 60 * 1000,
+        modifiers: [
+            "wooden_bonus",
+            "gilded",
+            "living",
+            "ornate",
+            "coin_pile"
+        ]
+    },
+    legendary: {
+        costDirt: 1000,
+        costFragments: 50,
+        durationMs: 12 * 60 * 60 * 1000,
+        modifiers: [
+            "phoenix",
+            "extended",
+            "xp_gain",
+            "pandoras_box"
+        ]
+    }
+};
+
+const MODIFIER_LABELS = {
+    companion_challenge: "Companion Challenge",
+    extended: "Extended",
+    gilded_cascade: "Gilded",
+    living_cascade: "Living",
+    ornate_cascade: "Ornate",
+    coin_cascade: "Bonus Coins",
+    wooden_cascade: "Wooden",
+    gilded: "Bonus Gilded",
+    living: "Bonus Living",
+    ornate: "Bonus Ornate",
+    wooden_bonus: "Bonus Wooden",
+    coin_pile: "Bonus Coins",
+    phoenix: "Phoenix",
+    plentiful: "Plentiful",
+    xp_gain: "XP Gain",
+    pandoras_box: "Pandora's Box"
+};
+
+function modifierResearchTier(modifier) {
+    for (const [tier, config] of Object.entries(MODIFIER_RESEARCH)) {
+        if (config.modifiers.includes(modifier)) {
+            return tier;
+        }
+    }
+    return "common";
+}
+
+function modifierResearchConfig(modifier, academyLevel = 1) {
+    const tier = modifierResearchTier(modifier);
+    const base = MODIFIER_RESEARCH[tier];
+    const level = Math.max(1, Math.min(10, Number(academyLevel || 1)));
+    const speedBonus = level >= 10 ? 0.25 : level >= 3 ? 0.10 : 0;
+    const dirtDiscount = level >= 6 ? 0.10 : 0;
+    const fragmentDiscount = level >= 8 ? 0.10 : 0;
+
+    return {
+        tier,
+        label: MODIFIER_LABELS[modifier] || modifier,
+        costDirt: Math.max(1, Math.ceil(base.costDirt * (1 - dirtDiscount))),
+        costFragments: Math.max(1, Math.ceil(base.costFragments * (1 - fragmentDiscount))),
+        durationMs: Math.max(60 * 1000, Math.ceil(base.durationMs * (1 - speedBonus)))
+    };
+}
+
 function forgeryKey(viewer, companionName) {
     return `${normalizeViewer(viewer)}::${String(companionName || "").trim().toLowerCase()}`;
 }
@@ -535,6 +630,22 @@ function rollForgerySlots() {
     return 1;
 }
 
+function rollAncientForgerySlots() {
+    const weighted = [
+        { slots: 6, weight: 65 },
+        { slots: 7, weight: 25 },
+        { slots: 8, weight: 8 },
+        { slots: 9, weight: 2 }
+    ];
+    const total = weighted.reduce((sum, entry) => sum + entry.weight, 0);
+    let roll = Math.random() * total;
+    for (const entry of weighted) {
+        roll -= entry.weight;
+        if (roll <= 0) return entry.slots;
+    }
+    return 6;
+}
+
 function getForgeryState(viewer, companionName) {
     const key = forgeryKey(viewer, companionName);
     if (!key || key === "::") return null;
@@ -555,20 +666,28 @@ function getForgeryState(viewer, companionName) {
 
 function publicForgeryState(state) {
     if (!state) return null;
+    const training = getTrainingState(state.viewer, state.companionName);
+    finalizeTrainingState(training);
     return {
         viewer: state.viewer,
         companionName: state.companionName,
         customRelic: state.customRelic || null,
+        relicFragments: Number(training?.relicFragments || 0),
+        ancientRelicFragments: Number(training?.ancientRelicFragments || 0),
+        unlockedModifiers: training ? getUnlockedModifiers(training) : ["companion_challenge"],
         updatedAt: state.updatedAt || ""
     };
 }
 
-function makeCustomRelic(viewer, companionName) {
-    const slots = rollForgerySlots();
+function makeCustomRelic(viewer, companionName, relicType = "normal") {
+    const type = relicType === "ancient" ? "ancient" : "normal";
+    const slots = type === "ancient" ? rollAncientForgerySlots() : rollForgerySlots();
     return {
         id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        type,
         slots,
         modifiers: Array(slots).fill(null),
+        modifierCost: type === "ancient" ? PRICES.FORGERY_ANCIENT_MODIFIER : PRICES.FORGERY_MODIFIER,
         spentOnModifiers: 0,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -584,6 +703,33 @@ function validateForgeryBody(req) {
         return { ok: false, status: 400, error: "Missing viewer or companion" };
     }
     return { ok: true, viewer, companionName };
+}
+
+function hasUnlockedModifier(viewer, companionName, modifier) {
+    const state = getTrainingState(viewer, companionName);
+    finalizeTrainingState(state);
+    return getUnlockedModifiers(state).includes(modifier);
+}
+
+function spendTrainingFragments(state, normalAmount, ancientAmount, reason) {
+    const normal = Math.max(0, Math.floor(Number(normalAmount || 0)));
+    const ancient = Math.max(0, Math.floor(Number(ancientAmount || 0)));
+    state.relicFragments = Number(state.relicFragments || 0);
+    state.ancientRelicFragments = Number(state.ancientRelicFragments || 0);
+
+    if (state.relicFragments < normal) {
+        return { ok: false, error: "Not enough Relic Fragments", required: normal, current: state.relicFragments };
+    }
+    if (state.ancientRelicFragments < ancient) {
+        return { ok: false, error: "Not enough Ancient Relic Fragments", required: ancient, current: state.ancientRelicFragments };
+    }
+
+    state.relicFragments -= normal;
+    state.ancientRelicFragments -= ancient;
+    state.updatedAt = new Date().toISOString();
+    addTrainingHistory(state, `${reason}: spent ${normal} Relic Fragment(s) and ${ancient} Ancient Relic Fragment(s).`);
+    saveTraining();
+    return { ok: true, relicFragments: state.relicFragments, ancientRelicFragments: state.ancientRelicFragments };
 }
 
 function transferWalletBalance(fromViewer, toViewer) {
@@ -1192,19 +1338,48 @@ app.post("/forgery/create", (req, res) => {
     const level = Number(req.body.level || 0);
     if (level < 10) return res.status(400).json({ ok: false, error: "Forgery unlocks at companion level 10." });
 
+    const relicType = String(req.body.relicType || req.body.type || "normal").toLowerCase() === "ancient" ? "ancient" : "normal";
+    const hasAncientRelic = !!(req.body.hasAncientRelic || req.body.ancientRelicOwned || Number(req.body.ancientRelicsFilled || 0) >= 1);
+
+    if (relicType === "ancient" && !hasAncientRelic) {
+        return res.status(400).json({ ok: false, error: "You need an Ancient Relic equipped before you can craft an Ancient Custom Relic." });
+    }
+
     const state = getForgeryState(valid.viewer, valid.companionName);
     if (state.customRelic && Array.isArray(state.customRelic.modifiers)) {
         return res.status(400).json({ ok: false, error: "You already have a custom relic in progress.", forgery: publicForgeryState(state) });
     }
 
-    const spend = spendDirt(valid.viewer, PRICES.FORGERY_CUSTOM_RELIC, "forgery_custom_relic");
+    const training = getTrainingState(valid.viewer, valid.companionName);
+    finalizeTrainingState(training);
+
+    const dirtCost = relicType === "ancient" ? PRICES.FORGERY_CUSTOM_ANCIENT_RELIC : PRICES.FORGERY_CUSTOM_RELIC;
+    const normalFragments = relicType === "ancient" ? 0 : 5;
+    const ancientFragments = relicType === "ancient" ? 10 : 0;
+
+    if (Number(training.relicFragments || 0) < normalFragments) {
+        return res.status(400).json({ ok: false, error: "Not enough Relic Fragments", required: normalFragments, current: Number(training.relicFragments || 0) });
+    }
+    if (Number(training.ancientRelicFragments || 0) < ancientFragments) {
+        return res.status(400).json({ ok: false, error: "Not enough Ancient Relic Fragments", required: ancientFragments, current: Number(training.ancientRelicFragments || 0) });
+    }
+
+    const spend = spendDirt(valid.viewer, dirtCost, relicType === "ancient" ? "forgery_custom_ancient_relic" : "forgery_custom_relic");
     if (!spend.ok) return res.status(400).json(spend);
 
-    state.customRelic = makeCustomRelic(valid.viewer, valid.companionName);
+    const fragmentSpend = spendTrainingFragments(training, normalFragments, ancientFragments, relicType === "ancient" ? "Ancient Forgery" : "Forgery");
+    if (!fragmentSpend.ok) return res.status(400).json(fragmentSpend);
+
+    state.customRelic = makeCustomRelic(valid.viewer, valid.companionName, relicType);
     state.updatedAt = new Date().toISOString();
     saveForgery();
 
-    res.json({ ok: true, wallet: spend, forgery: publicForgeryState(state) });
+    res.json({ ok: true, wallet: spend, fragments: fragmentSpend, forgery: publicForgeryState(state), training: publicTrainingState(training) });
+});
+
+app.post("/forgery/create-ancient", (req, res) => {
+    req.body.relicType = "ancient";
+    return app._router.handle({ ...req, url: "/forgery/create", method: "POST" }, res, () => {});
 });
 
 app.post("/forgery/buy-modifier", (req, res) => {
@@ -1221,11 +1396,17 @@ app.post("/forgery/buy-modifier", (req, res) => {
     if (!Number.isInteger(slot) || slot < 0 || slot >= Number(relic.slots || 0)) return res.status(400).json({ ok: false, error: "Invalid custom relic slot." });
     if (relic.modifiers[slot]) return res.status(400).json({ ok: false, error: "That slot is already filled." });
 
-    const spend = spendDirt(valid.viewer, PRICES.FORGERY_MODIFIER, "forgery_modifier");
+    if (!hasUnlockedModifier(valid.viewer, valid.companionName, modifier)) {
+        return res.status(400).json({ ok: false, error: "Research this modifier in the Training Center before using it in Forgery.", modifier });
+    }
+
+    const modifierCost = relic.type === "ancient" ? PRICES.FORGERY_ANCIENT_MODIFIER : PRICES.FORGERY_MODIFIER;
+    const spend = spendDirt(valid.viewer, modifierCost, relic.type === "ancient" ? "forgery_ancient_modifier" : "forgery_modifier");
     if (!spend.ok) return res.status(400).json(spend);
 
     relic.modifiers[slot] = modifier;
-    relic.spentOnModifiers = Number(relic.spentOnModifiers || 0) + PRICES.FORGERY_MODIFIER;
+    relic.modifierCost = modifierCost;
+    relic.spentOnModifiers = Number(relic.spentOnModifiers || 0) + modifierCost;
     relic.updatedAt = new Date().toISOString();
     state.updatedAt = relic.updatedAt;
     saveForgery();
@@ -1239,6 +1420,7 @@ app.post("/forgery/reroll", (req, res) => {
 
     const state = getForgeryState(valid.viewer, valid.companionName);
     const oldRelic = state.customRelic;
+    const relicType = oldRelic?.type === "ancient" ? "ancient" : "normal";
     const refund = oldRelic ? Number(oldRelic.spentOnModifiers || 0) : 0;
 
     if (refund > 0) {
@@ -1252,7 +1434,7 @@ app.post("/forgery/reroll", (req, res) => {
     const spend = spendDirt(valid.viewer, PRICES.FORGERY_REROLL, "forgery_reroll_slots");
     if (!spend.ok) return res.status(400).json(spend);
 
-    state.customRelic = makeCustomRelic(valid.viewer, valid.companionName);
+    state.customRelic = makeCustomRelic(valid.viewer, valid.companionName, relicType);
     state.history = Array.isArray(state.history) ? state.history : [];
     if (oldRelic) state.history.push({ ...oldRelic, rerolledAt: new Date().toISOString(), refundedModifiers: refund });
     state.updatedAt = new Date().toISOString();
@@ -1266,36 +1448,46 @@ app.post("/forgery/forge", (req, res) => {
     const valid = validateForgeryBody(req);
     if (!valid.ok) return res.status(valid.status).json(valid);
 
-    const replaceSlot = Number(req.body.replaceSlot);
-    const relicsFilled = Number(req.body.relicsFilled || 0);
-    if (!Number.isInteger(replaceSlot) || replaceSlot < 0 || replaceSlot > 3) return res.status(400).json({ ok: false, error: "Invalid relic slot to replace." });
-    if (relicsFilled < 4) return res.status(400).json({ ok: false, error: "All 4 relic slots must be filled before forging." });
-
     const state = getForgeryState(valid.viewer, valid.companionName);
     const relic = state.customRelic;
     if (!relic) return res.status(400).json({ ok: false, error: "Create a custom relic first." });
+
+    const relicType = relic.type === "ancient" ? "ancient" : "normal";
+    const hasAncientRelic = !!(req.body.hasAncientRelic || req.body.ancientRelicOwned || Number(req.body.ancientRelicsFilled || 0) >= 1);
+
+    let replaceSlot = Number(req.body.replaceSlot);
+
+    if (relicType === "ancient") {
+        replaceSlot = 0;
+        if (!hasAncientRelic) return res.status(400).json({ ok: false, error: "You need an Ancient Relic equipped before forging an Ancient Custom Relic." });
+    } else {
+        const relicsFilled = Number(req.body.relicsFilled || 0);
+        if (!Number.isInteger(replaceSlot) || replaceSlot < 0 || replaceSlot > 3) return res.status(400).json({ ok: false, error: "Invalid relic slot to replace." });
+        if (relicsFilled < 4) return res.status(400).json({ ok: false, error: "All 4 relic slots must be filled before forging." });
+    }
+
     if (!Array.isArray(relic.modifiers) || relic.modifiers.length !== Number(relic.slots || 0) || relic.modifiers.some(mod => !mod)) {
         return res.status(400).json({ ok: false, error: "Fill every custom relic slot before forging." });
     }
 
     const request = queueShopAction({
-        action: "forge_custom_relic",
+        action: relicType === "ancient" ? "forge_custom_ancient_relic" : "forge_custom_relic",
         viewer: valid.viewer,
         companionName: valid.companionName,
         replaceSlot,
+        relicType,
         modifiers: relic.modifiers,
         customSlots: relic.slots,
         cost: 0
     });
 
-    state.lastForgedRelic = { ...relic, replaceSlot, forgedAt: new Date().toISOString(), queueId: request.id };
+    state.lastForgedRelic = { ...relic, replaceSlot, relicType, forgedAt: new Date().toISOString(), queueId: request.id };
     state.customRelic = null;
     state.updatedAt = new Date().toISOString();
     saveForgery();
 
     res.json({ ok: true, request, forgery: publicForgeryState(state) });
 });
-
 
 /* =========================
    Companion Training Center
@@ -1307,8 +1499,8 @@ const TRAINING_TIERS = {
 };
 
 const STUDY_FOCUSES = ["vault_xp", "watchtime_dirt", "quest_rewards"];
-const SPECIALIZATIONS = ["explorer", "blacksmith", "alchemist", "treasure_hunter", "scholar"];
 const TRAINING_MODIFIERS = Array.from(FORGERY_MODIFIERS || []);
+const EXPEDITION_DURATION_MS = 5 * 60 * 1000;
 
 function trainingKey(viewer, companionName) {
     return `${normalizeViewer(viewer)}::${String(companionName || "").trim().toLowerCase()}`;
@@ -1324,13 +1516,16 @@ function getTrainingState(viewer, companionName) {
             academyLevel: 1,
             masteryXp: 0,
             masteryLevel: 1,
-            specialization: "none",
             cooldowns: {},
             dailyLastAt: 0,
             study: { vault_xp: 0, watchtime_dirt: 0, quest_rewards: 0 },
             relicFragments: 0,
-            modifierKnowledge: {},
-            agilityFinds: 0,
+            ancientRelicFragments: 0,
+            modifierKnowledge: { companion_challenge: true },
+            starterModifierChosen: false,
+            starterModifier: "",
+            activeResearch: [],
+            expedition: null,
             sparWins: 0,
             sparLosses: 0,
             history: [],
@@ -1338,25 +1533,109 @@ function getTrainingState(viewer, companionName) {
         };
         saveTraining();
     }
-    return trainingData[key];
+
+    const state = trainingData[key];
+    state.cooldowns = state.cooldowns || {};
+    state.study = state.study || { vault_xp: 0, watchtime_dirt: 0, quest_rewards: 0 };
+    state.modifierKnowledge = state.modifierKnowledge || {};
+    state.modifierKnowledge.companion_challenge = true;
+    state.activeResearch = Array.isArray(state.activeResearch) ? state.activeResearch : [];
+    state.relicFragments = Number(state.relicFragments || 0);
+    state.ancientRelicFragments = Number(state.ancientRelicFragments || 0);
+    state.academyLevel = Math.max(1, Math.min(10, Number(state.academyLevel || 1)));
+    state.masteryLevel = Math.max(1, Number(state.masteryLevel || 1));
+    return state;
+}
+
+function academyAncientFragmentChance(state) {
+    const level = Math.max(1, Math.min(10, Number(state?.academyLevel || 1)));
+    return Math.min(0.50, level * 0.05);
+}
+
+function researchQueueLimit(state) {
+    const level = Number(state?.academyLevel || 1);
+    if (level >= 10) return 3;
+    if (level >= 5) return 2;
+    return 1;
+}
+
+function getUnlockedModifiers(state) {
+    if (!state) return ["companion_challenge"];
+    state.modifierKnowledge = state.modifierKnowledge || {};
+    state.modifierKnowledge.companion_challenge = true;
+    return Object.keys(state.modifierKnowledge).filter(key => !!state.modifierKnowledge[key] && FORGERY_MODIFIERS.has(key));
+}
+
+function researchCatalogForState(state) {
+    const level = Number(state?.academyLevel || 1);
+    const catalog = {};
+    for (const [tier, data] of Object.entries(MODIFIER_RESEARCH)) {
+        catalog[tier] = data.modifiers.map(modifier => ({
+            id: modifier,
+            label: MODIFIER_LABELS[modifier] || modifier,
+            unlocked: getUnlockedModifiers(state).includes(modifier),
+            ...modifierResearchConfig(modifier, level)
+        }));
+    }
+    return catalog;
+}
+
+function finalizeTrainingState(state) {
+    if (!state) return state;
+    state.activeResearch = Array.isArray(state.activeResearch) ? state.activeResearch : [];
+    const now = Date.now();
+    let changed = false;
+    const stillActive = [];
+
+    for (const job of state.activeResearch) {
+        if (Number(job.completeAt || 0) <= now) {
+            state.modifierKnowledge = state.modifierKnowledge || {};
+            state.modifierKnowledge[job.modifier] = true;
+            addTrainingHistory(state, `Research complete: ${MODIFIER_LABELS[job.modifier] || job.modifier}.`);
+            changed = true;
+        } else {
+            stillActive.push(job);
+        }
+    }
+
+    if (changed || stillActive.length !== state.activeResearch.length) {
+        state.activeResearch = stillActive;
+        state.updatedAt = new Date().toISOString();
+        saveTraining();
+    }
+
+    return state;
 }
 
 function publicTrainingState(state) {
     if (!state) return null;
+    finalizeTrainingState(state);
+    const unlockedModifiers = getUnlockedModifiers(state);
+    const totalModifiers = TRAINING_MODIFIERS.length;
     return {
         viewer: state.viewer,
         companionName: state.companionName,
         academyLevel: Number(state.academyLevel || 1),
         masteryXp: Number(state.masteryXp || 0),
         masteryLevel: Number(state.masteryLevel || 1),
-        specialization: state.specialization || "none",
         cooldowns: state.cooldowns || {},
         dailyLastAt: Number(state.dailyLastAt || 0),
         dailyReady: Date.now() - Number(state.dailyLastAt || 0) >= 24 * 60 * 60 * 1000,
         study: state.study || {},
         relicFragments: Number(state.relicFragments || 0),
+        ancientRelicFragments: Number(state.ancientRelicFragments || 0),
+        ancientFragmentChance: academyAncientFragmentChance(state),
         modifierKnowledge: state.modifierKnowledge || {},
-        agilityFinds: Number(state.agilityFinds || 0),
+        unlockedModifiers,
+        knownMods: unlockedModifiers.length,
+        totalMods: totalModifiers,
+        starterModifierChosen: !!state.starterModifierChosen,
+        starterModifier: state.starterModifier || "",
+        starterChoices: Array.from(STARTER_FORGING_MODIFIERS),
+        activeResearch: state.activeResearch || [],
+        researchQueueLimit: researchQueueLimit(state),
+        researchCatalog: researchCatalogForState(state),
+        expedition: state.expedition || null,
         sparWins: Number(state.sparWins || 0),
         sparLosses: Number(state.sparLosses || 0),
         history: Array.isArray(state.history) ? state.history.slice(-8).reverse() : [],
@@ -1364,13 +1643,9 @@ function publicTrainingState(state) {
         tiers: TRAINING_TIERS,
         prices: {
             study: PRICES.TRAINING_STUDY,
-            agility: PRICES.TRAINING_AGILITY,
-            relicResearch: PRICES.TRAINING_RELIC_RESEARCH,
-            modifierResearch: PRICES.TRAINING_MODIFIER_RESEARCH,
-            rest: PRICES.TRAINING_REST,
+            expedition: PRICES.TRAINING_EXPEDITION,
             minigame: PRICES.TRAINING_MINIGAME,
-            sparring: PRICES.TRAINING_SPARRING,
-            specialization: PRICES.TRAINING_SPECIALIZATION
+            sparring: PRICES.TRAINING_SPARRING
         }
     };
 }
@@ -1398,10 +1673,9 @@ function randomItem(list) {
     return list[Math.floor(Math.random() * list.length)];
 }
 
-function maybeApplySpecializationBonus(state, basePercent) {
+function maybeApplyAcademyXpBonus(state, basePercent) {
     const academyBonus = Math.min(0.20, (Number(state.academyLevel || 1) - 1) * 0.015);
-    const scholarBonus = state.specialization === "scholar" ? 0.03 : 0;
-    return Number((basePercent + academyBonus + scholarBonus).toFixed(4));
+    return Number((basePercent + academyBonus).toFixed(4));
 }
 
 function setCooldown(state, key, ms) {
@@ -1431,10 +1705,11 @@ app.post("/training/combat", (req, res) => {
     const tier = TRAINING_TIERS[tierName];
     if (!tier) return res.status(400).json({ ok: false, error: "Invalid training tier." });
     const state = getTrainingState(valid.viewer, valid.companionName);
+    finalizeTrainingState(state);
     if (isOnCooldown(state, `combat_${tierName}`)) return res.status(400).json({ ok: false, error: `Training cooldown: ${secondsLeft(state, `combat_${tierName}`)}s left.` });
     const spend = spendDirt(valid.viewer, tier.cost, `training_combat_${tierName}`);
     if (!spend.ok) return res.status(400).json(spend);
-    const xpPercent = maybeApplySpecializationBonus(state, tier.xpPercent);
+    const xpPercent = maybeApplyAcademyXpBonus(state, tier.xpPercent);
     const request = queueShopAction({ action: "training_xp", viewer: valid.viewer, companionName: valid.companionName, xpPercent, trainingType: tierName, cost: tier.cost });
     addMastery(state, tierName === "elite" ? 35 : tierName === "advanced" ? 20 : 10);
     setCooldown(state, `combat_${tierName}`, tier.cooldownMs);
@@ -1447,25 +1722,19 @@ app.post("/training/daily", (req, res) => {
     const valid = validateTrainingBody(req);
     if (!valid.ok) return res.status(valid.status).json(valid);
     const state = getTrainingState(valid.viewer, valid.companionName);
+    finalizeTrainingState(state);
     if (Date.now() - Number(state.dailyLastAt || 0) < 24 * 60 * 60 * 1000) return res.status(400).json({ ok: false, error: "Daily training is not ready yet." });
-    const rewards = ["xp", "dirt", "fragment", "modifier"];
-    const reward = randomItem(rewards);
+
+    const reward = randomItem(["xp", "dirt"]);
     let request = null;
     let wallet = publicWallet(getWallet(valid.viewer));
     if (reward === "xp") {
         request = queueShopAction({ action: "training_xp", viewer: valid.viewer, companionName: valid.companionName, xpPercent: 0.05, trainingType: "daily", cost: 0 });
         addTrainingHistory(state, "Daily Training: +5% TNL XP queued.");
-    } else if (reward === "dirt") {
+    } else {
         const amount = 25 + Math.floor(Math.random() * 51);
         const w = getWallet(valid.viewer); w.dirt += amount; w.updatedAt = new Date().toISOString(); saveWallets(); wallet = publicWallet(w);
         addTrainingHistory(state, `Daily Training: found ${amount} Dirt.`);
-    } else if (reward === "fragment") {
-        state.relicFragments = Number(state.relicFragments || 0) + 1;
-        addTrainingHistory(state, "Daily Training: found 1 relic research fragment.");
-    } else {
-        const mod = randomItem(TRAINING_MODIFIERS);
-        state.modifierKnowledge = state.modifierKnowledge || {}; state.modifierKnowledge[mod] = true;
-        addTrainingHistory(state, `Daily Training: discovered ${mod.replace('the_vault:', '')} knowledge.`);
     }
     state.dailyLastAt = Date.now();
     addMastery(state, 15);
@@ -1478,9 +1747,10 @@ app.post("/training/study", (req, res) => {
     if (!valid.ok) return res.status(valid.status).json(valid);
     const focus = String(req.body.focus || "vault_xp").toLowerCase();
     if (!STUDY_FOCUSES.includes(focus)) return res.status(400).json({ ok: false, error: "Invalid study focus." });
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    finalizeTrainingState(state);
     const spend = spendDirt(valid.viewer, PRICES.TRAINING_STUDY, "training_study");
     if (!spend.ok) return res.status(400).json(spend);
-    const state = getTrainingState(valid.viewer, valid.companionName);
     state.study = state.study || {};
     state.study[focus] = Math.min(10, Number(state.study[focus] || 0) + 0.25);
     addMastery(state, 12);
@@ -1489,79 +1759,138 @@ app.post("/training/study", (req, res) => {
     res.json({ ok: true, wallet: spend, training: publicTrainingState(state) });
 });
 
-app.post("/training/agility", (req, res) => {
+app.post("/training/choose-starter-modifier", (req, res) => {
     const valid = validateTrainingBody(req);
     if (!valid.ok) return res.status(valid.status).json(valid);
+    const modifier = String(req.body.modifier || "").trim();
+    if (!STARTER_FORGING_MODIFIERS.has(modifier)) return res.status(400).json({ ok: false, error: "Invalid starter modifier." });
     const state = getTrainingState(valid.viewer, valid.companionName);
-    const spend = spendDirt(valid.viewer, PRICES.TRAINING_AGILITY, "training_agility");
-    if (!spend.ok) return res.status(400).json(spend);
-    const chance = Math.min(0.30, 0.08 + Number(state.academyLevel || 1) * 0.015);
-    const success = Math.random() < chance;
-    if (success) state.agilityFinds = Number(state.agilityFinds || 0) + 1;
-    addMastery(state, 14);
-    addTrainingHistory(state, success ? "Agility Training: discovered trail knowledge." : "Agility Training: no discovery this time.");
+    finalizeTrainingState(state);
+    if (state.starterModifierChosen) return res.status(400).json({ ok: false, error: "Starter forging discipline already chosen." });
+    state.starterModifierChosen = true;
+    state.starterModifier = modifier;
+    state.modifierKnowledge = state.modifierKnowledge || {};
+    state.modifierKnowledge.companion_challenge = true;
+    state.modifierKnowledge[modifier] = true;
+    addMastery(state, 10);
+    addTrainingHistory(state, `First forging discipline chosen: ${MODIFIER_LABELS[modifier] || modifier}.`);
     saveTraining();
-    res.json({ ok: true, success, wallet: spend, training: publicTrainingState(state) });
-});
-
-app.post("/training/relic-research", (req, res) => {
-    const valid = validateTrainingBody(req);
-    if (!valid.ok) return res.status(valid.status).json(valid);
-    const spend = spendDirt(valid.viewer, PRICES.TRAINING_RELIC_RESEARCH, "training_relic_research");
-    if (!spend.ok) return res.status(400).json(spend);
-    const state = getTrainingState(valid.viewer, valid.companionName);
-    const gain = state.specialization === "blacksmith" ? 2 : 1;
-    state.relicFragments = Number(state.relicFragments || 0) + gain;
-    addMastery(state, 16);
-    addTrainingHistory(state, `Relic Research: gained ${gain} fragment${gain === 1 ? "" : "s"}.`);
-    saveTraining();
-    res.json({ ok: true, wallet: spend, training: publicTrainingState(state) });
+    res.json({ ok: true, training: publicTrainingState(state) });
 });
 
 app.post("/training/modifier-research", (req, res) => {
     const valid = validateTrainingBody(req);
     if (!valid.ok) return res.status(valid.status).json(valid);
-    const spend = spendDirt(valid.viewer, PRICES.TRAINING_MODIFIER_RESEARCH, "training_modifier_research");
-    if (!spend.ok) return res.status(400).json(spend);
+    const modifier = String(req.body.modifier || "").trim();
+    if (!FORGERY_MODIFIERS.has(modifier)) return res.status(400).json({ ok: false, error: "Invalid modifier." });
+
     const state = getTrainingState(valid.viewer, valid.companionName);
-    const known = state.modifierKnowledge || {};
-    const unknown = TRAINING_MODIFIERS.filter(mod => !known[mod]);
-    const discovered = unknown.length ? randomItem(unknown) : randomItem(TRAINING_MODIFIERS);
-    state.modifierKnowledge = known;
-    state.modifierKnowledge[discovered] = true;
+    finalizeTrainingState(state);
+
+    if (getUnlockedModifiers(state).includes(modifier)) {
+        return res.status(400).json({ ok: false, error: "Modifier already researched.", modifier });
+    }
+    if ((state.activeResearch || []).some(job => job.modifier === modifier)) {
+        return res.status(400).json({ ok: false, error: "Modifier is already being researched.", modifier });
+    }
+    if ((state.activeResearch || []).length >= researchQueueLimit(state)) {
+        return res.status(400).json({ ok: false, error: "No research queue available.", activeResearch: state.activeResearch, limit: researchQueueLimit(state) });
+    }
+
+    const config = modifierResearchConfig(modifier, state.academyLevel);
+    if (Number(state.relicFragments || 0) < config.costFragments) {
+        return res.status(400).json({ ok: false, error: "Not enough Relic Fragments", required: config.costFragments, current: Number(state.relicFragments || 0) });
+    }
+
+    const spend = spendDirt(valid.viewer, config.costDirt, "training_modifier_research");
+    if (!spend.ok) return res.status(400).json(spend);
+
+    const fragmentSpend = spendTrainingFragments(state, config.costFragments, 0, `Research ${config.label}`);
+    if (!fragmentSpend.ok) return res.status(400).json(fragmentSpend);
+
+    const now = Date.now();
+    const job = {
+        id: `${now}-${Math.random().toString(16).slice(2)}`,
+        modifier,
+        label: config.label,
+        tier: config.tier,
+        startedAt: now,
+        completeAt: now + config.durationMs,
+        costDirt: config.costDirt,
+        costFragments: config.costFragments
+    };
+    state.activeResearch = state.activeResearch || [];
+    state.activeResearch.push(job);
     addMastery(state, 18);
-    addTrainingHistory(state, `Modifier Research: unlocked ${discovered.replace('the_vault:', '')}.`);
+    addTrainingHistory(state, `Research started: ${config.label}.`);
     saveTraining();
-    res.json({ ok: true, discovered, wallet: spend, training: publicTrainingState(state) });
+    res.json({ ok: true, job, wallet: spend, fragments: fragmentSpend, training: publicTrainingState(state) });
 });
 
-app.post("/training/specialize", (req, res) => {
+app.post("/training/claim-research", (req, res) => {
     const valid = validateTrainingBody(req);
     if (!valid.ok) return res.status(valid.status).json(valid);
-    const specialization = String(req.body.specialization || "").toLowerCase();
-    if (!SPECIALIZATIONS.includes(specialization)) return res.status(400).json({ ok: false, error: "Invalid specialization." });
-    const spend = spendDirt(valid.viewer, PRICES.TRAINING_SPECIALIZATION, "training_specialization");
-    if (!spend.ok) return res.status(400).json(spend);
     const state = getTrainingState(valid.viewer, valid.companionName);
-    state.specialization = specialization;
-    addMastery(state, 10);
-    addTrainingHistory(state, `Specialization selected: ${specialization.replace(/_/g, ' ')}.`);
+    finalizeTrainingState(state);
+    res.json({ ok: true, training: publicTrainingState(state) });
+});
+
+app.post("/training/expedition", (req, res) => {
+    const valid = validateTrainingBody(req);
+    if (!valid.ok) return res.status(valid.status).json(valid);
+    const state = getTrainingState(valid.viewer, valid.companionName);
+    finalizeTrainingState(state);
+
+    const now = Date.now();
+    const expedition = state.expedition || null;
+
+    if (expedition && Number(expedition.completeAt || 0) > now) {
+        return res.status(400).json({ ok: false, error: "Expedition still in progress.", expedition, remainingMs: Number(expedition.completeAt || 0) - now, training: publicTrainingState(state) });
+    }
+
+    if (expedition && Number(expedition.completeAt || 0) <= now) {
+        const chance = Number(expedition.ancientChance || academyAncientFragmentChance(state));
+        const ancientFound = Math.random() < chance;
+        state.relicFragments = Number(state.relicFragments || 0) + 1;
+        if (ancientFound) state.ancientRelicFragments = Number(state.ancientRelicFragments || 0) + 1;
+        state.expedition = null;
+        addMastery(state, ancientFound ? 25 : 15);
+        addTrainingHistory(state, ancientFound ? "Expedition complete: found 1 Relic Fragment and 1 Ancient Relic Fragment." : "Expedition complete: found 1 Relic Fragment.");
+        saveTraining();
+        return res.json({ ok: true, completed: true, reward: { relicFragments: 1, ancientRelicFragments: ancientFound ? 1 : 0, ancientChance: chance }, training: publicTrainingState(state) });
+    }
+
+    const spend = spendDirt(valid.viewer, PRICES.TRAINING_EXPEDITION, "training_expedition");
+    if (!spend.ok) return res.status(400).json(spend);
+
+    state.expedition = {
+        id: `${now}-${Math.random().toString(16).slice(2)}`,
+        startedAt: now,
+        completeAt: now + EXPEDITION_DURATION_MS,
+        ancientChance: academyAncientFragmentChance(state),
+        cost: PRICES.TRAINING_EXPEDITION
+    };
+    addMastery(state, 5);
+    addTrainingHistory(state, "Expedition started. Your companion will return in 5 minutes.");
     saveTraining();
-    res.json({ ok: true, wallet: spend, training: publicTrainingState(state) });
+    res.json({ ok: true, started: true, wallet: spend, expedition: state.expedition, training: publicTrainingState(state) });
+});
+
+app.post("/training/expedition/claim", (req, res) => {
+    req.url = "/training/expedition";
+    return app._router.handle(req, res, () => {});
+});
+
+app.post("/training/agility", (req, res) => {
+    return res.status(410).json({ ok: false, error: "Agility Training has been removed. Trails are bought from the Shop." });
+});
+
+app.post("/training/relic-research", (req, res) => {
+    return res.status(410).json({ ok: false, error: "Relic Research has been removed. Fragments now come from Expeditions only." });
 });
 
 app.post("/training/rest", (req, res) => {
-    const valid = validateTrainingBody(req);
-    if (!valid.ok) return res.status(valid.status).json(valid);
-    const spend = spendDirt(valid.viewer, PRICES.TRAINING_REST, "training_rest");
-    if (!spend.ok) return res.status(400).json(spend);
-    const state = getTrainingState(valid.viewer, valid.companionName);
-    const request = queueShopAction({ action: "training_rest", viewer: valid.viewer, companionName: valid.companionName, cost: PRICES.TRAINING_REST });
-    state.cooldowns = {};
-    addMastery(state, 8);
-    addTrainingHistory(state, "Rest: cooldowns cleared and healing queued.");
-    saveTraining();
-    res.json({ ok: true, request, wallet: spend, training: publicTrainingState(state) });
+    return res.status(410).json({ ok: false, error: "Rest is currently disabled." });
 });
 
 app.post("/training/minigame", (req, res) => {
@@ -1571,6 +1900,7 @@ app.post("/training/minigame", (req, res) => {
     const spend = spendDirt(valid.viewer, PRICES.TRAINING_MINIGAME, "training_minigame");
     if (!spend.ok) return res.status(400).json(spend);
     const state = getTrainingState(valid.viewer, valid.companionName);
+    finalizeTrainingState(state);
     const roll = Math.random();
     let xpPercent = 0.03;
     let event = "Success";
@@ -1591,6 +1921,7 @@ app.post("/training/spar", (req, res) => {
     const spend = spendDirt(valid.viewer, PRICES.TRAINING_SPARRING, "training_sparring");
     if (!spend.ok) return res.status(400).json(spend);
     const state = getTrainingState(valid.viewer, valid.companionName);
+    finalizeTrainingState(state);
     const power = Math.random() + Number(state.masteryLevel || 1) * 0.02;
     const enemy = Math.random() + 0.25;
     const won = power >= enemy;
@@ -1607,17 +1938,20 @@ app.post("/training/upgrade-academy", (req, res) => {
     const valid = validateTrainingBody(req);
     if (!valid.ok) return res.status(valid.status).json(valid);
     const state = getTrainingState(valid.viewer, valid.companionName);
+    finalizeTrainingState(state);
     const level = Number(state.academyLevel || 1);
     if (level >= 10) return res.status(400).json({ ok: false, error: "Academy is already level 10." });
-    const cost = 250 * level;
+
+    const cost = Math.floor(500 * level * 1.35);
     const spend = spendDirt(valid.viewer, cost, "training_upgrade_academy");
     if (!spend.ok) return res.status(400).json(spend);
     state.academyLevel = level + 1;
     addMastery(state, 25);
-    addTrainingHistory(state, `Academy upgraded to level ${state.academyLevel}.`);
+    addTrainingHistory(state, `Academy upgraded to level ${state.academyLevel}. Ancient fragment chance is now ${Math.round(academyAncientFragmentChance(state) * 100)}%.`);
     saveTraining();
     res.json({ ok: true, wallet: spend, training: publicTrainingState(state) });
 });
+
 
 app.post("/viewer-link", (req, res) => {
     const viewer = normalizeViewer(req.body.viewer);
