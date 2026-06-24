@@ -226,21 +226,12 @@ async function syncAllWalletsToSupabase() {
 }
 
 async function syncViewerLinkToSupabase(wallet) {
-    if (!USE_SUPABASE || !wallet) {
-        return;
-    }
-
-    const row = walletToSupabaseRow(wallet);
-
-    await supabaseRequest("/viewer_links?on_conflict=viewer", {
-        method: "POST",
-        headers: {
-            Prefer: "resolution=merge-duplicates"
-        },
-        body: JSON.stringify([row])
-    });
-
-    console.log(`[SUPABASE] Synced viewer link for ${row.viewer}.`);
+    // Viewer links are not used anymore.
+    // The wallets table is the single source of truth for:
+    // viewer, dirt, twitch_id, display_name, companion_name, updated_at.
+    // Keeping this disabled avoids Supabase errors caused by viewer_links
+    // missing wallet columns such as dirt.
+    return;
 }
 
 async function loadWalletsFromSupabase() {
