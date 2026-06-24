@@ -1957,31 +1957,79 @@ app.post("/training/upgrade-academy", (req, res) => {
    Admin Testing Endpoints
    All require x-api-key
    ========================= */
-function adminTrainingAndForgeryState(viewer, companionName) {
-    const training = getTrainingState(viewer, companionName);
-    const forgery = getForgeryState(viewer, companionName);
+function resolveAdminViewerIdentifier(identifier) {
+    const raw = String(identifier || "").trim();
+    const normalized = normalizeViewer(raw);
+
+    if (!normalized) {
+        return { ok: false, viewer: "", requestedViewer: raw, resolved: false, error: "Missing viewer." };
+    }
+
+    /*
+     * Admin commands are meant to be used with readable Twitch display names,
+     * for example:
+     *   /meowtyadmin setfragments DjHilha Hilha 10 10
+     *
+     * The extension usually stores the real viewer key as Twitch numeric ID
+     * such as 145555184.  Resolve the admin input through the wallet table so
+     * commands update the same profile that the extension reads.
+     */
+    const resolvedKey = resolveWalletKey(raw) || resolveWalletKey(normalized);
+
+    if (resolvedKey) {
+        return {
+            ok: true,
+            viewer: resolvedKey,
+            requestedViewer: raw,
+            resolved: resolvedKey !== normalized
+        };
+    }
+
+    return {
+        ok: true,
+        viewer: normalized,
+        requestedViewer: raw,
+        resolved: false
+    };
+}
+
+function adminTrainingAndForgeryState(viewer, companionName, requestedViewer) {
+    const resolved = resolveAdminViewerIdentifier(viewer);
+    const finalViewer = resolved.ok ? resolved.viewer : normalizeViewer(viewer);
+    const training = getTrainingState(finalViewer, companionName);
+    const forgery = getForgeryState(finalViewer, companionName);
     finalizeTrainingState(training);
     return {
+        requestedViewer: requestedViewer || resolved.requestedViewer || viewer,
+        resolvedViewer: finalViewer,
+        resolvedFromDisplayName: !!resolved.resolved,
         training: publicTrainingState(training),
         forgery: publicForgeryState(forgery),
-        wallet: publicWallet(getWallet(viewer))
+        wallet: publicWallet(getWallet(finalViewer))
     };
 }
 
 function validateAdminCompanionBody(req) {
-    const viewer = normalizeViewer(req.body.viewer || req.body.identifier);
+    const requestedViewer = String(req.body.viewer || req.body.identifier || "").trim();
+    const resolved = resolveAdminViewerIdentifier(requestedViewer);
     const companionName = String(req.body.companionName || req.body.companion || "").trim();
-    if (!viewer || !companionName) {
+    if (!resolved.ok || !resolved.viewer || !companionName) {
         return { ok: false, status: 400, error: "Missing viewer or companionName." };
     }
-    return { ok: true, viewer, companionName };
+    return {
+        ok: true,
+        viewer: resolved.viewer,
+        requestedViewer: resolved.requestedViewer,
+        resolvedFromDisplayName: resolved.resolved,
+        companionName
+    };
 }
 
 app.get("/admin/training/:viewer/:companionName", requireApiKey, (req, res) => {
-    const viewer = normalizeViewer(req.params.viewer);
+    const resolved = resolveAdminViewerIdentifier(req.params.viewer);
     const companionName = String(req.params.companionName || "").trim();
-    if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companionName." });
-    res.json({ ok: true, ...adminTrainingAndForgeryState(viewer, companionName) });
+    if (!resolved.ok || !resolved.viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companionName." });
+    res.json({ ok: true, ...adminTrainingAndForgeryState(resolved.viewer, companionName, resolved.requestedViewer) });
 });
 
 app.post("/admin/companion/reset", requireApiKey, (req, res) => {
