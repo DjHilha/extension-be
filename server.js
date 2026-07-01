@@ -14,6 +14,7 @@ const WATCHERS_FILE = path.join(DATA_DIR, "watchers.json");
 const FORGERY_FILE = path.join(DATA_DIR, "forgery.json");
 const TRAINING_FILE = path.join(DATA_DIR, "training_center.json");
 const STREAMER_CHANNELS_FILE = path.join(DATA_DIR, "streamer_channels.json");
+const STREAMER_CHANNELS_REPO_FILE = path.join(__dirname, "streamer_channels.json");
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
@@ -82,10 +83,38 @@ function defaultStreamerChannels() {
 }
 
 function loadStreamerChannels() {
-    streamerChannels = readJsonFile(STREAMER_CHANNELS_FILE, defaultStreamerChannels());
+    /*
+     * Prefer streamer_channels.json committed next to server.js.
+     * DATA_DIR is Render's runtime data folder, so files uploaded to Git are not
+     * found there unless we explicitly check __dirname too.
+     */
+    let loaded = null;
+
+    try {
+        if (fs.existsSync(STREAMER_CHANNELS_REPO_FILE)) {
+            const raw = fs.readFileSync(STREAMER_CHANNELS_REPO_FILE, "utf8");
+            loaded = raw.trim() ? JSON.parse(raw) : null;
+            console.log(`[CHANNELS] Loaded ${STREAMER_CHANNELS_REPO_FILE}`);
+        }
+    } catch (error) {
+        console.error(`[CHANNELS] Failed reading ${STREAMER_CHANNELS_REPO_FILE}`, error);
+    }
+
+    if (!loaded) {
+        loaded = readJsonFile(STREAMER_CHANNELS_FILE, defaultStreamerChannels());
+        console.log(`[CHANNELS] Loaded ${STREAMER_CHANNELS_FILE}`);
+    }
+
+    streamerChannels = loaded;
     if (!streamerChannels || typeof streamerChannels !== "object") streamerChannels = defaultStreamerChannels();
     if (!streamerChannels.servers || typeof streamerChannels.servers !== "object") streamerChannels.servers = defaultStreamerChannels().servers;
+
+    // Keep a runtime cache copy in DATA_DIR too.
     writeJsonFile(STREAMER_CHANNELS_FILE, streamerChannels);
+
+    const enabledServers = Object.entries(streamerChannels.servers || {}).filter(([, c]) => c && c.enabled !== false);
+    const channelCount = enabledServers.reduce((sum, [, c]) => sum + Object.keys(c.channels || {}).length, 0);
+    console.log(`[CHANNELS] Active servers: ${enabledServers.length}, allowed channels: ${channelCount}`);
 }
 
 function firstEnabledServerId() {
@@ -1103,7 +1132,29 @@ function requireApiKey(req, res, next) {
 // Data is loaded before the server starts at the bottom of this file.
 
 app.get("/streamer-channels", (req, res) => res.json({ ok: true, ...streamerChannels }));
-app.get("/", (req, res) => res.json({ ok: true, service: "Meowtys backend", prices: PRICES, persistence: { dataDir: DATA_DIR, wallets: Object.keys(wallets).length, queuedActions: shopActionQueue.length } }));
+app.get("/", (req, res) => res.json({ ok: true, service: "Meowtys backend", prices: PRICES, channels: { servers: Object.keys(streamerChannels.servers || {}).length, activeServer: firstEnabledServerId() }, persistence: { dataDir: DATA_DIR, wallets: Object.keys(wallets).length, queuedActions: shopActionQueue.length } }));
+app.get("/servers", (req, res) => {
+    const servers = {};
+    for (const [serverId, config] of Object.entries(streamerChannels.servers || {})) {
+        if (!config || config.enabled === false) continue;
+        servers[serverId] = {
+            enabled: true,
+            name: String(config.name || serverId),
+            channels: config.channels || {}
+        };
+    }
+    res.json({
+        ok: true,
+        servers,
+        count: Object.keys(servers).length,
+        allowedChannels: Object.values(servers).reduce((sum, server) => sum + Object.keys(server.channels || {}).length, 0)
+    });
+});
+
+app.get("/channel-config", (req, res) => {
+    res.json({ ok: true, config: streamerChannels });
+});
+
 app.get("/prices", (req, res) => res.json({ ok: true, prices: PRICES }));
 app.get("/companions", (req, res) => res.json(companionsData));
 app.post("/companions", requireApiKey, (req, res) => {
