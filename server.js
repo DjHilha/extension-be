@@ -1234,7 +1234,47 @@ app.get("/channel-config", (req, res) => {
 });
 
 app.get("/prices", (req, res) => res.json({ ok: true, prices: PRICES }));
-app.get("/companions", (req, res) => res.json(companionsData));
+app.get("/companions", (req, res) => {
+    const channelId = req.query.channelId || req.headers["x-channel-id"] || "";
+    const serverId = normalizeServerId(req.query.serverId || resolveServerIdFromChannel(channelId));
+    let list = Array.isArray(companionsData.companions) ? companionsData.companions.slice() : [];
+
+    // Only show companions for the resolved server.
+    list = list.filter(c => normalizeServerId(c.serverId || serverId) === serverId);
+
+    // If a viewer is provided, move their linked owner+companion to the front.
+    // This keeps old UI search-by-name working even when multiple owners have
+    // companions with the same name.
+    const requestedViewer = String(req.query.viewer || "").trim();
+    const scopedViewer = requestedViewer ? scopeViewerFromRequest(req, requestedViewer) : "";
+    const wallet = scopedViewer ? getWalletResolved(scopedViewer, false) : null;
+    const linked = wallet ? parseCompanionLink(wallet.companionName) : null;
+
+    if (linked && linked.companionName) {
+        const linkedName = String(linked.companionName || "").trim().toLowerCase();
+        const linkedOwnerUuid = String(linked.ownerUuid || "").trim().toLowerCase();
+        const linkedOwnerName = String(linked.ownerName || "").trim().toLowerCase();
+
+        list.sort((a, b) => {
+            const score = c => {
+                const name = String(c.name || "").trim().toLowerCase();
+                const ownerUuid = String(c.ownerUuid || "").trim().toLowerCase();
+                const ownerName = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
+                if (name !== linkedName) return 0;
+                if (linkedOwnerUuid && ownerUuid === linkedOwnerUuid) return 3;
+                if (linkedOwnerName && ownerName === linkedOwnerName) return 2;
+                return 1;
+            };
+            return score(b) - score(a);
+        });
+    }
+
+    res.json({
+        ...companionsData,
+        serverId,
+        companions: list
+    });
+});
 app.post("/companions", requireApiKey, (req, res) => {
     if (!req.body || !Array.isArray(req.body.companions)) return res.status(400).json({ ok: false, error: "Expected body with companions array" });
     const serverId = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(req.body.channelId));
