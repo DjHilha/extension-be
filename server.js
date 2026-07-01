@@ -13,6 +13,7 @@ const QUEUE_FILE = path.join(DATA_DIR, "shop_queue.json");
 const WATCHERS_FILE = path.join(DATA_DIR, "watchers.json");
 const FORGERY_FILE = path.join(DATA_DIR, "forgery.json");
 const TRAINING_FILE = path.join(DATA_DIR, "training_center.json");
+const STREAMER_CHANNELS_FILE = path.join(DATA_DIR, "streamer_channels.json");
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
@@ -63,6 +64,100 @@ let wallets = {};
 let watchers = {};
 let forgeryData = {};
 let trainingData = {};
+let streamerChannels = {};
+
+
+function defaultStreamerChannels() {
+    return {
+        servers: {
+            meowtys_s3: {
+                enabled: true,
+                name: "Meowtys S3",
+                channels: {
+                    "145555184": "DjHilha"
+                }
+            }
+        }
+    };
+}
+
+function loadStreamerChannels() {
+    streamerChannels = readJsonFile(STREAMER_CHANNELS_FILE, defaultStreamerChannels());
+    if (!streamerChannels || typeof streamerChannels !== "object") streamerChannels = defaultStreamerChannels();
+    if (!streamerChannels.servers || typeof streamerChannels.servers !== "object") streamerChannels.servers = defaultStreamerChannels().servers;
+    writeJsonFile(STREAMER_CHANNELS_FILE, streamerChannels);
+}
+
+function firstEnabledServerId() {
+    for (const [serverId, config] of Object.entries(streamerChannels.servers || {})) {
+        if (config && config.enabled !== false) return serverId;
+    }
+    return "meowtys_s3";
+}
+
+function resolveServerIdFromChannel(channelId) {
+    const wanted = String(channelId || "").trim();
+    for (const [serverId, config] of Object.entries(streamerChannels.servers || {})) {
+        if (!config || config.enabled === false) continue;
+        const channels = config.channels || {};
+        if (!wanted) return serverId;
+        if (Object.prototype.hasOwnProperty.call(channels, wanted)) return serverId;
+        for (const name of Object.values(channels)) {
+            if (String(name || "").toLowerCase() === wanted.toLowerCase()) return serverId;
+        }
+    }
+    return firstEnabledServerId();
+}
+
+function normalizeServerId(serverId) {
+    return String(serverId || firstEnabledServerId() || "meowtys_s3").trim().toLowerCase();
+}
+
+function encodeCompanionLink(serverId, ownerUuid, ownerName, companionName) {
+    const cleanServer = normalizeServerId(serverId);
+    const cleanOwnerUuid = String(ownerUuid || "").trim();
+    const cleanOwnerName = String(ownerName || "").trim();
+    const cleanCompanion = String(companionName || "").trim();
+    if (!cleanOwnerUuid || !cleanCompanion) return cleanCompanion;
+    return `${cleanServer}::${cleanOwnerUuid}::${cleanOwnerName.replace(/:/g, "_")}::${cleanCompanion}`;
+}
+
+function parseCompanionLink(value) {
+    const raw = String(value || "").trim();
+    const parts = raw.split("::");
+    if (parts.length >= 4) {
+        return {
+            serverId: normalizeServerId(parts[0]),
+            ownerUuid: parts[1],
+            ownerName: parts[2],
+            companionName: parts.slice(3).join("::")
+        };
+    }
+    return { serverId: firstEnabledServerId(), ownerUuid: "", ownerName: "", companionName: raw };
+}
+
+function companionStateKeyFor(viewer, companionName) {
+    const wallet = getWalletResolved(viewer, false) || getWallet(viewer);
+    const linked = parseCompanionLink(wallet && wallet.companionName);
+    const requested = String(companionName || "").trim();
+    if (linked.ownerUuid && (!requested || linked.companionName.toLowerCase() === requested.toLowerCase())) {
+        return `${normalizeServerId(linked.serverId)}::${linked.ownerUuid}::${linked.companionName.toLowerCase()}`;
+    }
+    return `${firstEnabledServerId()}::viewer::${normalizeViewer(viewer)}::${requested.toLowerCase()}`;
+}
+
+function findExportedCompanion(serverId, minecraftName, companionName) {
+    const sid = normalizeServerId(serverId);
+    const ownerWanted = String(minecraftName || "").trim().toLowerCase();
+    const companionWanted = String(companionName || "").trim().toLowerCase();
+    if (!ownerWanted || !companionWanted || !Array.isArray(companionsData.companions)) return null;
+    return companionsData.companions.find(c => {
+        const cServer = normalizeServerId(c.serverId || firstEnabledServerId());
+        const cOwner = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
+        const cName = String(c.name || "").trim().toLowerCase();
+        return cServer === sid && cOwner === ownerWanted && cName === companionWanted;
+    }) || null;
+}
 
 function ensureDataDir() {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -96,6 +191,8 @@ function readJsonFile(file, fallback) {
 }
 
 async function loadPersistentData() {
+    loadStreamerChannels();
+
     if (USE_SUPABASE) {
         wallets = {};
     } else {
@@ -582,14 +679,23 @@ function updateWalletIdentity(viewer, twitchId, displayName) {
     return wallet;
 }
 
-function linkWalletCompanion(viewer, twitchId, displayName, companionName) {
+function linkWalletCompanion(viewer, twitchId, displayName, companionName, minecraftName = "", channelId = "", serverIdOverride = "") {
     const wallet = updateWalletIdentity(viewer, twitchId, displayName);
     if (!wallet) return null;
 
     const cleanCompanionName = String(companionName || "").trim();
+    const serverId = normalizeServerId(serverIdOverride || resolveServerIdFromChannel(channelId));
+    const companion = findExportedCompanion(serverId, minecraftName, cleanCompanionName);
 
     if (cleanCompanionName) {
-        wallet.companionName = cleanCompanionName;
+        if (companion && companion.ownerUuid) {
+            wallet.companionName = encodeCompanionLink(serverId, companion.ownerUuid, companion.owner || companion.ownerName || minecraftName, cleanCompanionName);
+        } else if (minecraftName) {
+            // Allow linking before the exporter has seen the companion; it will still be isolated by owner name.
+            wallet.companionName = encodeCompanionLink(serverId, `ownername:${String(minecraftName).trim().toLowerCase()}`, minecraftName, cleanCompanionName);
+        } else {
+            wallet.companionName = cleanCompanionName;
+        }
     }
 
     wallet.updatedAt = new Date().toISOString();
@@ -661,13 +767,19 @@ function getWalletResolved(identifier, createIfMissing = false) {
 
 function publicWallet(wallet) {
     if (!wallet) return null;
+    const linked = parseCompanionLink(wallet.companionName);
 
     return {
         viewer: wallet.viewer,
         dirt: Number(wallet.dirt || 0),
         twitchId: String(wallet.twitchId || ""),
         displayName: String(wallet.displayName || wallet.viewer || ""),
-        companionName: String(wallet.companionName || ""),
+        serverId: linked.serverId || firstEnabledServerId(),
+        ownerUuid: linked.ownerUuid || "",
+        ownerName: linked.ownerName || "",
+        minecraftName: linked.ownerName || "",
+        companionName: linked.companionName || "",
+        companionKey: linked.ownerUuid ? `${linked.serverId}::${linked.ownerUuid}::${String(linked.companionName || "").toLowerCase()}` : "",
         updatedAt: String(wallet.updatedAt || "")
     };
 }
@@ -784,7 +896,7 @@ function modifierResearchConfig(modifier, academyLevel = 1) {
 }
 
 function forgeryKey(viewer, companionName) {
-    return `${normalizeViewer(viewer)}::${String(companionName || "").trim().toLowerCase()}`;
+    return companionStateKeyFor(viewer, companionName);
 }
 
 function rollForgerySlots() {
@@ -990,13 +1102,26 @@ function requireApiKey(req, res, next) {
 
 // Data is loaded before the server starts at the bottom of this file.
 
+app.get("/streamer-channels", (req, res) => res.json({ ok: true, ...streamerChannels }));
 app.get("/", (req, res) => res.json({ ok: true, service: "Meowtys backend", prices: PRICES, persistence: { dataDir: DATA_DIR, wallets: Object.keys(wallets).length, queuedActions: shopActionQueue.length } }));
 app.get("/prices", (req, res) => res.json({ ok: true, prices: PRICES }));
 app.get("/companions", (req, res) => res.json(companionsData));
 app.post("/companions", requireApiKey, (req, res) => {
     if (!req.body || !Array.isArray(req.body.companions)) return res.status(400).json({ ok: false, error: "Expected body with companions array" });
-    companionsData = req.body;
-    res.json({ ok: true, count: companionsData.companions.length });
+    const serverId = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(req.body.channelId));
+    const incoming = req.body.companions.map(c => ({ ...c, serverId }));
+    const existing = Array.isArray(companionsData.companions) ? companionsData.companions : [];
+    const byKey = new Map();
+    for (const c of existing) {
+        const key = `${normalizeServerId(c.serverId || serverId)}::${String(c.ownerUuid || c.owner || "").toLowerCase()}::${String(c.name || "").toLowerCase()}`;
+        byKey.set(key, c);
+    }
+    for (const c of incoming) {
+        const key = `${serverId}::${String(c.ownerUuid || c.owner || "").toLowerCase()}::${String(c.name || "").toLowerCase()}`;
+        byKey.set(key, c);
+    }
+    companionsData = { serverId, companions: Array.from(byKey.values()) };
+    res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length });
 });
 app.get("/tasks", (req, res) => res.json(tasksData));
 app.post("/tasks", requireApiKey, (req, res) => {
@@ -1700,7 +1825,7 @@ const TRAINING_MODIFIERS = Array.from(FORGERY_MODIFIERS || []);
 const EXPEDITION_DURATION_MS = 5 * 60 * 1000;
 
 function trainingKey(viewer, companionName) {
-    return `${normalizeViewer(viewer)}::${String(companionName || "").trim().toLowerCase()}`;
+    return companionStateKeyFor(viewer, companionName);
 }
 
 function getTrainingState(viewer, companionName) {
@@ -2465,25 +2590,21 @@ app.post("/viewer-link", (req, res) => {
     const twitchId = String(req.body.twitchId || "").trim();
     const displayName = String(req.body.displayName || viewer).trim();
     const companionName = String(req.body.companionName || "").trim();
+    const minecraftName = String(req.body.minecraftName || req.body.ownerName || "").trim();
+    const channelId = String(req.body.channelId || "").trim();
+    const serverId = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(channelId));
 
     if (!viewer) {
-        return res.status(400).json({
-            ok: false,
-            error: "Missing viewer"
-        });
+        return res.status(400).json({ ok: false, error: "Missing viewer" });
     }
 
-    const wallet = linkWalletCompanion(
-            viewer,
-            twitchId,
-            displayName,
-            companionName
-    );
+    if (companionName && !minecraftName) {
+        return res.status(400).json({ ok: false, error: "Enter the Minecraft owner name too, so companions with the same name do not mix." });
+    }
 
-    res.json({
-        ok: true,
-        wallet: publicWallet(wallet)
-    });
+    const wallet = linkWalletCompanion(viewer, twitchId, displayName, companionName, minecraftName, channelId, serverId);
+
+    res.json({ ok: true, serverId, wallet: publicWallet(wallet) });
 });
 
 app.post("/wallet/alias", requireApiKey, (req, res) => {
