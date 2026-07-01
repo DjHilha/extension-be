@@ -124,6 +124,14 @@ function firstEnabledServerId() {
     return "meowtys_s3";
 }
 
+function firstChannelId(serverIdOverride = "") {
+    const serverId = normalizeServerId(serverIdOverride || firstEnabledServerId());
+    const config = streamerChannels?.servers?.[serverId];
+    const channels = config?.channels || {};
+    const first = Object.keys(channels)[0];
+    return normalizeChannelId(first || "145555184");
+}
+
 function resolveServerIdFromChannel(channelId) {
     const wanted = String(channelId || "").trim();
     for (const [serverId, config] of Object.entries(streamerChannels.servers || {})) {
@@ -307,24 +315,36 @@ function saveTraining() {
 }
 
 function walletToSupabaseRow(wallet) {
+    const parsed = parseScopedViewerKey(wallet?.viewer || "");
+    const serverId = normalizeServerId(parsed.serverId || firstEnabledServerId());
+    const channelId = normalizeChannelId(parsed.channelId || firstChannelId(serverId));
+    const viewerId = normalizeViewer(parsed.viewerId || wallet?.viewer || "");
+
     return {
-        viewer: String(wallet.viewer || "").toLowerCase(),
+        // IMPORTANT: keep viewer as the raw Twitch viewer ID.
+        // Channel/server separation belongs in server_id + channel_id.
+        viewer: viewerId,
+        server_id: serverId,
+        channel_id: channelId,
         dirt: Number(wallet.dirt || 0),
         twitch_id: String(wallet.twitchId || ""),
-        display_name: String(wallet.displayName || wallet.viewer || ""),
+        display_name: String(wallet.displayName || viewerId || ""),
         companion_name: String(wallet.companionName || ""),
         updated_at: wallet.updatedAt || new Date().toISOString()
     };
 }
 
 function supabaseRowToWallet(row) {
-    const viewer = String(row.viewer || "").toLowerCase();
+    const serverId = normalizeServerId(row.server_id || firstEnabledServerId());
+    const channelId = normalizeChannelId(row.channel_id || firstChannelId(serverId));
+    const rawViewer = normalizeViewer(row.viewer || "");
+    const viewer = scopedViewerKey(rawViewer, channelId, serverId);
 
     return {
         viewer,
         dirt: Number(row.dirt || 0),
         twitchId: String(row.twitch_id || ""),
-        displayName: String(row.display_name || viewer),
+        displayName: String(row.display_name || rawViewer || viewer),
         companionName: String(row.companion_name || ""),
         updatedAt: String(row.updated_at || new Date().toISOString())
     };
@@ -397,7 +417,7 @@ async function syncAllWalletsToSupabase() {
         return;
     }
 
-    await supabaseRequest("/wallets?on_conflict=viewer", {
+    await supabaseRequest("/wallets?on_conflict=server_id,channel_id,viewer", {
         method: "POST",
         headers: {
             Prefer: "resolution=merge-duplicates"
@@ -458,19 +478,29 @@ function stateRowToObject(row, fallbackCompanionName = "") {
         ...data,
         viewer: String(data.viewer || row.viewer || "").toLowerCase(),
         companionName: String(data.companionName || row.companion_name || fallbackCompanionName || ""),
+        serverId: String(data.serverId || row.server_id || firstEnabledServerId()),
+        channelId: String(data.channelId || row.channel_id || ""),
         updatedAt: String(data.updatedAt || row.updated_at || new Date().toISOString()),
         __key: key
     };
 }
 
 function stateObjectToSupabaseRow(key, state) {
-    const viewer = normalizeViewer(state?.viewer || key.split("::")[0]);
-    const companionName = String(state?.companionName || key.split("::")[1] || "").trim();
+    const parts = String(key || "").split("::");
+    const keyLooksScoped = parts.length >= 3 && streamerChannels?.servers?.[parts[0]];
+    const serverId = normalizeServerId(state?.serverId || (keyLooksScoped ? parts[0] : firstEnabledServerId()));
+    const channelId = normalizeChannelId(state?.channelId || (keyLooksScoped ? parts[1] : firstChannelId(serverId)));
+    const viewer = normalizeViewer(state?.viewer || (keyLooksScoped ? parts[2] : parts[0]));
+    const companionName = String(state?.companionName || "").trim();
     const cleanState = { ...(state || {}) };
     delete cleanState.__key;
+    cleanState.serverId = serverId;
+    cleanState.channelId = channelId;
 
     return {
         key,
+        server_id: serverId,
+        channel_id: channelId,
         viewer,
         companion_name: companionName,
         data: cleanState,
@@ -598,7 +628,7 @@ async function syncAllTrainingToSupabase() {
 
     if (rows.length === 0) return;
 
-    await supabaseRequest("/training_center?on_conflict=key", {
+    await supabaseRequest("/training_center?on_conflict=server_id,channel_id,key", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates" },
         body: JSON.stringify(rows)
@@ -616,7 +646,7 @@ async function syncAllForgeryToSupabase() {
 
     if (rows.length === 0) return;
 
-    await supabaseRequest("/forgery?on_conflict=key", {
+    await supabaseRequest("/forgery?on_conflict=server_id,channel_id,key", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates" },
         body: JSON.stringify(rows)
