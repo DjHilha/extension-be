@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "meowtys_s3": {
+      "enabled": true,
+      "name": "Meowtys S3",
+      "channels": {
+        "145555184": "DjHilha"
+      }
+    }
+  }
+}
