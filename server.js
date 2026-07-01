@@ -142,6 +142,45 @@ function normalizeServerId(serverId) {
     return String(serverId || firstEnabledServerId() || "meowtys_s3").trim().toLowerCase();
 }
 
+function normalizeChannelId(channelId) {
+    return String(channelId || "").trim().toLowerCase();
+}
+
+function scopedViewerKey(viewer, channelId = "", serverIdOverride = "") {
+    const raw = normalizeViewer(viewer);
+    if (!raw) return "";
+    if (raw.includes("::")) return raw;
+    const channel = normalizeChannelId(channelId);
+    if (!channel) return raw;
+    const serverId = normalizeServerId(serverIdOverride || resolveServerIdFromChannel(channel));
+    return `${serverId}::${channel}::${raw}`;
+}
+
+function scopeViewerFromRequest(req, viewer) {
+    return scopedViewerKey(
+        viewer,
+        req?.body?.channelId || req?.query?.channelId || req?.headers?.["x-channel-id"] || "",
+        req?.body?.serverId || req?.query?.serverId || ""
+    );
+}
+
+function parseScopedViewerKey(viewer) {
+    const raw = normalizeViewer(viewer);
+    const parts = raw.split("::");
+    if (parts.length >= 3 && streamerChannels?.servers?.[parts[0]]) {
+        return {
+            serverId: normalizeServerId(parts[0]),
+            channelId: normalizeChannelId(parts[1]),
+            viewerId: parts.slice(2).join("::")
+        };
+    }
+    return {
+        serverId: firstEnabledServerId(),
+        channelId: "",
+        viewerId: raw
+    };
+}
+
 function encodeCompanionLink(serverId, ownerUuid, ownerName, companionName) {
     const cleanServer = normalizeServerId(serverId);
     const cleanOwnerUuid = String(ownerUuid || "").trim();
@@ -168,11 +207,17 @@ function parseCompanionLink(value) {
 function companionStateKeyFor(viewer, companionName) {
     const wallet = getWalletResolved(viewer, false) || getWallet(viewer);
     const linked = parseCompanionLink(wallet && wallet.companionName);
+    const scoped = parseScopedViewerKey(wallet?.viewer || viewer);
     const requested = String(companionName || "").trim();
+    const serverId = normalizeServerId(scoped.serverId || linked.serverId || firstEnabledServerId());
+    const channelId = normalizeChannelId(scoped.channelId || "default");
+    const viewerId = normalizeViewer(scoped.viewerId || viewer);
+
     if (linked.ownerUuid && (!requested || linked.companionName.toLowerCase() === requested.toLowerCase())) {
-        return `${normalizeServerId(linked.serverId)}::${linked.ownerUuid}::${linked.companionName.toLowerCase()}`;
+        return `${serverId}::${channelId}::${viewerId}::${linked.ownerUuid}::${linked.companionName.toLowerCase()}`;
     }
-    return `${firstEnabledServerId()}::viewer::${normalizeViewer(viewer)}::${requested.toLowerCase()}`;
+
+    return `${serverId}::${channelId}::${viewerId}::viewer::${requested.toLowerCase()}`;
 }
 
 function findExportedCompanion(serverId, minecraftName, companionName) {
@@ -743,14 +788,18 @@ function resolveWalletKey(identifier) {
     const wanted = normalizeViewer(identifier);
     if (!wanted) return "";
 
+    // Exact key must win first, especially for scoped keys such as
+    // meowtys_s3::145555184::viewerId. Otherwise displayName aliases from
+    // another streamer/channel could steal the wallet.
+    if (wallets[wanted]) {
+        return wanted;
+    }
+
     /*
      * IMPORTANT:
-     * Resolve companion/display aliases BEFORE direct wallet keys.
-     *
-     * This prevents old/fake rows like:
-     *   viewer = "hilha"
-     * from stealing rewards that should go to:
-     *   viewer = "145555184", companionName = "Hilha"
+     * Resolve companion/display aliases AFTER direct wallet keys.
+     * Public extension traffic should pass scoped keys. Admin commands can
+     * still resolve display names as a convenience.
      */
 
     for (const [key, wallet] of Object.entries(wallets)) {
@@ -777,10 +826,6 @@ function resolveWalletKey(identifier) {
         }
     }
 
-    if (wallets[wanted]) {
-        return wanted;
-    }
-
     return "";
 }
 
@@ -800,6 +845,8 @@ function publicWallet(wallet) {
 
     return {
         viewer: wallet.viewer,
+        channelId: parseScopedViewerKey(wallet.viewer).channelId || "",
+        rawViewer: parseScopedViewerKey(wallet.viewer).viewerId || wallet.viewer,
         dirt: Number(wallet.dirt || 0),
         twitchId: String(wallet.twitchId || ""),
         displayName: String(wallet.displayName || wallet.viewer || ""),
@@ -1029,7 +1076,8 @@ function resolveViewerForState(identifier) {
 }
 
 function validateForgeryBody(req) {
-    const viewer = resolveViewerForState(req.body.viewer);
+    const scopedInput = scopeViewerFromRequest(req, req.body.viewer);
+    const viewer = resolveViewerForState(scopedInput);
     const companionName = String(req.body.companionName || "").trim();
     if (!viewer || !companionName) {
         return { ok: false, status: 400, error: "Missing viewer or companion" };
@@ -1198,7 +1246,8 @@ app.post("/tasks", requireApiKey, (req, res) => {
     res.json({ ok: true, active: tasksData.active, count: tasksData.tasks.length });
 });
 app.get("/wallet/:viewer", (req, res) => {
-    const wallet = getWalletResolved(req.params.viewer, false);
+    const scopedViewer = scopeViewerFromRequest(req, req.params.viewer);
+    const wallet = getWalletResolved(scopedViewer, false) || getWalletResolved(req.params.viewer, false);
 
     if (!wallet) {
         return res.status(404).json({
@@ -1307,7 +1356,7 @@ app.post("/wallet/reset-all", requireApiKey, (req, res) => {
     res.json({ ok: true, reset: count });
 });
 app.post("/wallet/reset", requireApiKey, (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     if (!viewer) return res.status(400).json({ ok: false, error: "Missing viewer" });
     const wallet = getWalletResolved(viewer, false);
 
@@ -1327,7 +1376,7 @@ app.post("/wallet/reset", requireApiKey, (req, res) => {
 
 
 app.post("/watch/identity", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const twitchId = String(req.body.twitchId || "").trim();
     const displayName = String(req.body.displayName || viewer).trim();
 
@@ -1357,7 +1406,7 @@ app.post("/watch/identity", (req, res) => {
 });
 
 app.post("/watch/heartbeat", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const twitchId = String(req.body.twitchId || "").trim();
     const displayName = String(req.body.displayName || viewer).trim();
 
@@ -1476,7 +1525,7 @@ app.post("/watch/heartbeat", (req, res) => {
 });
 
 app.post("/watch/confirm", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const checkId = String(req.body.checkId || "").trim();
 
     if (!viewer) {
@@ -1537,7 +1586,7 @@ app.post("/watch/confirm", (req, res) => {
 });
 
 app.get("/watch/:viewer", (req, res) => {
-    const watcher = getWatcher(req.params.viewer);
+    const watcher = getWatcher(scopeViewerFromRequest(req, req.params.viewer));
 
     if (!watcher) {
         return res.status(400).json({
@@ -1554,7 +1603,7 @@ app.get("/watch/:viewer", (req, res) => {
 
 
 app.post("/shop/create-companion", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion name" });
     const alreadyExists = Array.isArray(companionsData.companions) && companionsData.companions.some(c => String(c.name || "").toLowerCase() === companionName.toLowerCase());
@@ -1588,7 +1637,7 @@ app.post("/shop/create-companion", (req, res) => {
     });
 });
 app.post("/shop/buy-trail", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || req.body.viewer || "").trim();
     const trailType = Number(req.body.trailType);
     const color = Number(req.body.color);
@@ -1605,7 +1654,7 @@ app.post("/shop/buy-trail", (req, res) => {
 });
 app.post("/shop/trail", (req, res) => { req.body.companionName = req.body.companionName || req.body.viewer; return app._router.handle({ ...req, url: "/shop/buy-trail", method: "POST" }, res, () => {}); });
 app.post("/shop/buy-relic", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || req.body.viewer || "").trim();
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     const spend = spendDirt(viewer, PRICES.BUY_RELIC, "buy_relic");
@@ -1614,7 +1663,7 @@ app.post("/shop/buy-relic", (req, res) => {
     res.json({ ok: true, request, wallet: spend });
 });
 app.post("/shop/buy-ancient-relic", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || req.body.viewer || "").trim();
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     const spend = spendDirt(viewer, PRICES.BUY_ANCIENT_RELIC, "buy_ancient_relic");
@@ -1623,7 +1672,7 @@ app.post("/shop/buy-ancient-relic", (req, res) => {
     res.json({ ok: true, request, wallet: spend });
 });
 app.post("/shop/reroll-relic", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || req.body.viewer || "").trim();
     const slot = Number(req.body.slot);
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
@@ -1634,7 +1683,7 @@ app.post("/shop/reroll-relic", (req, res) => {
     res.json({ ok: true, request, wallet: spend });
 });
 app.post("/shop/reroll-ancient-relic", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || req.body.viewer || "").trim();
     const slot = Number(req.body.slot || 0);
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
@@ -1647,7 +1696,7 @@ app.post("/shop/reroll-ancient-relic", (req, res) => {
 
 function createPaidShopRoute(path, actionName, price, extraBuilder) {
     app.post(path, (req, res) => {
-        const viewer = normalizeViewer(req.body.viewer);
+        const viewer = scopeViewerFromRequest(req, req.body.viewer);
         const companionName = String(req.body.companionName || req.body.viewer || "").trim();
         if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
 
@@ -1665,7 +1714,7 @@ createPaidShopRoute("/shop/pay-debt", "pay_debt", PRICES.PAY_DEBT);
 createPaidShopRoute("/shop/reroll-legendary", "reroll_legendary", PRICES.REROLL_LEGENDARY);
 
 app.post("/shop/switch-skin", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     const skinName = String(req.body.skinName || "").trim();
     if (!viewer || !companionName || !skinName) return res.status(400).json({ ok: false, error: "Missing viewer, companion, or skin" });
@@ -1674,7 +1723,7 @@ app.post("/shop/switch-skin", (req, res) => {
 });
 
 app.post("/shop/crew-quarters", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     const request = queueShopAction({ action: "crew_quarters", viewer, companionName, cost: 0 });
@@ -1682,7 +1731,7 @@ app.post("/shop/crew-quarters", (req, res) => {
 });
 
 app.post("/shop/back-to-work", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     const request = queueShopAction({ action: "back_to_work", viewer, companionName, cost: 0 });
@@ -1692,7 +1741,7 @@ app.post("/shop/back-to-work", (req, res) => {
 
 app.get("/forgery/:viewer/:companionName", (req, res) => {
     const requestedViewer = String(req.params.viewer || "").trim();
-    const viewer = resolveViewerForState(requestedViewer);
+    const viewer = resolveViewerForState(scopeViewerFromRequest(req, requestedViewer));
     const companionName = String(req.params.companionName || "").trim();
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     const state = getForgeryState(viewer, companionName);
@@ -2024,7 +2073,8 @@ function publicTrainingState(state) {
 }
 
 function validateTrainingBody(req) {
-    const viewer = resolveViewerForState(req.body.viewer);
+    const scopedInput = scopeViewerFromRequest(req, req.body.viewer);
+    const viewer = resolveViewerForState(scopedInput);
     const companionName = String(req.body.companionName || "").trim();
     if (!viewer || !companionName) return { ok: false, status: 400, error: "Missing viewer or companion." };
     return { ok: true, viewer, companionName, requestedViewer: String(req.body.viewer || "").trim() };
@@ -2066,7 +2116,7 @@ function secondsLeft(state, key) {
 
 app.get("/training/:viewer/:companionName", (req, res) => {
     const requestedViewer = String(req.params.viewer || "").trim();
-    const viewer = resolveViewerForState(requestedViewer);
+    const viewer = resolveViewerForState(scopeViewerFromRequest(req, requestedViewer));
     const companionName = String(req.params.companionName || "").trim();
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     const state = getTrainingState(viewer, companionName);
@@ -2637,7 +2687,7 @@ app.post("/admin/academy/set", requireApiKey, (req, res) => {
 
 
 app.post("/viewer-link", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const twitchId = String(req.body.twitchId || "").trim();
     const displayName = String(req.body.displayName || viewer).trim();
     const companionName = String(req.body.companionName || "").trim();
@@ -2732,7 +2782,7 @@ app.get("/wallets", requireApiKey, (req, res) => {
 let taskVotes = {};
 
 app.post("/tasks/join", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     const displayName = String(req.body.displayName || "").trim();
     const twitchId = String(req.body.twitchId || "").trim();
@@ -2767,7 +2817,7 @@ app.post("/tasks/join", (req, res) => {
 });
 
 app.post("/tasks/vote", (req, res) => {
-    const viewer = normalizeViewer(req.body.viewer);
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     const displayName = String(req.body.displayName || "").trim();
     const twitchId = String(req.body.twitchId || "").trim();
