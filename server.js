@@ -1440,6 +1440,58 @@ app.get("/companions", (req, res) => {
         companions: list
     });
 });
+
+
+app.get("/viewer-init/:viewer", (req, res) => {
+    const channelId = req.query.channelId || req.headers["x-channel-id"] || "";
+    const serverId = normalizeServerId(req.query.serverId || resolveServerIdFromChannel(channelId));
+    const requestedViewer = String(req.params.viewer || req.query.viewer || "").trim();
+    const scopedViewer = requestedViewer ? scopeViewerFromRequest(req, requestedViewer) : "";
+
+    let wallet = scopedViewer ? getWalletResolved(scopedViewer, false) : null;
+    if (!wallet && requestedViewer) wallet = getWalletResolved(requestedViewer, false);
+
+    let list = Array.isArray(companionsData.companions) ? companionsData.companions.slice() : [];
+    list = list.filter(c => normalizeServerId(c.serverId || serverId) === serverId);
+
+    const ownerCandidates = ownerCandidatesForRequest(req, serverId, channelId);
+    if (ownerCandidates.length > 0) {
+        const allowedOwners = new Set(ownerCandidates);
+        list = list.filter(c => allowedOwners.has(companionOwnerName(c)));
+    }
+
+    let companion = null;
+    let clearedStaleCompanion = false;
+
+    if (wallet && wallet.companionName) {
+        const linked = parseCompanionLink(wallet.companionName);
+        if (linked && linked.companionName) {
+            companion = list.find(c => companionMatchesLinked(c, linked)) || null;
+
+            if (!companion) {
+                console.log(`[VIEWER-INIT] Clearing stale companion link for ${wallet.viewer}: ${wallet.companionName}`);
+                wallet.companionName = "";
+                wallet.updatedAt = new Date().toISOString();
+                saveWallets();
+                clearedStaleCompanion = true;
+            }
+        }
+    }
+
+    // If the wallet was not linked yet but this stream owner has exactly one active
+    // companion with the same name as the viewer's selected companion, do not guess.
+    // Returning no companion is safer than name-only fallback across multi-streamer data.
+
+    res.json({
+        ok: true,
+        serverId,
+        ownerFilter: ownerCandidates,
+        wallet: wallet ? publicWallet(wallet) : null,
+        companion,
+        companions: companion ? [companion] : [],
+        clearedStaleCompanion
+    });
+});
 app.post("/companions", requireApiKey, (req, res) => {
     if (!req.body || !Array.isArray(req.body.companions)) {
         return res.status(400).json({ ok: false, error: "Expected body with companions array" });
