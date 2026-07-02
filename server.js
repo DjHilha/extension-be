@@ -3533,4 +3533,52 @@ app.post("/tasks/vote", (req, res) => {
 
     if (taskVotes[voteKey][viewer]) {
         return res.json({
-       
+            ok: true,
+            alreadyVoted: true,
+            vote: taskVotes[voteKey][viewer]
+        });
+    }
+
+    taskVotes[voteKey][viewer] = vote;
+
+    const request = queueShopAction({
+        action: "task_vote",
+        viewer,
+        companionName,
+        displayName,
+        twitchId,
+        vote,
+        voteKey,
+        cost: 0
+    });
+
+    res.json({
+        ok: true,
+        vote,
+        request
+    });
+});
+
+
+app.get("/shop/actions/queue", requireApiKey, (req, res) => res.json({ ok: true, queue: shopActionQueue }));
+app.post("/shop/actions/queue/clear", requireApiKey, (req, res) => {
+    const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+    shopActionQueue = shopActionQueue.filter(item => !ids.includes(item.id));
+    saveQueue();
+    res.json({ ok: true, remaining: shopActionQueue.length });
+});
+app.get("/shop/trail/queue", requireApiKey, (req, res) => res.json({ ok: true, queue: shopActionQueue.filter(item => item.action === "buy_trail") }));
+app.post("/shop/trail/queue/clear", requireApiKey, (req, res) => {
+    const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+    shopActionQueue = shopActionQueue.filter(item => !ids.includes(item.id));
+    saveQueue();
+    res.json({ ok: true, remaining: shopActionQueue.length });
+});
+loadPersistentData()
+    .then(() => {
+        app.listen(PORT, () => console.log(`Meowtys backend running on port ${PORT}`));
+    })
+    .catch(error => {
+        console.error("[DATA] Failed during startup.", error);
+        app.listen(PORT, () => console.log(`Meowtys backend running on port ${PORT} with fallback data`));
+    });
