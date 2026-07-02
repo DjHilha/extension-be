@@ -67,16 +67,6 @@ let forgeryData = {};
 let trainingData = {};
 let streamerChannels = {};
 
-// Fast in-memory lookup caches. These avoid scanning every wallet/companion
-// on every extension load. They are rebuilt whenever wallets or companions change.
-let walletLookupIndex = {
-    exact: new Map(),
-    companion: new Map(),
-    displayName: new Map(),
-    twitchId: new Map(),
-    viewer: new Map()
-};
-let ownerCompanionCache = new Map();
 
 function defaultStreamerChannels() {
     return {
@@ -396,15 +386,11 @@ async function loadPersistentData() {
     await loadTrainingFromSupabase();
     await loadForgeryFromSupabase();
 
-    rebuildWalletLookupIndex();
-    rebuildOwnerCompanionCache();
-
     console.log(`[DATA] Loaded ${Object.keys(wallets).length} wallets, ${Object.keys(trainingData).length} training states, ${Object.keys(forgeryData).length} forgery states and ${shopActionQueue.length} queued shop actions and ${Object.keys(watchers).length} watchers.`);
 }
 
 
 function saveWallets() {
-    rebuildWalletLookupIndex();
     writeJsonFile(WALLETS_FILE, wallets);
     syncWalletsToSupabaseSoon();
 }
@@ -763,77 +749,6 @@ async function syncAllForgeryToSupabase() {
 
 function normalizeViewer(viewer) { return String(viewer || "").trim().toLowerCase(); }
 
-function rebuildWalletLookupIndex() {
-    const next = {
-        exact: new Map(),
-        companion: new Map(),
-        displayName: new Map(),
-        twitchId: new Map(),
-        viewer: new Map()
-    };
-
-    for (const [key, wallet] of Object.entries(wallets || {})) {
-        const cleanKey = normalizeViewer(key);
-        if (cleanKey) next.exact.set(cleanKey, key);
-
-        const walletViewer = normalizeViewer(wallet?.viewer || "");
-        if (walletViewer && !next.viewer.has(walletViewer)) next.viewer.set(walletViewer, key);
-
-        const companionName = normalizeViewer(wallet?.companionName || "");
-        if (companionName && !next.companion.has(companionName)) next.companion.set(companionName, key);
-
-        const displayName = normalizeViewer(wallet?.displayName || "");
-        if (displayName && !next.displayName.has(displayName)) next.displayName.set(displayName, key);
-
-        const twitchId = normalizeViewer(wallet?.twitchId || "");
-        if (twitchId && !next.twitchId.has(twitchId)) next.twitchId.set(twitchId, key);
-    }
-
-    walletLookupIndex = next;
-}
-
-function rebuildOwnerCompanionCache() {
-    const cache = new Map();
-    const list = Array.isArray(companionsData.companions) ? companionsData.companions : [];
-
-    for (const companion of list) {
-        const serverId = normalizeServerId(companion.serverId || firstEnabledServerId());
-        const owner = companionOwnerName(companion);
-        if (!serverId || !owner) continue;
-
-        const key = `${serverId}::${owner}`;
-        if (!cache.has(key)) cache.set(key, []);
-        cache.get(key).push(companion);
-    }
-
-    ownerCompanionCache = cache;
-}
-
-function getCachedCompanionsForOwners(serverId, ownerCandidates) {
-    const sid = normalizeServerId(serverId);
-    const owners = Array.isArray(ownerCandidates) ? ownerCandidates : [];
-
-    if (owners.length === 0) {
-        return (Array.isArray(companionsData.companions) ? companionsData.companions : [])
-            .filter(c => normalizeServerId(c.serverId || sid) === sid);
-    }
-
-    const out = [];
-    const seen = new Set();
-
-    for (const owner of owners) {
-        const key = `${sid}::${normalizeOwnerName(owner)}`;
-        for (const companion of ownerCompanionCache.get(key) || []) {
-            const unique = String(companion.ownerUuid || companion.uuid || companion.id || `${companionOwnerName(companion)}::${companion.name || ""}`);
-            if (seen.has(unique)) continue;
-            seen.add(unique);
-            out.push(companion);
-        }
-    }
-
-    return out;
-}
-
 function nowMs() {
     return Date.now();
 }
@@ -995,21 +910,43 @@ function resolveWalletKey(identifier) {
     const wanted = normalizeViewer(identifier);
     if (!wanted) return "";
 
-    // Fast path: exact/scoped key first, then indexed aliases.
-    const exact = walletLookupIndex.exact.get(wanted);
-    if (exact && wallets[exact]) return exact;
+    // Exact key must win first, especially for scoped keys such as
+    // meowtys_s3::145555184::viewerId. Otherwise displayName aliases from
+    // another streamer/channel could steal the wallet.
+    if (wallets[wanted]) {
+        return wanted;
+    }
 
-    const byCompanion = walletLookupIndex.companion.get(wanted);
-    if (byCompanion && wallets[byCompanion]) return byCompanion;
+    /*
+     * IMPORTANT:
+     * Resolve companion/display aliases AFTER direct wallet keys.
+     * Public extension traffic should pass scoped keys. Admin commands can
+     * still resolve display names as a convenience.
+     */
 
-    const byDisplayName = walletLookupIndex.displayName.get(wanted);
-    if (byDisplayName && wallets[byDisplayName]) return byDisplayName;
+    for (const [key, wallet] of Object.entries(wallets)) {
+        if (wallet.companionName && normalizeViewer(wallet.companionName) === wanted) {
+            return key;
+        }
+    }
 
-    const byTwitchId = walletLookupIndex.twitchId.get(wanted);
-    if (byTwitchId && wallets[byTwitchId]) return byTwitchId;
+    for (const [key, wallet] of Object.entries(wallets)) {
+        if (wallet.displayName && normalizeViewer(wallet.displayName) === wanted) {
+            return key;
+        }
+    }
 
-    const byViewer = walletLookupIndex.viewer.get(wanted);
-    if (byViewer && wallets[byViewer]) return byViewer;
+    for (const [key, wallet] of Object.entries(wallets)) {
+        if (wallet.twitchId && normalizeViewer(wallet.twitchId) === wanted) {
+            return key;
+        }
+    }
+
+    for (const [key, wallet] of Object.entries(wallets)) {
+        if (wallet.viewer && normalizeViewer(wallet.viewer) === wanted) {
+            return key;
+        }
+    }
 
     return "";
 }
@@ -1458,10 +1395,20 @@ app.get("/prices", (req, res) => res.json({ ok: true, prices: PRICES }));
 app.get("/companions", (req, res) => {
     const channelId = req.query.channelId || req.headers["x-channel-id"] || "";
     const serverId = normalizeServerId(req.query.serverId || resolveServerIdFromChannel(channelId));
-    // Fast owner-scoped companion lookup. This avoids scanning all exported
-    // companions for every extension load.
+    let list = Array.isArray(companionsData.companions) ? companionsData.companions.slice() : [];
+
+    // Only show companions for the resolved server.
+    list = list.filter(c => normalizeServerId(c.serverId || serverId) === serverId);
+
+    // IMPORTANT:
+    // Multi-streamer safety. A stream must only expose companions owned by that
+    // streamer's Minecraft owner name. This prevents DjHilha's stream from ever
+    // showing HalosiaPaage/Aslakx/etc companions with the same companion name.
     const ownerCandidates = ownerCandidatesForRequest(req, serverId, channelId);
-    let list = getCachedCompanionsForOwners(serverId, ownerCandidates);
+    if (ownerCandidates.length > 0) {
+        const allowedOwners = new Set(ownerCandidates);
+        list = list.filter(c => allowedOwners.has(companionOwnerName(c)));
+    }
 
     const requestedViewer = String(req.query.viewer || "").trim();
     const scopedViewer = requestedViewer ? scopeViewerFromRequest(req, requestedViewer) : "";
@@ -1504,8 +1451,14 @@ app.get("/viewer-init/:viewer", (req, res) => {
     let wallet = scopedViewer ? getWalletResolved(scopedViewer, false) : null;
     if (!wallet && requestedViewer) wallet = getWalletResolved(requestedViewer, false);
 
+    let list = Array.isArray(companionsData.companions) ? companionsData.companions.slice() : [];
+    list = list.filter(c => normalizeServerId(c.serverId || serverId) === serverId);
+
     const ownerCandidates = ownerCandidatesForRequest(req, serverId, channelId);
-    let list = getCachedCompanionsForOwners(serverId, ownerCandidates);
+    if (ownerCandidates.length > 0) {
+        const allowedOwners = new Set(ownerCandidates);
+        list = list.filter(c => allowedOwners.has(companionOwnerName(c)));
+    }
 
     let companion = null;
     let clearedStaleCompanion = false;
@@ -1525,36 +1478,9 @@ app.get("/viewer-init/:viewer", (req, res) => {
         }
     }
 
-    // Safe fallback: by this point the list is already filtered to the stream owner's
-    // companions only (for DjHilha, only owner=Hilha). So if the wallet link is
-    // missing/stale, we can still resolve the selected companion by name without
-    // ever crossing into another streamer's companions.
-    if (!companion) {
-        const fallbackNames = new Set();
-        const addFallbackName = value => {
-            const raw = String(value || "").trim();
-            if (!raw) return;
-            fallbackNames.add(raw.toLowerCase());
-            if (/^dj/i.test(raw) && raw.length > 2) fallbackNames.add(raw.slice(2).toLowerCase());
-        };
-
-        addFallbackName(req.query.companionName);
-        addFallbackName(req.query.companion);
-        addFallbackName(req.query.selectedCompanion);
-        addFallbackName(wallet && parseCompanionLink(wallet.companionName).companionName);
-        addFallbackName(wallet && wallet.displayName);
-        addFallbackName(requestedViewer);
-
-        if (fallbackNames.size > 0) {
-            companion = list.find(c => fallbackNames.has(String(c.name || "").trim().toLowerCase())) || null;
-        }
-
-        // If the stream owner has only one companion exported, use it. This keeps
-        // first-load behavior fast while staying owner-scoped.
-        if (!companion && list.length === 1) {
-            companion = list[0];
-        }
-    }
+    // If the wallet was not linked yet but this stream owner has exactly one active
+    // companion with the same name as the viewer's selected companion, do not guess.
+    // Returning no companion is safer than name-only fallback across multi-streamer data.
 
     res.json({
         ok: true,
@@ -1562,7 +1488,7 @@ app.get("/viewer-init/:viewer", (req, res) => {
         ownerFilter: ownerCandidates,
         wallet: wallet ? publicWallet(wallet) : null,
         companion,
-        companions: companion ? [companion] : list,
+        companions: companion ? [companion] : [],
         clearedStaleCompanion
     });
 });
@@ -1585,7 +1511,6 @@ app.post("/companions", requireApiKey, (req, res) => {
         serverId,
         companions: existingOtherServers.concat(incoming)
     };
-    rebuildOwnerCompanionCache();
 
     console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}`);
 
@@ -3533,4 +3458,90 @@ app.post("/tasks/join", (req, res) => {
         joined: true,
         request
     });
+});
+
+app.post("/tasks/vote", (req, res) => {
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
+    const companionName = String(req.body.companionName || "").trim();
+    const displayName = String(req.body.displayName || "").trim();
+    const twitchId = String(req.body.twitchId || "").trim();
+    const vote = String(req.body.vote || "").toLowerCase();
+    const voteKey = String(req.body.voteKey || "current");
+
+    if (!viewer || !["support", "doubt"].includes(vote)) {
+        return res.status(400).json({
+            ok: false,
+            error: "Invalid vote"
+        });
+    }
+
+    if (twitchId || displayName) {
+        updateWalletIdentity(viewer, twitchId, displayName || viewer);
+    }
+
+    if (!taskVotes[voteKey]) {
+        taskVotes[voteKey] = {};
+    }
+
+    if (taskVotes[voteKey][viewer]) {
+        return res.json({
+            ok: true,
+            alreadyVoted: true,
+            vote: taskVotes[voteKey][viewer]
+        });
+    }
+
+    taskVotes[voteKey][viewer] = vote;
+
+    const request = queueShopAction({
+        action: "task_vote",
+        viewer,
+        companionName,
+        displayName,
+        twitchId,
+        vote,
+        voteKey,
+        cost: 0
+    });
+
+    res.json({
+        ok: true,
+        vote,
+        request
+    });
+});
+
+
+app.get("/shop/actions/queue", requireApiKey, (req, res) => res.json({ ok: true, queue: shopActionQueue }));
+app.post("/shop/actions/queue/clear", requireApiKey, (req, res) => {
+    const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+    shopActionQueue = shopActionQueue.filter(item => !ids.includes(item.id));
+    saveQueue();
+    res.json({ ok: true, remaining: shopActionQueue.length });
+});
+app.get("/shop/trail/queue", requireApiKey, (req, res) => res.json({ ok: true, queue: shopActionQueue.filter(item => item.action === "buy_trail") }));
+app.post("/shop/trail/queue/clear", requireApiKey, (req, res) => {
+    const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+    shopActionQueue = shopActionQueue.filter(item => !ids.includes(item.id));
+    saveQueue();
+    res.json({ ok: true, remaining: shopActionQueue.length });
+});
+process.on("uncaughtException", error => {
+    console.error("[FATAL] Uncaught exception:", error);
+});
+
+process.on("unhandledRejection", error => {
+    console.error("[FATAL] Unhandled rejection:", error);
+});
+
+app.listen(PORT, () => {
+    console.log(`Meowtys backend running on port ${PORT}`);
+
+    loadPersistentData()
+        .then(() => {
+            console.log("[DATA] Startup data loaded.");
+        })
+        .catch(error => {
+            console.error("[DATA] Failed during startup. Server will keep running with fallback data.", error);
+        });
 });
