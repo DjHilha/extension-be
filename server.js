@@ -169,11 +169,6 @@ function addOwnerCandidate(set, value) {
 function ownerCandidatesForRequest(req, serverId, channelId) {
     const candidates = new Set();
 
-    // Explicit owner query params are allowed for admin/testing URLs.
-    addOwnerCandidate(candidates, req?.query?.ownerName);
-    addOwnerCandidate(candidates, req?.query?.minecraftName);
-    addOwnerCandidate(candidates, req?.query?.streamOwner);
-
     const sid = normalizeServerId(serverId);
     const config = streamerChannels?.servers?.[sid] || {};
     const channels = config.channels || {};
@@ -181,7 +176,13 @@ function ownerCandidatesForRequest(req, serverId, channelId) {
 
     let cleanChannel = normalizeChannelId(channelId || "");
 
-    // If Twitch sends a display name instead of the numeric channel id,
+    // Public /companions must NEVER trust viewer/companion ownerName query params.
+    // Those values can be stale or can come from the viewer profile, which is what
+    // caused DjHilha's stream to load another player's companion named "Hilha".
+    // Only the configured broadcaster channel -> Minecraft owner mapping decides
+    // which owners are visible on a stream.
+
+    // If Twitch sends a display name instead of the numeric broadcaster id,
     // convert it back to the matching configured channel id.
     if (cleanChannel && !Object.prototype.hasOwnProperty.call(channels, cleanChannel)) {
         for (const [id, name] of Object.entries(channels)) {
@@ -192,16 +193,14 @@ function ownerCandidatesForRequest(req, serverId, channelId) {
         }
     }
 
-    // If the request does not include a usable broadcaster channel id, use the
-    // first configured channel for this server. This is important because some
-    // extension contexts do not provide channelId reliably.
+    // If no usable broadcaster id is supplied, default to the first configured
+    // broadcaster for this server. For your current config that is DjHilha -> Hilha.
     if (!cleanChannel || !Object.prototype.hasOwnProperty.call(channels, cleanChannel)) {
         cleanChannel = firstChannelId(sid);
     }
 
     // The owners mapping is the source of truth:
     // Twitch channel id -> Minecraft owner name.
-    // Example: 145555184 (DjHilha) -> Hilha.
     if (cleanChannel && Object.prototype.hasOwnProperty.call(owners, cleanChannel)) {
         addOwnerCandidate(candidates, owners[cleanChannel]);
     } else if (cleanChannel && Object.prototype.hasOwnProperty.call(channels, cleanChannel)) {
@@ -209,7 +208,6 @@ function ownerCandidatesForRequest(req, serverId, channelId) {
         addOwnerCandidate(candidates, channels[cleanChannel]);
     }
 
-    // Last-resort safety fallback for this deployment.
     if (candidates.size === 0 && sid === "meowtys_s3") {
         addOwnerCandidate(candidates, "Hilha");
     }
