@@ -75,7 +75,10 @@ function defaultStreamerChannels() {
                 enabled: true,
                 name: "Meowtys S3",
                 channels: {
-                    "145555184": "DjHilha"
+                    "145555184": {
+                        displayName: "DjHilha",
+                        minecraftOwner: "Hilha"
+                    }
                 }
             }
         }
@@ -156,16 +159,64 @@ function addOwnerCandidate(set, value) {
 
     set.add(normalizeOwnerName(raw));
 
-    // Your Twitch channel is DjHilha, but your Minecraft owner name is Hilha.
-    // This keeps channel filtering working for names that use the DJ prefix.
+    // Compatibility fallback: Twitch names like DjHilha can map to the
+    // Minecraft owner Hilha when no explicit minecraftOwner is configured.
     if (/^dj/i.test(raw) && raw.length > 2) {
         set.add(normalizeOwnerName(raw.slice(2)));
     }
 }
 
+function channelConfigValueToOwnerCandidates(value) {
+    const candidates = new Set();
+
+    if (!value) return [];
+
+    if (typeof value === "string") {
+        // Old config format:
+        // "145555184": "DjHilha"
+        addOwnerCandidate(candidates, value);
+        return Array.from(candidates).filter(Boolean);
+    }
+
+    if (typeof value === "object") {
+        // New recommended config format:
+        // "145555184": {
+        //   "displayName": "DjHilha",
+        //   "minecraftOwner": "Hilha"
+        // }
+        addOwnerCandidate(candidates, value.minecraftOwner);
+        addOwnerCandidate(candidates, value.ownerName);
+        addOwnerCandidate(candidates, value.minecraftName);
+
+        // Keep displayName/name as fallbacks only. The explicit minecraftOwner
+        // above is the real source of truth.
+        addOwnerCandidate(candidates, value.displayName);
+        addOwnerCandidate(candidates, value.name);
+        addOwnerCandidate(candidates, value.twitchName);
+    }
+
+    return Array.from(candidates).filter(Boolean);
+}
+
+function allConfiguredOwnerCandidatesForServer(serverId) {
+    const candidates = new Set();
+    const sid = normalizeServerId(serverId);
+    const config = streamerChannels?.servers?.[sid];
+    const channels = config?.channels || {};
+
+    for (const value of Object.values(channels)) {
+        for (const candidate of channelConfigValueToOwnerCandidates(value)) {
+            candidates.add(candidate);
+        }
+    }
+
+    return Array.from(candidates).filter(Boolean);
+}
+
 function ownerCandidatesForRequest(req, serverId, channelId) {
     const candidates = new Set();
 
+    // Explicit query params win. Useful for admin/manual tests.
     addOwnerCandidate(candidates, req?.query?.ownerName);
     addOwnerCandidate(candidates, req?.query?.minecraftName);
     addOwnerCandidate(candidates, req?.query?.streamOwner);
@@ -176,11 +227,17 @@ function ownerCandidatesForRequest(req, serverId, channelId) {
     const cleanChannel = normalizeChannelId(channelId || firstChannelId(sid));
 
     if (cleanChannel && Object.prototype.hasOwnProperty.call(channels, cleanChannel)) {
-        addOwnerCandidate(candidates, channels[cleanChannel]);
-    } else if (!channelId) {
-        // If no channel id is provided, use the first configured channel for this server.
-        const firstName = Object.values(channels)[0];
-        addOwnerCandidate(candidates, firstName);
+        for (const candidate of channelConfigValueToOwnerCandidates(channels[cleanChannel])) {
+            candidates.add(candidate);
+        }
+    }
+
+    if (candidates.size === 0) {
+        // If Twitch sends no broadcaster channel id, scope to the configured
+        // owners for this server instead of returning every exported companion.
+        for (const candidate of allConfiguredOwnerCandidatesForServer(sid)) {
+            candidates.add(candidate);
+        }
     }
 
     return Array.from(candidates).filter(Boolean);
