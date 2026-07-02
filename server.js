@@ -146,6 +146,69 @@ function resolveServerIdFromChannel(channelId) {
     return firstEnabledServerId();
 }
 
+function normalizeOwnerName(value) {
+    return String(value || "").trim().toLowerCase();
+}
+
+function addOwnerCandidate(set, value) {
+    const raw = String(value || "").trim();
+    if (!raw) return;
+
+    set.add(normalizeOwnerName(raw));
+
+    // Your Twitch channel is DjHilha, but your Minecraft owner name is Hilha.
+    // This keeps channel filtering working for names that use the DJ prefix.
+    if (/^dj/i.test(raw) && raw.length > 2) {
+        set.add(normalizeOwnerName(raw.slice(2)));
+    }
+}
+
+function ownerCandidatesForRequest(req, serverId, channelId) {
+    const candidates = new Set();
+
+    addOwnerCandidate(candidates, req?.query?.ownerName);
+    addOwnerCandidate(candidates, req?.query?.minecraftName);
+    addOwnerCandidate(candidates, req?.query?.streamOwner);
+
+    const sid = normalizeServerId(serverId);
+    const config = streamerChannels?.servers?.[sid];
+    const channels = config?.channels || {};
+    const cleanChannel = normalizeChannelId(channelId || firstChannelId(sid));
+
+    if (cleanChannel && Object.prototype.hasOwnProperty.call(channels, cleanChannel)) {
+        addOwnerCandidate(candidates, channels[cleanChannel]);
+    } else if (!channelId) {
+        // If no channel id is provided, use the first configured channel for this server.
+        const firstName = Object.values(channels)[0];
+        addOwnerCandidate(candidates, firstName);
+    }
+
+    return Array.from(candidates).filter(Boolean);
+}
+
+function companionOwnerName(c) {
+    return normalizeOwnerName(c?.owner || c?.ownerName || c?.minecraftName || "");
+}
+
+function companionMatchesLinked(c, linked) {
+    if (!c || !linked || !linked.companionName) return false;
+
+    const wantedServer = normalizeServerId(linked.serverId || firstEnabledServerId());
+    const wantedName = String(linked.companionName || "").trim().toLowerCase();
+    const wantedOwnerUuid = String(linked.ownerUuid || "").trim().toLowerCase();
+    const wantedOwnerName = String(linked.ownerName || "").trim().toLowerCase();
+
+    const cServer = normalizeServerId(c.serverId || wantedServer);
+    const cName = String(c.name || "").trim().toLowerCase();
+    const cOwnerUuid = String(c.ownerUuid || "").trim().toLowerCase();
+    const cOwnerName = companionOwnerName(c);
+
+    if (cServer !== wantedServer || cName !== wantedName) return false;
+    if (wantedOwnerUuid && cOwnerUuid === wantedOwnerUuid) return true;
+    if (wantedOwnerName && cOwnerName === wantedOwnerName) return true;
+    return false;
+}
+
 function normalizeServerId(serverId) {
     return String(serverId || firstEnabledServerId() || "meowtys_s3").trim().toLowerCase();
 }
@@ -1297,53 +1360,35 @@ app.get("/companions", (req, res) => {
     // Only show companions for the resolved server.
     list = list.filter(c => normalizeServerId(c.serverId || serverId) === serverId);
 
-    // If a viewer has a linked companion, return the EXACT owner + companion match.
-    // This prevents loading another player's companion when multiple companions share the same name.
+    // IMPORTANT:
+    // Multi-streamer safety. A stream must only expose companions owned by that
+    // streamer's Minecraft owner name. This prevents DjHilha's stream from ever
+    // showing HalosiaPaage/Aslakx/etc companions with the same companion name.
+    const ownerCandidates = ownerCandidatesForRequest(req, serverId, channelId);
+    if (ownerCandidates.length > 0) {
+        const allowedOwners = new Set(ownerCandidates);
+        list = list.filter(c => allowedOwners.has(companionOwnerName(c)));
+    }
+
     const requestedViewer = String(req.query.viewer || "").trim();
     const scopedViewer = requestedViewer ? scopeViewerFromRequest(req, requestedViewer) : "";
     const wallet = scopedViewer ? getWalletResolved(scopedViewer, false) : null;
     const linked = wallet ? parseCompanionLink(wallet.companionName) : null;
 
-    if (linked && linked.companionName) {
-        const linkedName = String(linked.companionName || "").trim().toLowerCase();
-        const linkedOwnerUuid = String(linked.ownerUuid || "").trim().toLowerCase();
-        const linkedOwnerName = String(linked.ownerName || "").trim().toLowerCase();
-
-        const exact = list.find(c => {
-            const name = String(c.name || "").trim().toLowerCase();
-            const ownerUuid = String(c.ownerUuid || "").trim().toLowerCase();
-            const ownerName = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
-
-            if (name !== linkedName) return false;
-            if (linkedOwnerUuid && ownerUuid && ownerUuid === linkedOwnerUuid) return true;
-            if (linkedOwnerUuid && linkedOwnerUuid.startsWith("ownername:") && ownerName === linkedOwnerUuid.slice("ownername:".length)) return true;
-            if (linkedOwnerName && ownerName === linkedOwnerName) return true;
-            return false;
-        });
+    if (wallet && linked && linked.companionName) {
+        const exact = list.find(c => companionMatchesLinked(c, linked));
 
         if (exact) {
-            // Upgrade old placeholder links such as ownername:hilha to the real owner UUID once exporter data exists.
-            const exactOwnerUuid = String(exact.ownerUuid || "").trim();
-            const exactOwnerName = String(exact.owner || exact.ownerName || exact.minecraftName || linked.ownerName || "").trim();
-            if (wallet && exactOwnerUuid && linkedOwnerUuid.startsWith("ownername:")) {
-                wallet.companionName = encodeCompanionLink(serverId, exactOwnerUuid, exactOwnerName, exact.name || linked.companionName);
-                wallet.updatedAt = new Date().toISOString();
-                saveWallets();
-                console.log(`[LINK] Upgraded companion link for ${wallet.viewer}: ${wallet.companionName}`);
-            }
-
+            // Return only the exact linked companion. Do not fall back to another
+            // companion with the same name.
             list = [exact];
         } else {
-            // IMPORTANT: Do not fall back to name-only matching.
-            // If Hilha's linked companion was deleted, returning all companions lets the
-            // extension pick another player's companion also named "Hilha".
-            // Clear this stale wallet link and return no companion for this viewer.
-            if (wallet) {
-                console.log(`[LINK] Exact linked companion missing for ${wallet.viewer}; clearing stale link: ${wallet.companionName}`);
-                wallet.companionName = "";
-                wallet.updatedAt = new Date().toISOString();
-                saveWallets();
-            }
+            // The linked companion was deleted or belongs to a different owner.
+            // Clear the stale wallet link and return no companion.
+            console.log(`[LINK] Linked companion not found for ${wallet.viewer}; clearing stale link: ${wallet.companionName}`);
+            wallet.companionName = "";
+            wallet.updatedAt = new Date().toISOString();
+            saveWallets();
             list = [];
         }
     }
@@ -1351,6 +1396,7 @@ app.get("/companions", (req, res) => {
     res.json({
         ...companionsData,
         serverId,
+        ownerFilter: ownerCandidates,
         companions: list
     });
 });
@@ -1374,46 +1420,9 @@ app.post("/companions", requireApiKey, (req, res) => {
         companions: existingOtherServers.concat(incoming)
     };
 
-    // Upgrade wallet links created before the exporter knew the real owner UUID.
-    // Example old link: meowtys_s3::ownername:hilha::Hilha::Hilha
-    let upgradedLinks = 0;
-    for (const wallet of Object.values(wallets || {})) {
-        if (!wallet || !wallet.companionName) continue;
-        const linked = parseCompanionLink(wallet.companionName);
-        const linkedServer = normalizeServerId(linked.serverId || serverId);
-        const linkedOwnerUuid = String(linked.ownerUuid || "").trim().toLowerCase();
-        const linkedOwnerName = String(linked.ownerName || "").trim().toLowerCase();
-        const linkedCompanion = String(linked.companionName || "").trim().toLowerCase();
+    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}`);
 
-        if (linkedServer !== serverId || !linkedCompanion) continue;
-        if (!linkedOwnerUuid.startsWith("ownername:") && linkedOwnerUuid) continue;
-
-        const ownerFromPlaceholder = linkedOwnerUuid.startsWith("ownername:")
-            ? linkedOwnerUuid.slice("ownername:".length)
-            : linkedOwnerName;
-
-        const exact = incoming.find(c => {
-            const cName = String(c.name || "").trim().toLowerCase();
-            const cOwner = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
-            return cName === linkedCompanion && cOwner === ownerFromPlaceholder;
-        });
-
-        if (exact && exact.ownerUuid) {
-            wallet.companionName = encodeCompanionLink(
-                serverId,
-                exact.ownerUuid,
-                exact.owner || exact.ownerName || exact.minecraftName || linked.ownerName,
-                exact.name || linked.companionName
-            );
-            wallet.updatedAt = new Date().toISOString();
-            upgradedLinks++;
-        }
-    }
-    if (upgradedLinks > 0) saveWallets();
-
-    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}, upgradedLinks: ${upgradedLinks}`);
-
-    res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace", upgradedLinks });
+    res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace" });
 });
 app.get("/tasks", (req, res) => res.json(tasksData));
 app.post("/tasks", requireApiKey, (req, res) => {
