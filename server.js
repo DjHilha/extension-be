@@ -1276,21 +1276,44 @@ app.get("/companions", (req, res) => {
     });
 });
 app.post("/companions", requireApiKey, (req, res) => {
-    if (!req.body || !Array.isArray(req.body.companions)) return res.status(400).json({ ok: false, error: "Expected body with companions array" });
+    if (!req.body || !Array.isArray(req.body.companions)) {
+        return res.status(400).json({
+            ok: false,
+            error: "Expected body with companions array"
+        });
+    }
+
     const serverId = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(req.body.channelId));
-    const incoming = req.body.companions.map(c => ({ ...c, serverId }));
-    const existing = Array.isArray(companionsData.companions) ? companionsData.companions : [];
-    const byKey = new Map();
-    for (const c of existing) {
-        const key = `${normalizeServerId(c.serverId || serverId)}::${String(c.ownerUuid || c.owner || "").toLowerCase()}::${String(c.name || "").toLowerCase()}`;
-        byKey.set(key, c);
-    }
-    for (const c of incoming) {
-        const key = `${serverId}::${String(c.ownerUuid || c.owner || "").toLowerCase()}::${String(c.name || "").toLowerCase()}`;
-        byKey.set(key, c);
-    }
-    companionsData = { serverId, companions: Array.from(byKey.values()) };
-    res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length });
+
+    const incoming = req.body.companions.map(c => ({
+        ...c,
+        serverId
+    }));
+
+    /*
+     * IMPORTANT:
+     * The Minecraft exporter sends the FULL current companion list.
+     * Do not merge with the previous list, otherwise deleted companions stay
+     * cached on Render forever and the extension still thinks they exist.
+     */
+    const otherServers = Array.isArray(companionsData.companions)
+        ? companionsData.companions.filter(c => normalizeServerId(c.serverId || "") !== serverId)
+        : [];
+
+    companionsData = {
+        serverId,
+        companions: [...otherServers, ...incoming]
+    };
+
+    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Count: ${incoming.length}`);
+
+    res.json({
+        ok: true,
+        serverId,
+        count: companionsData.companions.length,
+        updated: incoming.length,
+        replaced: true
+    });
 });
 app.get("/tasks", (req, res) => res.json(tasksData));
 app.post("/tasks", requireApiKey, (req, res) => {
