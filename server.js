@@ -1525,9 +1525,36 @@ app.get("/viewer-init/:viewer", (req, res) => {
         }
     }
 
-    // If the wallet was not linked yet but this stream owner has exactly one active
-    // companion with the same name as the viewer's selected companion, do not guess.
-    // Returning no companion is safer than name-only fallback across multi-streamer data.
+    // Safe fallback: by this point the list is already filtered to the stream owner's
+    // companions only (for DjHilha, only owner=Hilha). So if the wallet link is
+    // missing/stale, we can still resolve the selected companion by name without
+    // ever crossing into another streamer's companions.
+    if (!companion) {
+        const fallbackNames = new Set();
+        const addFallbackName = value => {
+            const raw = String(value || "").trim();
+            if (!raw) return;
+            fallbackNames.add(raw.toLowerCase());
+            if (/^dj/i.test(raw) && raw.length > 2) fallbackNames.add(raw.slice(2).toLowerCase());
+        };
+
+        addFallbackName(req.query.companionName);
+        addFallbackName(req.query.companion);
+        addFallbackName(req.query.selectedCompanion);
+        addFallbackName(wallet && parseCompanionLink(wallet.companionName).companionName);
+        addFallbackName(wallet && wallet.displayName);
+        addFallbackName(requestedViewer);
+
+        if (fallbackNames.size > 0) {
+            companion = list.find(c => fallbackNames.has(String(c.name || "").trim().toLowerCase())) || null;
+        }
+
+        // If the stream owner has only one companion exported, use it. This keeps
+        // first-load behavior fast while staying owner-scoped.
+        if (!companion && list.length === 1) {
+            companion = list[0];
+        }
+    }
 
     res.json({
         ok: true,
@@ -1535,7 +1562,7 @@ app.get("/viewer-init/:viewer", (req, res) => {
         ownerFilter: ownerCandidates,
         wallet: wallet ? publicWallet(wallet) : null,
         companion,
-        companions: companion ? [companion] : [],
+        companions: companion ? [companion] : list,
         clearedStaleCompanion
     });
 });
@@ -3507,78 +3534,3 @@ app.post("/tasks/join", (req, res) => {
         request
     });
 });
-
-app.post("/tasks/vote", (req, res) => {
-    const viewer = scopeViewerFromRequest(req, req.body.viewer);
-    const companionName = String(req.body.companionName || "").trim();
-    const displayName = String(req.body.displayName || "").trim();
-    const twitchId = String(req.body.twitchId || "").trim();
-    const vote = String(req.body.vote || "").toLowerCase();
-    const voteKey = String(req.body.voteKey || "current");
-
-    if (!viewer || !["support", "doubt"].includes(vote)) {
-        return res.status(400).json({
-            ok: false,
-            error: "Invalid vote"
-        });
-    }
-
-    if (twitchId || displayName) {
-        updateWalletIdentity(viewer, twitchId, displayName || viewer);
-    }
-
-    if (!taskVotes[voteKey]) {
-        taskVotes[voteKey] = {};
-    }
-
-    if (taskVotes[voteKey][viewer]) {
-        return res.json({
-            ok: true,
-            alreadyVoted: true,
-            vote: taskVotes[voteKey][viewer]
-        });
-    }
-
-    taskVotes[voteKey][viewer] = vote;
-
-    const request = queueShopAction({
-        action: "task_vote",
-        viewer,
-        companionName,
-        displayName,
-        twitchId,
-        vote,
-        voteKey,
-        cost: 0
-    });
-
-    res.json({
-        ok: true,
-        vote,
-        request
-    });
-});
-
-
-app.get("/shop/actions/queue", requireApiKey, (req, res) => res.json({ ok: true, queue: shopActionQueue }));
-app.post("/shop/actions/queue/clear", requireApiKey, (req, res) => {
-    const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
-    shopActionQueue = shopActionQueue.filter(item => !ids.includes(item.id));
-    saveQueue();
-    res.json({ ok: true, remaining: shopActionQueue.length });
-});
-app.get("/shop/trail/queue", requireApiKey, (req, res) => res.json({ ok: true, queue: shopActionQueue.filter(item => item.action === "buy_trail") }));
-app.post("/shop/trail/queue/clear", requireApiKey, (req, res) => {
-    const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
-    shopActionQueue = shopActionQueue.filter(item => !ids.includes(item.id));
-    saveQueue();
-    res.json({ ok: true, remaining: shopActionQueue.length });
-});
-loadPersistentData()
-    .then(() => {
-        app.listen(PORT, () => console.log(`Meowtys backend running on port ${PORT}`));
-    })
-    .catch(error => {
-        console.error("[DATA] Failed during startup.", error);
-        app.listen(PORT, () => console.log(`Meowtys backend running on port ${PORT} with fallback data`));
-    });
