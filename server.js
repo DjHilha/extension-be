@@ -1994,6 +1994,36 @@ const STUDY_FOCUSES = ["vault_xp", "watchtime_dirt", "quest_rewards"];
 const TRAINING_MODIFIERS = Array.from(FORGERY_MODIFIERS || []);
 const EXPEDITION_DURATION_MS = 5 * 60 * 1000;
 
+const STUDY_MANUAL_CAP = 10;
+const STUDY_SPARRING_CAP = 25;
+const CAPTAIN_NAMES = new Set(["djhilha", "hilha"]);
+const CAPTAIN_WIN_MESSAGES = [
+    "🏆 Another victory for the Captain!",
+    "🏴‍☠️ The Captain remains undefeated!",
+    "⚓ Captain Hilha sent another challenger overboard!",
+    "Mutiny?! Quartermaster?!"
+];
+const SPARRING_BONUS_RATING = {
+    basic: 1,
+    advanced: 2,
+    elite: 5,
+    agility: 2,
+    study: 2,
+    expedition: 5,
+    sparring: 2,
+    specialization: 2
+};
+const SPARRING_BONUS_LABELS = {
+    basic: "Basic",
+    advanced: "Advanced",
+    elite: "Elite",
+    agility: "Agility",
+    study: "Study",
+    expedition: "Expedition",
+    sparring: "Sparring",
+    specialization: "Specialization"
+};
+
 function trainingKey(viewer, companionName) {
     return companionStateKeyFor(viewer, companionName);
 }
@@ -2020,6 +2050,9 @@ function getTrainingState(viewer, companionName) {
             expedition: null,
             sparWins: 0,
             sparLosses: 0,
+            currentWinStreak: 0,
+            bestWinStreak: 0,
+            sparringBonuses: {},
             history: [],
             updatedAt: new Date().toISOString()
         };
@@ -2032,6 +2065,11 @@ function getTrainingState(viewer, companionName) {
     state.modifierKnowledge = state.modifierKnowledge || {};
     state.modifierKnowledge.companion_challenge = true;
     state.activeResearch = Array.isArray(state.activeResearch) ? state.activeResearch : [];
+    state.sparWins = Number(state.sparWins || 0);
+    state.sparLosses = Number(state.sparLosses || 0);
+    state.currentWinStreak = Number(state.currentWinStreak || 0);
+    state.bestWinStreak = Number(state.bestWinStreak || 0);
+    state.sparringBonuses = state.sparringBonuses && typeof state.sparringBonuses === "object" ? state.sparringBonuses : {};
     state.relicFragments = Number(state.relicFragments || 0);
     state.ancientRelicFragments = Number(state.ancientRelicFragments || 0);
     state.academyLevel = Math.max(1, Math.min(10, Number(state.academyLevel || 1)));
@@ -2130,6 +2168,10 @@ function publicTrainingState(state) {
         expedition: state.expedition || null,
         sparWins: Number(state.sparWins || 0),
         sparLosses: Number(state.sparLosses || 0),
+        currentWinStreak: Number(state.currentWinStreak || 0),
+        bestWinStreak: Number(state.bestWinStreak || 0),
+        sparringBonuses: state.sparringBonuses || {},
+        combatRating: calculateCombatRating(state, 0).base,
         history: Array.isArray(state.history) ? state.history.slice(-8).reverse() : [],
         updatedAt: state.updatedAt || "",
         tiers: TRAINING_TIERS,
@@ -2160,6 +2202,84 @@ function addTrainingHistory(state, text) {
 function addMastery(state, amount) {
     state.masteryXp = Number(state.masteryXp || 0) + Math.max(1, amount);
     state.masteryLevel = Math.max(1, Math.floor(state.masteryXp / 100) + 1);
+}
+
+function isCaptainName(value) {
+    return CAPTAIN_NAMES.has(String(value || "").trim().toLowerCase());
+}
+
+function displayFighterName(value, fallback = "Unknown") {
+    const clean = String(value || "").trim();
+    if (!clean) return fallback;
+    if (isCaptainName(clean)) return "Captain Hilha";
+    return clean;
+}
+
+function addSparringRatingBonus(state, bonusType) {
+    if (!state) return 0;
+    const key = String(bonusType || "").toLowerCase();
+    const amount = Number(SPARRING_BONUS_RATING[key] || 0);
+    if (amount <= 0) return 0;
+    state.sparringBonuses = state.sparringBonuses && typeof state.sparringBonuses === "object" ? state.sparringBonuses : {};
+    state.sparringBonuses[key] = Number(state.sparringBonuses[key] || 0) + amount;
+    return amount;
+}
+
+function totalSparringRatingBonuses(state) {
+    const bonuses = state?.sparringBonuses || {};
+    return Object.values(bonuses).reduce((sum, value) => sum + Number(value || 0), 0);
+}
+
+function manualStudyMaxed(state, focus) {
+    return Number(state?.study?.[focus] || 0) >= STUDY_MANUAL_CAP;
+}
+
+function addSparringStudyBonus(state) {
+    if (!state) return null;
+    state.study = state.study || { vault_xp: 0, watchtime_dirt: 0, quest_rewards: 0 };
+    const focus = randomItem(STUDY_FOCUSES);
+    const current = Number(state.study[focus] || 0);
+    const cap = Number(state.academyLevel || 1) >= 10 && current >= STUDY_MANUAL_CAP ? STUDY_SPARRING_CAP : STUDY_MANUAL_CAP;
+    if (current >= cap) {
+        return { focus, added: 0, value: current, capped: true };
+    }
+    const next = Math.min(cap, Number((current + 0.25).toFixed(2)));
+    state.study[focus] = next;
+    return { focus, added: Number((next - current).toFixed(2)), value: next, capped: false };
+}
+
+function calculateCombatRating(state, companionLevel = 0) {
+    const level = Math.max(1, Number(companionLevel || state?.companionLevel || 1));
+    const base = Math.round(level * 10 + totalSparringRatingBonuses(state));
+    const variance = Number((0.90 + Math.random() * 0.20).toFixed(4));
+    return {
+        base,
+        roll: Math.max(1, Math.round(base * variance)),
+        variance
+    };
+}
+
+function recordSparResult(state, won) {
+    if (!state) return;
+    if (won) {
+        state.sparWins = Number(state.sparWins || 0) + 1;
+        state.currentWinStreak = Number(state.currentWinStreak || 0) + 1;
+        state.bestWinStreak = Math.max(Number(state.bestWinStreak || 0), Number(state.currentWinStreak || 0));
+    } else {
+        state.sparLosses = Number(state.sparLosses || 0) + 1;
+        state.currentWinStreak = 0;
+    }
+}
+
+function buildSparringChatMessage(challengerName, opponentName, winnerName, captainFight = false, opponentSelected = false) {
+    if (captainFight) return randomItem(CAPTAIN_WIN_MESSAGES);
+    const challenger = displayFighterName(challengerName, "A viewer");
+    const opponent = opponentSelected ? displayFighterName(opponentName, "Training Dummy") : "a training dummy";
+    const winner = displayFighterName(winnerName, challenger);
+    if (opponentSelected) {
+        return `⚔ ${challenger} is sparring with ${opponent} and ${winner} won!`;
+    }
+    return `⚔ ${challenger} went sparring and ${winner} won!`;
 }
 
 function randomItem(list) {
@@ -2213,8 +2333,9 @@ app.post("/training/combat", (req, res) => {
     const xpPercent = maybeApplyAcademyXpBonus(state, tier.xpPercent);
     const request = queueShopAction({ action: "training_xp", viewer: valid.viewer, companionName: valid.companionName, xpPercent, trainingType: tierName, cost: tier.cost });
     addMastery(state, tierName === "elite" ? 35 : tierName === "advanced" ? 20 : 10);
+    const sparBonus = addSparringRatingBonus(state, tierName);
     setCooldown(state, `combat_${tierName}`, tier.cooldownMs);
-    addTrainingHistory(state, `${tier.label}: queued ${Math.round(xpPercent * 100)}% TNL XP.`);
+    addTrainingHistory(state, `${tier.label}: queued ${Math.round(xpPercent * 100)}% TNL XP.${sparBonus ? ` Sparring rating +${sparBonus}.` : ""}`);
     saveTraining();
     res.json({ ok: true, request, wallet: spend, training: publicTrainingState(state) });
 });
@@ -2250,12 +2371,16 @@ app.post("/training/study", (req, res) => {
     if (!STUDY_FOCUSES.includes(focus)) return res.status(400).json({ ok: false, error: "Invalid study focus." });
     const state = getTrainingState(valid.viewer, valid.companionName);
     finalizeTrainingState(state);
+    state.study = state.study || {};
+    if (manualStudyMaxed(state, focus)) {
+        return res.status(400).json({ ok: false, error: "That study is already maxed. Sparring bonuses can still push it higher later." });
+    }
     const spend = spendDirt(valid.viewer, PRICES.TRAINING_STUDY, "training_study");
     if (!spend.ok) return res.status(400).json(spend);
-    state.study = state.study || {};
-    state.study[focus] = Math.min(10, Number(state.study[focus] || 0) + 0.25);
+    state.study[focus] = Math.min(STUDY_MANUAL_CAP, Number((Number(state.study[focus] || 0) + 0.25).toFixed(2)));
     addMastery(state, 12);
-    addTrainingHistory(state, `Study: ${focus.replace(/_/g, ' ')} improved to ${state.study[focus]}%.`);
+    const sparBonus = addSparringRatingBonus(state, "study");
+    addTrainingHistory(state, `Study: ${focus.replace(/_/g, ' ')} improved to ${state.study[focus]}%.${sparBonus ? ` Sparring rating +${sparBonus}.` : ""}`);
     saveTraining();
     res.json({ ok: true, wallet: spend, training: publicTrainingState(state) });
 });
@@ -2356,7 +2481,8 @@ app.post("/training/expedition", (req, res) => {
         if (ancientFound) state.ancientRelicFragments = Number(state.ancientRelicFragments || 0) + 1;
         state.expedition = null;
         addMastery(state, ancientFound ? 25 : 15);
-        addTrainingHistory(state, ancientFound ? "Expedition complete: found 1 Relic Fragment and 1 Ancient Relic Fragment." : "Expedition complete: found 1 Relic Fragment.");
+        const sparBonus = addSparringRatingBonus(state, "expedition");
+        addTrainingHistory(state, (ancientFound ? "Expedition complete: found 1 Relic Fragment and 1 Ancient Relic Fragment." : "Expedition complete: found 1 Relic Fragment.") + (sparBonus ? ` Sparring rating +${sparBonus}.` : ""));
         saveTraining();
         return res.json({ ok: true, completed: true, reward: { relicFragments: 1, ancientRelicFragments: ancientFound ? 1 : 0, ancientChance: chance }, training: publicTrainingState(state) });
     }
@@ -2418,21 +2544,96 @@ app.post("/training/minigame", (req, res) => {
 app.post("/training/spar", (req, res) => {
     const valid = validateTrainingBody(req);
     if (!valid.ok) return res.status(valid.status).json(valid);
-    const opponent = String(req.body.opponent || "Training Dummy").trim() || "Training Dummy";
+
+    const opponentRaw = String(req.body.opponent || "").trim();
+    const opponentSelected = !!opponentRaw && opponentRaw.toLowerCase() !== "training dummy";
+    const opponent = opponentSelected ? opponentRaw : "Training Dummy";
+    const companionLevel = Number(req.body.level || req.body.companionLevel || 1);
+
     const spend = spendDirt(valid.viewer, PRICES.TRAINING_SPARRING, "training_sparring");
     if (!spend.ok) return res.status(400).json(spend);
+
     const state = getTrainingState(valid.viewer, valid.companionName);
     finalizeTrainingState(state);
-    const power = Math.random() + Number(state.masteryLevel || 1) * 0.02;
-    const enemy = Math.random() + 0.25;
-    const won = power >= enemy;
-    if (won) state.sparWins = Number(state.sparWins || 0) + 1; else state.sparLosses = Number(state.sparLosses || 0) + 1;
+
+    const challengerName = publicWallet(getWallet(valid.viewer))?.displayName || valid.companionName || valid.viewer;
+    const challengerIsCaptain = isCaptainName(challengerName) || isCaptainName(valid.companionName);
+    const opponentIsCaptain = isCaptainName(opponent);
+    const captainFight = challengerIsCaptain || opponentIsCaptain;
+
+    let opponentState = null;
+    let opponentCompanionName = opponent;
+    let opponentLevel = 1;
+
+    if (opponentSelected && !opponentIsCaptain) {
+        const scopedOpponent = scopeViewerFromRequest(req, opponentRaw);
+        const opponentWallet = getWalletResolved(scopedOpponent, false) || getWalletResolved(opponentRaw, false);
+        if (opponentWallet) {
+            const publicOpponentWallet = publicWallet(opponentWallet);
+            opponentCompanionName = publicOpponentWallet.companionName || opponentRaw;
+            opponentState = getTrainingState(opponentWallet.viewer, opponentCompanionName);
+            finalizeTrainingState(opponentState);
+        }
+    }
+
+    const challengerRating = calculateCombatRating(state, companionLevel);
+    const opponentRating = opponentIsCaptain
+        ? { base: 999999, roll: 999999, variance: 1 }
+        : opponentState
+            ? calculateCombatRating(opponentState, opponentLevel)
+            : { base: 75, roll: Math.max(1, Math.round(75 * (0.90 + Math.random() * 0.20))), variance: 1 };
+
+    let won;
+    if (captainFight) {
+        won = challengerIsCaptain && !opponentIsCaptain;
+    } else {
+        won = challengerRating.roll >= opponentRating.roll;
+    }
+
+    recordSparResult(state, won);
+    if (opponentState && opponentSelected) {
+        recordSparResult(opponentState, !won);
+        opponentState.updatedAt = new Date().toISOString();
+    }
+
     const xpPercent = won ? 0.07 : 0.025;
     const request = queueShopAction({ action: "training_xp", viewer: valid.viewer, companionName: valid.companionName, xpPercent, trainingType: "sparring", cost: PRICES.TRAINING_SPARRING });
+
+    const sparBonusType = randomItem(Object.keys(SPARRING_BONUS_RATING));
+    const sparBonus = addSparringRatingBonus(state, sparBonusType);
+    let studyBonus = null;
+    if (sparBonusType === "study") {
+        studyBonus = addSparringStudyBonus(state);
+    }
+
     addMastery(state, won ? 18 : 7);
-    addTrainingHistory(state, `Sparring vs ${opponent}: ${won ? "won" : "lost"}, ${Math.round(xpPercent * 100)}% TNL XP queued.`);
+
+    const winnerName = captainFight
+        ? "Captain Hilha"
+        : won
+            ? (challengerName || valid.companionName)
+            : opponent;
+
+    const chatMessage = buildSparringChatMessage(challengerName || valid.companionName, opponent, winnerName, captainFight, opponentSelected);
+    queueShopAction({ action: "chat_message", message: chatMessage, source: "sparring", viewer: valid.viewer, companionName: valid.companionName, cost: 0 });
+
+    const bonusLabel = SPARRING_BONUS_LABELS[sparBonusType] || sparBonusType;
+    const studyText = studyBonus && studyBonus.added > 0 ? ` ${studyBonus.focus.replace(/_/g, " ")} +${studyBonus.added}%.` : "";
+    addTrainingHistory(state, `Sparring vs ${opponent}: ${won ? "won" : "lost"}. Rating ${challengerRating.roll} vs ${opponentRating.roll}. ${Math.round(xpPercent * 100)}% TNL XP queued. ${bonusLabel} sparring rating +${sparBonus}.${studyText}`);
+
     saveTraining();
-    res.json({ ok: true, won, request, wallet: spend, training: publicTrainingState(state) });
+    res.json({
+        ok: true,
+        won,
+        opponent,
+        winner: winnerName,
+        message: chatMessage,
+        ratings: { challenger: challengerRating, opponent: opponentRating },
+        bonus: { type: sparBonusType, rating: sparBonus, study: studyBonus },
+        request,
+        wallet: spend,
+        training: publicTrainingState(state)
+    });
 });
 
 app.post("/training/upgrade-academy", (req, res) => {
