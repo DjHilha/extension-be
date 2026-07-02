@@ -2294,28 +2294,33 @@ function buildSparringArenaChatBlock(details) {
     const bonusAmount = Number(details.bonusAmount || 0);
     const flavor = String(details.flavor || "").trim();
 
+    // Minecraft chat does not support the graphic overlay from the mockup.
+    // This is the clean chat version: one [Meowty Arena] prefix at the top,
+    // no broken emoji boxes, and color-coded text using Minecraft formatting.
+    const challengerColor = isCaptainName(challenger) ? "§6" : "§f";
+    const opponentColor = isCaptainName(opponent) ? "§6" : "§c";
+    const winnerColor = isCaptainName(winner) ? "§6" : "§e";
+
     const lines = [
-        "====================================",
-        "        MEOWTY TRAINING ARENA",
-        "====================================",
-        `${challenger} (${challengerRating})`,
-        "        VS",
-        `${opponent} (${opponentRating})`,
-        "",
-        `Winner: ${winner}`,
-        `XP Reward: +${xpPercent}% TNL XP`,
-        `Win Streak: ${streak}`
+        "§6==============================",
+        "§e        MEOWTY TRAINING ARENA",
+        "§6==============================",
+        `${challengerColor}${challenger} §a(${challengerRating}) §7x VS x ${opponentColor}${opponent} §c(${opponentRating})`,
+        "§8------------------------------",
+        `§6Winner: ${winnerColor}${winner}`,
+        `§bXP Reward: §a+${xpPercent}% §fTNL XP`,
+        `§dWin Streak: §f${streak}`
     ];
 
     if (bonusLabel && bonusAmount > 0) {
-        lines.push(`Training Bonus: ${bonusLabel} (+${bonusAmount})`);
+        lines.push(`§9Training Bonus: §b${bonusLabel} §a(+${bonusAmount})`);
     }
 
     if (flavor) {
-        lines.push("", flavor);
+        lines.push("§8------------------------------", `§6${flavor}`);
     }
 
-    lines.push("====================================");
+    lines.push("§6==============================");
 
     return lines.join("\n");
 }
