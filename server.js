@@ -2271,15 +2271,46 @@ function recordSparResult(state, won) {
     }
 }
 
-function buildSparringChatMessage(challengerName, opponentName, winnerName, captainFight = false, opponentSelected = false) {
-    if (captainFight) return randomItem(CAPTAIN_WIN_MESSAGES);
+function buildSparringChatMessage(challengerName, opponentName, winnerName, captainFight = false, opponentSelected = false, details = {}) {
     const challenger = displayFighterName(challengerName, "A viewer");
-    const opponent = opponentSelected ? displayFighterName(opponentName, "Training Dummy") : "a training dummy";
+    const opponent = opponentSelected ? displayFighterName(opponentName, "Training Dummy") : "Training Dummy";
     const winner = displayFighterName(winnerName, challenger);
-    if (opponentSelected) {
-        return `⚔ ${challenger} is sparring with ${opponent} and ${winner} won!`;
+    const challengerRating = Number(details?.challengerRating || 0);
+    const opponentRating = Number(details?.opponentRating || 0);
+    const xpPercent = Number(details?.xpPercent || 0);
+    const streak = Number(details?.streak || 0);
+    const bonusLabel = String(details?.bonusLabel || "").trim();
+    const bonusAmount = Number(details?.bonusAmount || 0);
+
+    const lines = [
+        "══════════════════════════════",
+        "⚔ MEOWTY TRAINING ARENA ⚔",
+        "",
+        `${challenger} (${challengerRating} Combat Rating)`,
+        "        VS",
+        `${opponent} (${opponentRating} Combat Rating)`,
+        "",
+        `🏆 Winner: ${winner}`
+    ];
+
+    if (xpPercent > 0) {
+        lines.push(`⭐ +${Math.round(xpPercent * 100)}% TNL XP queued`);
     }
-    return `⚔ ${challenger} went sparring and ${winner} won!`;
+
+    if (streak > 0) {
+        lines.push(`🔥 Win Streak: ${streak}`);
+    }
+
+    if (bonusLabel && bonusAmount > 0) {
+        lines.push(`📈 Sparring Bonus: ${bonusLabel} +${bonusAmount} Combat Rating`);
+    }
+
+    if (captainFight) {
+        lines.push(randomItem(CAPTAIN_WIN_MESSAGES));
+    }
+
+    lines.push("══════════════════════════════");
+    return lines.join("\n");
 }
 
 function randomItem(list) {
@@ -2614,10 +2645,24 @@ app.post("/training/spar", (req, res) => {
             ? (challengerName || valid.companionName)
             : opponent;
 
-    const chatMessage = buildSparringChatMessage(challengerName || valid.companionName, opponent, winnerName, captainFight, opponentSelected);
+    const bonusLabel = SPARRING_BONUS_LABELS[sparBonusType] || sparBonusType;
+    const chatMessage = buildSparringChatMessage(
+        challengerName || valid.companionName,
+        opponent,
+        winnerName,
+        captainFight,
+        opponentSelected,
+        {
+            challengerRating: challengerRating.roll,
+            opponentRating: opponentRating.roll,
+            xpPercent,
+            streak: Number(state.currentWinStreak || 0),
+            bonusLabel,
+            bonusAmount: sparBonus
+        }
+    );
     queueShopAction({ action: "chat_message", message: chatMessage, source: "sparring", viewer: valid.viewer, companionName: valid.companionName, cost: 0 });
 
-    const bonusLabel = SPARRING_BONUS_LABELS[sparBonusType] || sparBonusType;
     const studyText = studyBonus && studyBonus.added > 0 ? ` ${studyBonus.focus.replace(/_/g, " ")} +${studyBonus.added}%.` : "";
     addTrainingHistory(state, `Sparring vs ${opponent}: ${won ? "won" : "lost"}. Rating ${challengerRating.roll} vs ${opponentRating.roll}. ${Math.round(xpPercent * 100)}% TNL XP queued. ${bonusLabel} sparring rating +${sparBonus}.${studyText}`);
 
