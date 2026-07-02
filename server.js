@@ -1333,6 +1333,18 @@ app.get("/companions", (req, res) => {
             }
 
             list = [exact];
+        } else {
+            // IMPORTANT: Do not fall back to name-only matching.
+            // If Hilha's linked companion was deleted, returning all companions lets the
+            // extension pick another player's companion also named "Hilha".
+            // Clear this stale wallet link and return no companion for this viewer.
+            if (wallet) {
+                console.log(`[LINK] Exact linked companion missing for ${wallet.viewer}; clearing stale link: ${wallet.companionName}`);
+                wallet.companionName = "";
+                wallet.updatedAt = new Date().toISOString();
+                saveWallets();
+            }
+            list = [];
         }
     }
 
