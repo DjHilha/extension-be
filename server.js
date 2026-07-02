@@ -1348,6 +1348,17 @@ function queueShopAction(action) {
     return request;
 }
 
+function shopCompanionFields(req, serverId = "") {
+    const ownerName = String(req.body.ownerName || req.body.minecraftName || "").trim();
+    return {
+        companionUuid: String(req.body.companionUuid || req.body.uuid || "").trim(),
+        ownerUuid: String(req.body.ownerUuid || "").trim(),
+        ownerName,
+        minecraftName: ownerName,
+        serverId: normalizeServerId(serverId || req.body.serverId || resolveServerIdFromChannel(req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || ""))
+    };
+}
+
 function requireApiKey(req, res, next) {
     const key = req.headers["x-api-key"];
     if (!key || key !== API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
@@ -1973,7 +1984,7 @@ app.post("/shop/buy-trail", (req, res) => {
     if (Number.isNaN(color)) return res.status(400).json({ ok: false, error: "Invalid color" });
     const spend = spendDirt(viewer, PRICES.BUY_TRAIL, "buy_trail");
     if (!spend.ok) return res.status(400).json(spend);
-    const request = queueShopAction({ action: "buy_trail", viewer, companionName, trailType, trailTypeName, color, colorName, slot: Number.isInteger(Number(req.body.slot)) ? Number(req.body.slot) : -1, cost: PRICES.BUY_TRAIL });
+    const request = queueShopAction({ action: "buy_trail", viewer, companionName, ...shopCompanionFields(req), trailType, trailTypeName, color, colorName, slot: Number.isInteger(Number(req.body.slot)) ? Number(req.body.slot) : -1, cost: PRICES.BUY_TRAIL });
     res.json({ ok: true, request, wallet: spend });
 });
 app.post("/shop/trail", (req, res) => { req.body.companionName = req.body.companionName || req.body.viewer; return app._router.handle({ ...req, url: "/shop/buy-trail", method: "POST" }, res, () => {}); });
@@ -1983,7 +1994,7 @@ app.post("/shop/buy-relic", (req, res) => {
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     const spend = spendDirt(viewer, PRICES.BUY_RELIC, "buy_relic");
     if (!spend.ok) return res.status(400).json(spend);
-    const request = queueShopAction({ action: "buy_relic", viewer, companionName, cost: PRICES.BUY_RELIC });
+    const request = queueShopAction({ action: "buy_relic", viewer, companionName, ...shopCompanionFields(req), cost: PRICES.BUY_RELIC });
     res.json({ ok: true, request, wallet: spend });
 });
 app.post("/shop/buy-ancient-relic", (req, res) => {
@@ -1992,7 +2003,7 @@ app.post("/shop/buy-ancient-relic", (req, res) => {
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     const spend = spendDirt(viewer, PRICES.BUY_ANCIENT_RELIC, "buy_ancient_relic");
     if (!spend.ok) return res.status(400).json(spend);
-    const request = queueShopAction({ action: "buy_ancient_relic", viewer, companionName, cost: PRICES.BUY_ANCIENT_RELIC });
+    const request = queueShopAction({ action: "buy_ancient_relic", viewer, companionName, ...shopCompanionFields(req), cost: PRICES.BUY_ANCIENT_RELIC });
     res.json({ ok: true, request, wallet: spend });
 });
 app.post("/shop/reroll-relic", (req, res) => {
@@ -2003,7 +2014,7 @@ app.post("/shop/reroll-relic", (req, res) => {
     if (!Number.isInteger(slot) || slot < 0 || slot > 3) return res.status(400).json({ ok: false, error: "Invalid relic slot" });
     const spend = spendDirt(viewer, PRICES.REROLL_RELIC, "reroll_relic");
     if (!spend.ok) return res.status(400).json(spend);
-    const request = queueShopAction({ action: "reroll_relic", viewer, companionName, slot, cost: PRICES.REROLL_RELIC });
+    const request = queueShopAction({ action: "reroll_relic", viewer, companionName, ...shopCompanionFields(req), slot, cost: PRICES.REROLL_RELIC });
     res.json({ ok: true, request, wallet: spend });
 });
 app.post("/shop/reroll-ancient-relic", (req, res) => {
@@ -2014,7 +2025,7 @@ app.post("/shop/reroll-ancient-relic", (req, res) => {
     if (!Number.isInteger(slot) || slot < 0 || slot > 0) return res.status(400).json({ ok: false, error: "Invalid ancient relic slot" });
     const spend = spendDirt(viewer, PRICES.REROLL_ANCIENT_RELIC, "reroll_ancient_relic");
     if (!spend.ok) return res.status(400).json(spend);
-    const request = queueShopAction({ action: "reroll_ancient_relic", viewer, companionName, slot, cost: PRICES.REROLL_ANCIENT_RELIC });
+    const request = queueShopAction({ action: "reroll_ancient_relic", viewer, companionName, ...shopCompanionFields(req), slot, cost: PRICES.REROLL_ANCIENT_RELIC });
     res.json({ ok: true, request, wallet: spend });
 });
 
@@ -2028,7 +2039,7 @@ function createPaidShopRoute(path, actionName, price, extraBuilder) {
         if (!spend.ok) return res.status(400).json(spend);
 
         const extra = extraBuilder ? extraBuilder(req) : {};
-        const request = queueShopAction({ action: actionName, viewer, companionName, cost: price, ...extra });
+        const request = queueShopAction({ action: actionName, viewer, companionName, ...shopCompanionFields(req), cost: price, ...extra });
         res.json({ ok: true, request, wallet: spend });
     });
 }
@@ -2042,7 +2053,7 @@ app.post("/shop/switch-skin", (req, res) => {
     const companionName = String(req.body.companionName || "").trim();
     const skinName = String(req.body.skinName || "").trim();
     if (!viewer || !companionName || !skinName) return res.status(400).json({ ok: false, error: "Missing viewer, companion, or skin" });
-    const request = queueShopAction({ action: "switch_skin", viewer, companionName, skinName, cost: 0 });
+    const request = queueShopAction({ action: "switch_skin", viewer, companionName, ...shopCompanionFields(req), skinName, cost: 0 });
     res.json({ ok: true, request });
 });
 
@@ -2050,7 +2061,7 @@ app.post("/shop/crew-quarters", (req, res) => {
     const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
-    const request = queueShopAction({ action: "crew_quarters", viewer, companionName, cost: 0 });
+    const request = queueShopAction({ action: "crew_quarters", viewer, companionName, ...shopCompanionFields(req), cost: 0 });
     res.json({ ok: true, request });
 });
 
@@ -2058,7 +2069,7 @@ app.post("/shop/back-to-work", (req, res) => {
     const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
-    const request = queueShopAction({ action: "back_to_work", viewer, companionName, cost: 0 });
+    const request = queueShopAction({ action: "back_to_work", viewer, companionName, ...shopCompanionFields(req), cost: 0 });
     res.json({ ok: true, request });
 });
 
