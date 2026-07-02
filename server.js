@@ -890,6 +890,61 @@ function publicWallet(wallet) {
     };
 }
 
+
+function exportedCompanionExistsForLink(linked) {
+    if (!linked || !linked.companionName || !Array.isArray(companionsData.companions)) return false;
+    const wantedServer = normalizeServerId(linked.serverId || firstEnabledServerId());
+    const wantedName = String(linked.companionName || "").trim().toLowerCase();
+    const wantedOwnerUuid = String(linked.ownerUuid || "").trim().toLowerCase();
+    const wantedOwnerName = String(linked.ownerName || "").trim().toLowerCase();
+
+    return companionsData.companions.some(c => {
+        const cServer = normalizeServerId(c.serverId || wantedServer);
+        const cName = String(c.name || "").trim().toLowerCase();
+        const cOwnerUuid = String(c.ownerUuid || "").trim().toLowerCase();
+        const cOwnerName = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
+        if (cServer !== wantedServer || cName !== wantedName) return false;
+        if (wantedOwnerUuid && cOwnerUuid === wantedOwnerUuid) return true;
+        if (wantedOwnerName && cOwnerName === wantedOwnerName) return true;
+        if (!wantedOwnerUuid && !wantedOwnerName) {
+            const matches = companionsData.companions.filter(other =>
+                normalizeServerId(other.serverId || wantedServer) === wantedServer &&
+                String(other.name || "").trim().toLowerCase() === wantedName
+            );
+            return matches.length === 1;
+        }
+        return false;
+    });
+}
+
+function clearStaleCompanionLinkIfNeeded(wallet) {
+    if (!wallet || !wallet.companionName) return false;
+    const linked = parseCompanionLink(wallet.companionName);
+    if (!linked.companionName) return false;
+    if (!Array.isArray(companionsData.companions) || companionsData.companions.length === 0) return false;
+    if (exportedCompanionExistsForLink(linked)) return false;
+    console.log(`[LINK] Clearing stale companion link for ${wallet.viewer}: ${wallet.companionName}`);
+    wallet.companionName = "";
+    wallet.updatedAt = new Date().toISOString();
+    saveWallets();
+    return true;
+}
+
+function companionNameExistsForOwner(serverId, minecraftName, companionName) {
+    const sid = normalizeServerId(serverId);
+    const ownerWanted = String(minecraftName || "").trim().toLowerCase();
+    const nameWanted = String(companionName || "").trim().toLowerCase();
+    if (!nameWanted || !Array.isArray(companionsData.companions)) return false;
+
+    return companionsData.companions.some(c => {
+        const cServer = normalizeServerId(c.serverId || sid);
+        const cName = String(c.name || "").trim().toLowerCase();
+        const cOwner = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
+        if (cServer !== sid || cName !== nameWanted) return false;
+        return ownerWanted ? cOwner === ownerWanted : true;
+    });
+}
+
 const FORGERY_MODIFIERS = new Set([
     "companion_challenge",
     "extended",
@@ -1277,43 +1332,27 @@ app.get("/companions", (req, res) => {
 });
 app.post("/companions", requireApiKey, (req, res) => {
     if (!req.body || !Array.isArray(req.body.companions)) {
-        return res.status(400).json({
-            ok: false,
-            error: "Expected body with companions array"
-        });
+        return res.status(400).json({ ok: false, error: "Expected body with companions array" });
     }
 
     const serverId = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(req.body.channelId));
+    const incoming = req.body.companions.map(c => ({ ...c, serverId }));
 
-    const incoming = req.body.companions.map(c => ({
-        ...c,
-        serverId
-    }));
-
-    /*
-     * IMPORTANT:
-     * The Minecraft exporter sends the FULL current companion list.
-     * Do not merge with the previous list, otherwise deleted companions stay
-     * cached on Render forever and the extension still thinks they exist.
-     */
-    const otherServers = Array.isArray(companionsData.companions)
-        ? companionsData.companions.filter(c => normalizeServerId(c.serverId || "") !== serverId)
+    // The Minecraft exporter sends the FULL current companion list.
+    // Replace this server's cached list instead of merging, otherwise deleted
+    // companions stay cached on Render forever.
+    const existingOtherServers = Array.isArray(companionsData.companions)
+        ? companionsData.companions.filter(c => normalizeServerId(c.serverId || serverId) !== serverId)
         : [];
 
     companionsData = {
         serverId,
-        companions: [...otherServers, ...incoming]
+        companions: existingOtherServers.concat(incoming)
     };
 
-    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Count: ${incoming.length}`);
+    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}`);
 
-    res.json({
-        ok: true,
-        serverId,
-        count: companionsData.companions.length,
-        updated: incoming.length,
-        replaced: true
-    });
+    res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace" });
 });
 app.get("/tasks", (req, res) => res.json(tasksData));
 app.post("/tasks", requireApiKey, (req, res) => {
@@ -1350,7 +1389,8 @@ app.get("/wallet/:viewer", (req, res) => {
         });
     }
 
-    res.json({ ok: true, ...publicWallet(wallet) });
+    const clearedStaleCompanion = clearStaleCompanionLinkIfNeeded(wallet);
+    res.json({ ok: true, ...publicWallet(wallet), clearedStaleCompanion });
 });
 app.post("/wallet/add", requireApiKey, (req, res) => {
     const requestedViewer = String(req.body.viewer || "").trim();
@@ -1465,6 +1505,75 @@ app.post("/wallet/reset", requireApiKey, (req, res) => {
     saveWallets();
     console.log(`[WALLET] Reset ${viewer} to 0 Dirt.`);
     res.json({ ok: true, viewer: wallet.viewer, dirt: wallet.dirt });
+});
+
+app.post("/admin/reset-player", requireApiKey, (req, res) => {
+    const requestedViewer = String(req.body.viewer || req.body.twitchName || req.body.displayName || "").trim();
+    const minecraftName = String(req.body.minecraftName || req.body.ownerName || requestedViewer || "").trim();
+    const scopedViewer = requestedViewer ? scopeViewerFromRequest(req, requestedViewer) : "";
+    const walletKey = resolveWalletKey(scopedViewer) || resolveWalletKey(requestedViewer) || normalizeViewer(scopedViewer || requestedViewer);
+
+    if (!requestedViewer && !minecraftName) {
+        return res.status(400).json({ ok: false, error: "Missing viewer or minecraftName" });
+    }
+
+    let walletDeleted = false;
+    let walletBefore = null;
+    if (walletKey && wallets[walletKey]) {
+        walletBefore = publicWallet(wallets[walletKey]);
+        delete wallets[walletKey];
+        walletDeleted = true;
+    }
+
+    const wantedMinecraft = minecraftName.toLowerCase();
+    const beforeCompanions = Array.isArray(companionsData.companions) ? companionsData.companions.length : 0;
+    companionsData.companions = (Array.isArray(companionsData.companions) ? companionsData.companions : []).filter(c => {
+        const owner = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
+        return owner !== wantedMinecraft;
+    });
+    const removedCompanions = beforeCompanions - companionsData.companions.length;
+
+    let removedTraining = 0;
+    for (const key of Object.keys(trainingData || {})) {
+        const state = trainingData[key] || {};
+        if (
+            normalizeViewer(state.viewer || "") === normalizeViewer(walletKey || requestedViewer) ||
+            String(state.companionName || "").trim().toLowerCase() === wantedMinecraft
+        ) {
+            delete trainingData[key];
+            removedTraining++;
+        }
+    }
+
+    let removedForgery = 0;
+    for (const key of Object.keys(forgeryData || {})) {
+        const state = forgeryData[key] || {};
+        if (
+            normalizeViewer(state.viewer || "") === normalizeViewer(walletKey || requestedViewer) ||
+            String(state.companionName || "").trim().toLowerCase() === wantedMinecraft
+        ) {
+            delete forgeryData[key];
+            removedForgery++;
+        }
+    }
+
+    saveWallets();
+    saveTraining();
+    saveForgery();
+
+    console.log(`[ADMIN] Reset player. viewer=${requestedViewer} minecraftName=${minecraftName} walletDeleted=${walletDeleted} companionsRemoved=${removedCompanions}`);
+
+    res.json({
+        ok: true,
+        requestedViewer,
+        minecraftName,
+        walletKey,
+        walletDeleted,
+        walletBefore,
+        removedCompanions,
+        removedTraining,
+        removedForgery
+    });
 });
 
 
@@ -1698,9 +1807,26 @@ app.get("/watch/:viewer", (req, res) => {
 app.post("/shop/create-companion", (req, res) => {
     const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
+    const minecraftName = String(
+        req.body.minecraftName ||
+        req.body.minecraftNameOverride ||
+        req.body.ownerName ||
+        companionName
+    ).trim();
+    const channelId = req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || "";
+    const serverId = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(channelId));
+
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion name" });
-    const alreadyExists = Array.isArray(companionsData.companions) && companionsData.companions.some(c => String(c.name || "").toLowerCase() === companionName.toLowerCase());
-    if (alreadyExists) return res.status(400).json({ ok: false, error: "A companion with that name already exists" });
+
+    if (companionNameExistsForOwner(serverId, minecraftName, companionName)) {
+        return res.status(400).json({
+            ok: false,
+            error: "You already have a companion with that name",
+            companionName,
+            minecraftName
+        });
+    }
+
     const spend = spendDirt(viewer, PRICES.CREATE_COMPANION, "create_companion");
     if (!spend.ok) return res.status(400).json(spend);
 
@@ -1709,13 +1835,19 @@ app.post("/shop/create-companion", (req, res) => {
                     viewer,
                     req.body.twitchId || "",
                     req.body.displayName || viewer,
-                    companionName
+                    companionName,
+                    minecraftName,
+                    channelId,
+                    serverId
             );
 
     const request = queueShopAction({
         action: "create_companion",
         viewer,
         companionName,
+        minecraftName,
+        ownerName: minecraftName,
+        serverId,
         cost: PRICES.CREATE_COMPANION
     });
 
