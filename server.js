@@ -1297,9 +1297,8 @@ app.get("/companions", (req, res) => {
     // Only show companions for the resolved server.
     list = list.filter(c => normalizeServerId(c.serverId || serverId) === serverId);
 
-    // If a viewer is provided, move their linked owner+companion to the front.
-    // This keeps old UI search-by-name working even when multiple owners have
-    // companions with the same name.
+    // If a viewer has a linked companion, return the EXACT owner + companion match.
+    // This prevents loading another player's companion when multiple companions share the same name.
     const requestedViewer = String(req.query.viewer || "").trim();
     const scopedViewer = requestedViewer ? scopeViewerFromRequest(req, requestedViewer) : "";
     const wallet = scopedViewer ? getWalletResolved(scopedViewer, false) : null;
@@ -1310,18 +1309,31 @@ app.get("/companions", (req, res) => {
         const linkedOwnerUuid = String(linked.ownerUuid || "").trim().toLowerCase();
         const linkedOwnerName = String(linked.ownerName || "").trim().toLowerCase();
 
-        list.sort((a, b) => {
-            const score = c => {
-                const name = String(c.name || "").trim().toLowerCase();
-                const ownerUuid = String(c.ownerUuid || "").trim().toLowerCase();
-                const ownerName = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
-                if (name !== linkedName) return 0;
-                if (linkedOwnerUuid && ownerUuid === linkedOwnerUuid) return 3;
-                if (linkedOwnerName && ownerName === linkedOwnerName) return 2;
-                return 1;
-            };
-            return score(b) - score(a);
+        const exact = list.find(c => {
+            const name = String(c.name || "").trim().toLowerCase();
+            const ownerUuid = String(c.ownerUuid || "").trim().toLowerCase();
+            const ownerName = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
+
+            if (name !== linkedName) return false;
+            if (linkedOwnerUuid && ownerUuid && ownerUuid === linkedOwnerUuid) return true;
+            if (linkedOwnerUuid && linkedOwnerUuid.startsWith("ownername:") && ownerName === linkedOwnerUuid.slice("ownername:".length)) return true;
+            if (linkedOwnerName && ownerName === linkedOwnerName) return true;
+            return false;
         });
+
+        if (exact) {
+            // Upgrade old placeholder links such as ownername:hilha to the real owner UUID once exporter data exists.
+            const exactOwnerUuid = String(exact.ownerUuid || "").trim();
+            const exactOwnerName = String(exact.owner || exact.ownerName || exact.minecraftName || linked.ownerName || "").trim();
+            if (wallet && exactOwnerUuid && linkedOwnerUuid.startsWith("ownername:")) {
+                wallet.companionName = encodeCompanionLink(serverId, exactOwnerUuid, exactOwnerName, exact.name || linked.companionName);
+                wallet.updatedAt = new Date().toISOString();
+                saveWallets();
+                console.log(`[LINK] Upgraded companion link for ${wallet.viewer}: ${wallet.companionName}`);
+            }
+
+            list = [exact];
+        }
     }
 
     res.json({
@@ -1350,9 +1362,46 @@ app.post("/companions", requireApiKey, (req, res) => {
         companions: existingOtherServers.concat(incoming)
     };
 
-    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}`);
+    // Upgrade wallet links created before the exporter knew the real owner UUID.
+    // Example old link: meowtys_s3::ownername:hilha::Hilha::Hilha
+    let upgradedLinks = 0;
+    for (const wallet of Object.values(wallets || {})) {
+        if (!wallet || !wallet.companionName) continue;
+        const linked = parseCompanionLink(wallet.companionName);
+        const linkedServer = normalizeServerId(linked.serverId || serverId);
+        const linkedOwnerUuid = String(linked.ownerUuid || "").trim().toLowerCase();
+        const linkedOwnerName = String(linked.ownerName || "").trim().toLowerCase();
+        const linkedCompanion = String(linked.companionName || "").trim().toLowerCase();
 
-    res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace" });
+        if (linkedServer !== serverId || !linkedCompanion) continue;
+        if (!linkedOwnerUuid.startsWith("ownername:") && linkedOwnerUuid) continue;
+
+        const ownerFromPlaceholder = linkedOwnerUuid.startsWith("ownername:")
+            ? linkedOwnerUuid.slice("ownername:".length)
+            : linkedOwnerName;
+
+        const exact = incoming.find(c => {
+            const cName = String(c.name || "").trim().toLowerCase();
+            const cOwner = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
+            return cName === linkedCompanion && cOwner === ownerFromPlaceholder;
+        });
+
+        if (exact && exact.ownerUuid) {
+            wallet.companionName = encodeCompanionLink(
+                serverId,
+                exact.ownerUuid,
+                exact.owner || exact.ownerName || exact.minecraftName || linked.ownerName,
+                exact.name || linked.companionName
+            );
+            wallet.updatedAt = new Date().toISOString();
+            upgradedLinks++;
+        }
+    }
+    if (upgradedLinks > 0) saveWallets();
+
+    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}, upgradedLinks: ${upgradedLinks}`);
+
+    res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace", upgradedLinks });
 });
 app.get("/tasks", (req, res) => res.json(tasksData));
 app.post("/tasks", requireApiKey, (req, res) => {
