@@ -1692,11 +1692,12 @@ function resolveViewerForState(identifier) {
     const normalized = normalizeViewer(raw);
     if (!normalized) return "";
 
-    // Important: public extension calls and admin commands may send either
-    // Twitch display names (DjHilha) or Twitch numeric IDs (145555184).
-    // Always resolve through wallets first so training/forgery use the same
-    // profile as Dirt wallets.
-    return resolveWalletKey(raw) || resolveWalletKey(normalized) || normalized;
+    // Public extension calls should usually send scoped keys: server::channel::viewer.
+    // Resolve exact/scoped first. If not found, keep the scoped key so state and Dirt
+    // remain channel-isolated instead of falling back to another channel's displayName.
+    const resolved = resolveWalletKey(raw) || resolveWalletKey(normalized);
+    if (resolved) return resolved;
+    return normalized;
 }
 
 function validateForgeryBody(req) {
@@ -1774,9 +1775,10 @@ function transferWalletBalance(fromViewer, toViewer) {
 
 
 function spendDirt(viewer, amount, reason) {
-    const wallet = getWallet(viewer);
+    const resolvedKey = resolveWalletKey(viewer) || normalizeViewer(viewer);
+    const wallet = resolvedKey ? getWallet(resolvedKey) : null;
     const cost = Math.floor(Number(amount || 0));
-    if (!wallet) return { ok: false, error: "Missing viewer" };
+    if (!wallet) return { ok: false, error: "Missing wallet" };
     if (!Number.isFinite(cost) || cost <= 0) return { ok: false, error: "Invalid amount" };
     if (wallet.dirt < cost) {
         return { ok: false, error: "Not enough Dirt", viewer: wallet.viewer, dirt: wallet.dirt, required: cost };
@@ -1802,6 +1804,7 @@ function shopCompanionFields(req, serverId = "") {
         ownerUuid: String(req.body.ownerUuid || "").trim(),
         ownerName,
         minecraftName: ownerName,
+        channelId: normalizeChannelId(req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || ""),
         serverId: normalizeServerId(serverId || req.body.serverId || resolveServerIdFromChannel(req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || ""))
     };
 }
