@@ -961,6 +961,124 @@ function getWalletResolved(identifier, createIfMissing = false) {
     return createIfMissing ? getWallet(identifier) : null;
 }
 
+
+function resolveChannelIdInput(channelInput, serverIdOverride = "") {
+    const raw = String(channelInput || "").trim();
+    const wanted = normalizeViewer(raw);
+    const serverId = normalizeServerId(serverIdOverride || resolveServerIdFromChannel(raw));
+    const config = streamerChannels?.servers?.[serverId] || {};
+    const channels = config.channels || {};
+
+    if (!wanted) {
+        return firstChannelId(serverId);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(channels, wanted)) {
+        return normalizeChannelId(wanted);
+    }
+
+    for (const [id, name] of Object.entries(channels)) {
+        if (normalizeViewer(name) === wanted) {
+            return normalizeChannelId(id);
+        }
+    }
+
+    // Also accept owner/Minecraft names from the owners map, for commands like
+    // /mm dirtallchannel 100 Hilha or /mm dirt DjHilha 100 HalosiaPaage.
+    const owners = config.owners || {};
+    for (const [id, ownerName] of Object.entries(owners)) {
+        if (normalizeViewer(ownerName) === wanted) {
+            return normalizeChannelId(id);
+        }
+    }
+
+    // If a numeric channel id is supplied before it is present in config, still
+    // use it so scoped wallets can be targeted directly.
+    if (/^\d+$/.test(wanted)) {
+        return normalizeChannelId(wanted);
+    }
+
+    return "";
+}
+
+function walletMatchesIdentifierInChannel(wallet, requestedViewer, channelId, serverIdOverride = "") {
+    if (!wallet) return false;
+
+    const wanted = normalizeViewer(requestedViewer);
+    if (!wanted) return false;
+
+    const parsed = parseScopedViewerKey(wallet.viewer || "");
+    const serverId = normalizeServerId(serverIdOverride || parsed.serverId || firstEnabledServerId());
+    const wantedChannel = normalizeChannelId(channelId || "");
+
+    if (wantedChannel && normalizeChannelId(parsed.channelId || "") !== wantedChannel) {
+        return false;
+    }
+
+    const linked = parseCompanionLink(wallet.companionName || "");
+    const candidates = [
+        wallet.viewer,
+        parsed.viewerId,
+        wallet.displayName,
+        wallet.twitchId,
+        linked.companionName,
+        linked.ownerName,
+        wallet.companionName
+    ].map(normalizeViewer).filter(Boolean);
+
+    return candidates.includes(wanted);
+}
+
+function resolveWalletKeyForChannel(requestedViewer, channelInput, serverIdOverride = "") {
+    const raw = String(requestedViewer || "").trim();
+    const normalized = normalizeViewer(raw);
+    if (!normalized) return { key: "", channelId: "", serverId: normalizeServerId(serverIdOverride), matchedBy: "missing" };
+
+    const parsedInput = parseScopedViewerKey(raw);
+    const serverId = normalizeServerId(serverIdOverride || parsedInput.serverId || resolveServerIdFromChannel(channelInput));
+    const channelId = resolveChannelIdInput(channelInput || parsedInput.channelId, serverId);
+
+    // Exact scoped key first: server::channel::viewer
+    if (channelId && !normalized.includes("::")) {
+        const exactScoped = scopedViewerKey(raw, channelId, serverId);
+        if (wallets[exactScoped]) {
+            return { key: exactScoped, channelId, serverId, matchedBy: "scoped_key" };
+        }
+    }
+
+    // Exact raw key, but only if it belongs to this channel when scoped.
+    if (wallets[normalized]) {
+        const parsed = parseScopedViewerKey(normalized);
+        if (!channelId || !parsed.channelId || normalizeChannelId(parsed.channelId) === channelId) {
+            return { key: normalized, channelId: channelId || normalizeChannelId(parsed.channelId || ""), serverId, matchedBy: "exact_key" };
+        }
+    }
+
+    for (const [key, wallet] of Object.entries(wallets)) {
+        if (walletMatchesIdentifierInChannel(wallet, raw, channelId, serverId)) {
+            return { key, channelId, serverId, matchedBy: "channel_alias" };
+        }
+    }
+
+    return { key: "", channelId, serverId, matchedBy: "not_found" };
+}
+
+function walletKeysForChannel(channelInput, serverIdOverride = "") {
+    const serverId = normalizeServerId(serverIdOverride || resolveServerIdFromChannel(channelInput));
+    const channelId = resolveChannelIdInput(channelInput, serverId);
+    if (!channelId) return { keys: [], channelId: "", serverId };
+
+    const keys = Object.entries(wallets)
+        .filter(([key, wallet]) => {
+            const parsed = parseScopedViewerKey(wallet?.viewer || key);
+            return normalizeServerId(parsed.serverId || serverId) === serverId
+                && normalizeChannelId(parsed.channelId || "") === channelId;
+        })
+        .map(([key]) => key);
+
+    return { keys, channelId, serverId };
+}
+
 function publicWallet(wallet) {
     if (!wallet) return null;
     const linked = parseCompanionLink(wallet.companionName);
@@ -1558,17 +1676,32 @@ app.post("/wallet/add", requireApiKey, (req, res) => {
     const requestedViewer = String(req.body.viewer || "").trim();
     const amount = Number(req.body.amount || 0);
     const reason = String(req.body.reason || "manual");
+    const requestedChannel = String(req.body.channelId || req.body.channel || req.query.channelId || req.query.channel || "").trim();
+    const requestedServer = String(req.body.serverId || req.query.serverId || "").trim();
 
     if (!requestedViewer) return res.status(400).json({ ok: false, error: "Missing viewer" });
     if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ ok: false, error: "Invalid amount" });
 
-    const wallet = getWalletResolved(requestedViewer, false);
+    let wallet = null;
+    let channelResolution = null;
+
+    if (requestedChannel) {
+        channelResolution = resolveWalletKeyForChannel(requestedViewer, requestedChannel, requestedServer);
+        wallet = channelResolution.key ? getWallet(channelResolution.key) : null;
+    } else {
+        wallet = getWalletResolved(requestedViewer, false);
+    }
 
     if (!wallet) {
         return res.status(404).json({
             ok: false,
-            error: "Wallet not found. Viewer must log in with Twitch first, or the companion must be linked.",
-            requestedViewer
+            error: requestedChannel
+                ? "Wallet not found in that channel. Viewer must log in with Twitch on that channel first."
+                : "Wallet not found. Viewer must log in with Twitch first, or the companion must be linked.",
+            requestedViewer,
+            requestedChannel: requestedChannel || "",
+            resolvedChannelId: channelResolution?.channelId || "",
+            serverId: channelResolution?.serverId || ""
         });
     }
 
@@ -1579,12 +1712,15 @@ app.post("/wallet/add", requireApiKey, (req, res) => {
 
     saveWallets();
 
-    console.log(`[WALLET] +${added} Dirt to ${wallet.viewer} via "${requestedViewer}" | Reason: ${reason} | Balance: ${wallet.dirt}`);
+    console.log(`[WALLET] +${added} Dirt to ${wallet.viewer} via "${requestedViewer}" | Channel: ${requestedChannel || "any"} | Reason: ${reason} | Balance: ${wallet.dirt}`);
 
     res.json({
         ok: true,
         ...publicWallet(wallet),
         requestedViewer,
+        requestedChannel: requestedChannel || "",
+        resolvedChannelId: channelResolution?.channelId || parseScopedViewerKey(wallet.viewer).channelId || "",
+        matchedBy: channelResolution?.matchedBy || "global",
         added,
         reason
     });
@@ -1618,6 +1754,52 @@ app.post("/wallet/add-all", requireApiKey, (req, res) => {
         added,
         count: keys.length,
         reason
+    });
+});
+
+
+app.post("/wallet/add-channel", requireApiKey, (req, res) => {
+    const amount = Number(req.body.amount || 0);
+    const requestedChannel = String(req.body.channelId || req.body.channel || req.query.channelId || req.query.channel || "").trim();
+    const requestedServer = String(req.body.serverId || req.query.serverId || "").trim();
+    const reason = String(req.body.reason || "manual_channel");
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ ok: false, error: "Invalid amount" });
+    }
+
+    if (!requestedChannel) {
+        return res.status(400).json({ ok: false, error: "Missing channel or channelId" });
+    }
+
+    const resolved = walletKeysForChannel(requestedChannel, requestedServer);
+    if (!resolved.channelId) {
+        return res.status(404).json({ ok: false, error: "Channel not found", requestedChannel });
+    }
+
+    const added = Math.floor(amount);
+    const affected = [];
+
+    for (const key of resolved.keys) {
+        const wallet = getWallet(key);
+        wallet.dirt += added;
+        wallet.updatedAt = new Date().toISOString();
+        affected.push(publicWallet(wallet));
+    }
+
+    saveWallets();
+
+    console.log(`[WALLET] +${added} Dirt to channel ${resolved.channelId} (${requestedChannel}). Count: ${affected.length} | Reason: ${reason}`);
+
+    res.json({
+        ok: true,
+        added,
+        count: affected.length,
+        requestedChannel,
+        channelId: resolved.channelId,
+        serverId: resolved.serverId,
+        reason,
+        wallets: affected
     });
 });
 
