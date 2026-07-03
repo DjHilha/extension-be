@@ -67,6 +67,85 @@ let forgeryData = {};
 let trainingData = {};
 let streamerChannels = {};
 
+const CANONICAL_CHANNELS = {
+    meowtys_s3: {
+        djhilha: { id: "145555184", displayName: "DjHilha", ownerName: "Hilha" },
+        hilha: { id: "145555184", displayName: "DjHilha", ownerName: "Hilha" },
+        halosiapaage: { id: "133543020", displayName: "HalosiaPaage", ownerName: "HalosiaPaage" }
+    }
+};
+
+const PLACEHOLDER_CHANNEL_IDS = new Set(["123456789"]);
+
+function canonicalChannelForInput(channelInput, serverIdOverride = "") {
+    const sid = normalizeServerId(serverIdOverride || firstEnabledServerId());
+    const wanted = normalizeViewer(channelInput);
+    const serverMap = CANONICAL_CHANNELS[sid] || {};
+    return serverMap[wanted] || null;
+}
+
+function isPlaceholderChannelId(channelId) {
+    return PLACEHOLDER_CHANNEL_IDS.has(normalizeChannelId(channelId));
+}
+
+function applyCanonicalChannelOverrides() {
+    for (const [serverId, channelMap] of Object.entries(CANONICAL_CHANNELS)) {
+        if (!streamerChannels.servers[serverId]) {
+            streamerChannels.servers[serverId] = { enabled: true, name: serverId, channels: {}, owners: {} };
+        }
+
+        const config = streamerChannels.servers[serverId];
+        if (!config.channels || typeof config.channels !== "object") config.channels = {};
+        if (!config.owners || typeof config.owners !== "object") config.owners = {};
+
+        for (const badId of PLACEHOLDER_CHANNEL_IDS) {
+            delete config.channels[badId];
+            delete config.owners[badId];
+        }
+
+        for (const canonical of Object.values(channelMap)) {
+            for (const [id, name] of Object.entries({ ...config.channels })) {
+                if (normalizeViewer(name) === normalizeViewer(canonical.displayName) && normalizeChannelId(id) !== canonical.id) {
+                    delete config.channels[id];
+                    delete config.owners[id];
+                }
+            }
+            config.channels[canonical.id] = canonical.displayName;
+            config.owners[canonical.id] = canonical.ownerName;
+        }
+    }
+}
+
+function prunePlaceholderWalletsFromMemory() {
+    let removed = 0;
+    for (const [key, wallet] of Object.entries(wallets || {})) {
+        const parsed = parseScopedViewerKey(wallet?.viewer || key);
+        if (isPlaceholderChannelId(parsed.channelId)) {
+            delete wallets[key];
+            removed++;
+        }
+    }
+    if (removed > 0) {
+        console.log(`[WALLET] Removed ${removed} placeholder-channel wallet(s) from memory/cache.`);
+        writeJsonFile(WALLETS_FILE, wallets);
+    }
+}
+
+async function purgePlaceholderWalletsFromSupabase() {
+    if (!USE_SUPABASE) return;
+    for (const channelId of PLACEHOLDER_CHANNEL_IDS) {
+        try {
+            await supabaseRequest(`/wallets?channel_id=eq.${encodeURIComponent(channelId)}`, {
+                method: "DELETE",
+                headers: { Prefer: "return=minimal" }
+            });
+            console.log(`[SUPABASE] Purged placeholder wallet rows for channel_id=${channelId}.`);
+        } catch (error) {
+            console.error(`[SUPABASE] Failed purging placeholder wallet rows for channel_id=${channelId}.`, error);
+        }
+    }
+}
+
 
 function defaultStreamerChannels() {
     return {
@@ -112,6 +191,8 @@ function loadStreamerChannels() {
     if (!streamerChannels || typeof streamerChannels !== "object") streamerChannels = defaultStreamerChannels();
     if (!streamerChannels.servers || typeof streamerChannels.servers !== "object") streamerChannels.servers = defaultStreamerChannels().servers;
 
+    applyCanonicalChannelOverrides();
+
     // Keep a runtime cache copy in DATA_DIR too.
     writeJsonFile(STREAMER_CHANNELS_FILE, streamerChannels);
 
@@ -137,6 +218,10 @@ function firstChannelId(serverIdOverride = "") {
 
 function resolveServerIdFromChannel(channelId) {
     const wanted = String(channelId || "").trim();
+    const wantedNorm = normalizeViewer(wanted);
+    for (const [serverId, channelMap] of Object.entries(CANONICAL_CHANNELS || {})) {
+        if (channelMap[wantedNorm]) return serverId;
+    }
     for (const [serverId, config] of Object.entries(streamerChannels.servers || {})) {
         if (!config || config.enabled === false) continue;
         const channels = config.channels || {};
@@ -383,6 +468,8 @@ async function loadPersistentData() {
     trainingData = readJsonFile(TRAINING_FILE, {});
 
     await loadWalletsFromSupabase();
+    prunePlaceholderWalletsFromMemory();
+    await purgePlaceholderWalletsFromSupabase();
     await loadTrainingFromSupabase();
     await loadForgeryFromSupabase();
 
@@ -503,7 +590,8 @@ async function syncAllWalletsToSupabase() {
                 || String(wallet.companionName || "").trim()
                 || /^\d+$/.test(String(wallet.viewer || ""));
         })
-        .map(walletToSupabaseRow);
+        .map(walletToSupabaseRow)
+        .filter(row => !isPlaceholderChannelId(row.channel_id));
 
     if (rows.length === 0) {
         return;
@@ -545,6 +633,10 @@ async function loadWalletsFromSupabase() {
         }
 
         for (const row of rows) {
+            if (isPlaceholderChannelId(row.channel_id)) {
+                continue;
+            }
+
             const wallet = supabaseRowToWallet(row);
 
             if (wallet.viewer) {
@@ -1040,6 +1132,11 @@ function resolveChannelIdInput(channelInput, serverIdOverride = "") {
     const serverId = normalizeServerId(serverIdOverride || resolveServerIdFromChannel(raw));
     const config = streamerChannels?.servers?.[serverId] || {};
     const channels = config.channels || {};
+
+    const canonical = canonicalChannelForInput(raw, serverId);
+    if (canonical) {
+        return canonical.id;
+    }
 
     if (!wanted) {
         return firstChannelId(serverId);
