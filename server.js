@@ -473,7 +473,7 @@ function parseCompanionLink(value) {
 }
 
 function companionStateKeyFor(viewer, companionName) {
-    const wallet = getWalletResolved(viewer, false) || getWallet(viewer);
+    const wallet = getWalletResolved(viewer, false) || (wallets[normalizeViewer(viewer)] || null);
     const linked = parseCompanionLink(wallet && wallet.companionName);
     const scoped = parseScopedViewerKey(wallet?.viewer || viewer);
     const requested = String(companionName || "").trim();
@@ -1775,10 +1775,11 @@ function transferWalletBalance(fromViewer, toViewer) {
 
 
 function spendDirt(viewer, amount, reason) {
-    const resolvedKey = resolveWalletKey(viewer) || normalizeViewer(viewer);
+    const requested = normalizeViewer(viewer);
+    const resolvedKey = resolveWalletKey(viewer) || (wallets[requested] ? requested : "");
     const wallet = resolvedKey ? getWallet(resolvedKey) : null;
     const cost = Math.floor(Number(amount || 0));
-    if (!wallet) return { ok: false, error: "Missing wallet" };
+    if (!wallet) return { ok: false, error: "Wallet not found for this channel. Viewer must open/link the extension on this stream first.", viewer: requested };
     if (!Number.isFinite(cost) || cost <= 0) return { ok: false, error: "Invalid amount" };
     if (wallet.dirt < cost) {
         return { ok: false, error: "Not enough Dirt", viewer: wallet.viewer, dirt: wallet.dirt, required: cost };
@@ -1790,7 +1791,14 @@ function spendDirt(viewer, amount, reason) {
 }
 
 function queueShopAction(action) {
-    const request = { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, createdAt: new Date().toISOString(), ...action };
+    const parsed = parseScopedViewerKey(action && action.viewer || "");
+    const request = {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        createdAt: new Date().toISOString(),
+        serverId: action.serverId || parsed.serverId || firstEnabledServerId(),
+        channelId: action.channelId || parsed.channelId || "",
+        ...action
+    };
     shopActionQueue.push(request);
     saveQueue();
     console.log(`[SHOP] Queued ${request.action} for ${request.viewer}`);
