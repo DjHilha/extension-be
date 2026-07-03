@@ -420,7 +420,7 @@ function walletToSupabaseRow(wallet) {
         channel_id: channelId,
         dirt: Number(wallet.dirt || 0),
         twitch_id: String(wallet.twitchId || ""),
-        display_name: String(wallet.displayName || viewerId || ""),
+        display_name: safeDisplayName(wallet.displayName, wallet.twitchId || viewerId || ""),
         companion_name: String(wallet.companionName || ""),
         updated_at: wallet.updatedAt || new Date().toISOString()
     };
@@ -436,7 +436,7 @@ function supabaseRowToWallet(row) {
         viewer,
         dirt: Number(row.dirt || 0),
         twitchId: String(row.twitch_id || ""),
-        displayName: String(row.display_name || rawViewer || viewer),
+        displayName: safeDisplayName(row.display_name, row.twitch_id || rawViewer || ""),
         companionName: String(row.companion_name || ""),
         updatedAt: String(row.updated_at || new Date().toISOString())
     };
@@ -552,7 +552,15 @@ async function loadWalletsFromSupabase() {
             }
         }
 
+        // Repair legacy rows where display_name was accidentally stored as
+        // meowtys_s3::channel::viewer. This keeps Supabase from restoring the
+        // bad display name after you manually edit it.
+        for (const wallet of Object.values(wallets)) {
+            repairWalletDisplayName(wallet, "");
+        }
+
         writeJsonFile(WALLETS_FILE, wallets);
+        syncWalletsToSupabaseSoon();
 
         console.log(`[SUPABASE] Loaded ${rows.length} wallet(s).`);
 
@@ -845,6 +853,68 @@ function looksLikeNumericId(value) {
     return /^\d+$/.test(String(value || "").trim());
 }
 
+function looksLikeInternalScopedId(value) {
+    const raw = String(value || "").trim().toLowerCase();
+    if (!raw) return false;
+    if (raw.includes("::")) return true;
+    return /^meowtys[_-]s\d+::/.test(raw);
+}
+
+function safeDisplayName(value, fallback = "") {
+    const raw = String(value || "").trim();
+    if (!raw || looksLikeNumericId(raw) || looksLikeInternalScopedId(raw)) {
+        return String(fallback || "").trim();
+    }
+    return raw;
+}
+
+
+function findReadableDisplayNameForIdentity(identifier) {
+    const wanted = normalizeViewer(identifier);
+    if (!wanted) return "";
+
+    for (const wallet of Object.values(wallets || {})) {
+        if (!wallet) continue;
+        const parsed = parseScopedViewerKey(wallet.viewer || "");
+        const candidates = [wallet.twitchId, parsed.viewerId, wallet.viewer].map(normalizeViewer);
+        if (!candidates.includes(wanted)) continue;
+
+        const clean = safeDisplayName(wallet.displayName, "");
+        if (clean) return clean;
+    }
+
+    return "";
+}
+
+function repairWalletDisplayName(wallet, preferredName = "") {
+    if (!wallet) return false;
+
+    const preferred = safeDisplayName(preferredName, "");
+    if (preferred) {
+        if (wallet.displayName !== preferred) {
+            wallet.displayName = preferred;
+            wallet.updatedAt = new Date().toISOString();
+            return true;
+        }
+        return false;
+    }
+
+    const current = safeDisplayName(wallet.displayName, "");
+    if (current) return false;
+
+    const parsed = parseScopedViewerKey(wallet.viewer || "");
+    const found = findReadableDisplayNameForIdentity(wallet.twitchId || parsed.viewerId || wallet.viewer);
+    const fallback = found || String(wallet.twitchId || parsed.viewerId || "").trim();
+
+    if (fallback && wallet.displayName !== fallback) {
+        wallet.displayName = fallback;
+        wallet.updatedAt = new Date().toISOString();
+        return true;
+    }
+
+    return false;
+}
+
 function updateWalletIdentity(viewer, twitchId, displayName) {
     const wallet = getWallet(viewer);
     if (!wallet) return null;
@@ -861,8 +931,10 @@ function updateWalletIdentity(viewer, twitchId, displayName) {
      * Do NOT let that overwrite a real readable Twitch name set by walletalias
      * or by the extension manual Twitch-name box.
      */
-    if (cleanDisplayName && !looksLikeNumericId(cleanDisplayName)) {
+    if (cleanDisplayName && !looksLikeNumericId(cleanDisplayName) && !looksLikeInternalScopedId(cleanDisplayName)) {
         wallet.displayName = cleanDisplayName;
+    } else {
+        repairWalletDisplayName(wallet, "");
     }
 
     wallet.updatedAt = new Date().toISOString();
@@ -1001,11 +1073,59 @@ function resolveChannelIdInput(channelInput, serverIdOverride = "") {
     return "";
 }
 
+function collectViewerAliases(identifier) {
+    const wanted = normalizeViewer(identifier);
+    const aliases = new Set();
+
+    if (!wanted) return aliases;
+
+    aliases.add(wanted);
+
+    const parsedWanted = parseScopedViewerKey(wanted);
+    if (parsedWanted.viewerId) aliases.add(normalizeViewer(parsedWanted.viewerId));
+
+    /*
+     * Admin commands may use a readable Twitch name such as DjHilha while the
+     * target channel wallet stores only the numeric Twitch viewer id.
+     * Example:
+     *   /mm dirt DjHilha 100 HalosiaPaage
+     * must resolve DjHilha -> 145555184, then update the wallet where
+     * channel_id = HalosiaPaage's channel and viewer/twitch_id = 145555184.
+     *
+     * We collect aliases globally first, then match inside the requested channel.
+     * This prevents creating duplicate wallets like viewer="djhilha".
+     */
+    for (const wallet of Object.values(wallets || {})) {
+        if (!wallet) continue;
+
+        const parsed = parseScopedViewerKey(wallet.viewer || "");
+        const linked = parseCompanionLink(wallet.companionName || "");
+
+        const candidates = [
+            wallet.viewer,
+            parsed.viewerId,
+            wallet.displayName,
+            wallet.twitchId,
+            linked.companionName,
+            linked.ownerName,
+            wallet.companionName
+        ].map(normalizeViewer).filter(Boolean);
+
+        if (candidates.includes(wanted)) {
+            for (const candidate of candidates) {
+                aliases.add(candidate);
+            }
+        }
+    }
+
+    return aliases;
+}
+
 function walletMatchesIdentifierInChannel(wallet, requestedViewer, channelId, serverIdOverride = "") {
     if (!wallet) return false;
 
-    const wanted = normalizeViewer(requestedViewer);
-    if (!wanted) return false;
+    const aliases = collectViewerAliases(requestedViewer);
+    if (aliases.size === 0) return false;
 
     const parsed = parseScopedViewerKey(wallet.viewer || "");
     const serverId = normalizeServerId(serverIdOverride || parsed.serverId || firstEnabledServerId());
@@ -1026,7 +1146,7 @@ function walletMatchesIdentifierInChannel(wallet, requestedViewer, channelId, se
         wallet.companionName
     ].map(normalizeViewer).filter(Boolean);
 
-    return candidates.includes(wanted);
+    return candidates.some(candidate => aliases.has(candidate));
 }
 
 function resolveWalletKeyForChannel(requestedViewer, channelInput, serverIdOverride = "") {
@@ -1708,6 +1828,11 @@ app.post("/wallet/add", requireApiKey, (req, res) => {
     const added = Math.floor(amount);
 
     wallet.dirt += added;
+    // Admin commands may target a wallet by readable Twitch name while the
+    // wallet row itself is keyed by numeric Twitch id. Keep the readable name
+    // on the row and never let internal scoped ids such as
+    // meowtys_s3::channel::viewer come back as display_name.
+    repairWalletDisplayName(wallet, requestedViewer);
     wallet.updatedAt = new Date().toISOString();
 
     saveWallets();
