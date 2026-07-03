@@ -88,6 +88,46 @@ function isPlaceholderChannelId(channelId) {
     return PLACEHOLDER_CHANNEL_IDS.has(normalizeChannelId(channelId));
 }
 
+function configuredChannelIds(serverIdOverride = "") {
+    const sid = normalizeServerId(serverIdOverride || firstEnabledServerId());
+    const ids = new Set();
+    const config = streamerChannels?.servers?.[sid] || {};
+    for (const id of Object.keys(config.channels || {})) {
+        const clean = normalizeChannelId(id);
+        if (clean && !isPlaceholderChannelId(clean)) ids.add(clean);
+    }
+    const canonicalMap = CANONICAL_CHANNELS[sid] || {};
+    for (const channel of Object.values(canonicalMap)) {
+        const clean = normalizeChannelId(channel.id);
+        if (clean && !isPlaceholderChannelId(clean)) ids.add(clean);
+    }
+    return ids;
+}
+
+function isAllowedChannelId(channelId, serverIdOverride = "") {
+    const clean = normalizeChannelId(channelId);
+    if (!clean || isPlaceholderChannelId(clean)) return false;
+    const allowed = configuredChannelIds(serverIdOverride);
+    return allowed.size === 0 || allowed.has(clean);
+}
+
+function resolveViewerIdInput(viewerInput, serverIdOverride = "") {
+    const wanted = normalizeViewer(viewerInput);
+    if (!wanted) return "";
+    const parsed = parseScopedViewerKey(wanted);
+    if (parsed.viewerId && parsed.viewerId !== wanted) return normalizeViewer(parsed.viewerId);
+    if (/^\d+$/.test(wanted)) return wanted;
+    const sid = normalizeServerId(serverIdOverride || firstEnabledServerId());
+    const canonicalMap = CANONICAL_CHANNELS[sid] || {};
+    const canonical = canonicalMap[wanted];
+    if (canonical && canonical.id) return normalizeViewer(canonical.id);
+    const config = streamerChannels?.servers?.[sid] || {};
+    for (const [id, name] of Object.entries(config.channels || {})) {
+        if (normalizeViewer(name) === wanted) return normalizeViewer(id);
+    }
+    return "";
+}
+
 function applyCanonicalChannelOverrides() {
     for (const [serverId, channelMap] of Object.entries(CANONICAL_CHANNELS)) {
         if (!streamerChannels.servers[serverId]) {
@@ -131,6 +171,23 @@ function prunePlaceholderWalletsFromMemory() {
     }
 }
 
+function pruneInvalidChannelWalletsFromMemory() {
+    let removed = 0;
+    for (const [key, wallet] of Object.entries(wallets || {})) {
+        const parsed = parseScopedViewerKey(wallet?.viewer || key);
+        const serverId = normalizeServerId(parsed.serverId || wallet?.serverId || firstEnabledServerId());
+        const channelId = normalizeChannelId(parsed.channelId || "");
+        if (!isAllowedChannelId(channelId, serverId)) {
+            delete wallets[key];
+            removed++;
+        }
+    }
+    if (removed > 0) {
+        console.log(`[WALLET] Removed ${removed} invalid-channel wallet(s) from memory/cache.`);
+        writeJsonFile(WALLETS_FILE, wallets);
+    }
+}
+
 async function purgePlaceholderWalletsFromSupabase() {
     if (!USE_SUPABASE) return;
     for (const channelId of PLACEHOLDER_CHANNEL_IDS) {
@@ -143,6 +200,32 @@ async function purgePlaceholderWalletsFromSupabase() {
         } catch (error) {
             console.error(`[SUPABASE] Failed purging placeholder wallet rows for channel_id=${channelId}.`, error);
         }
+    }
+}
+
+async function purgeInvalidChannelWalletsFromSupabase() {
+    if (!USE_SUPABASE) return;
+    try {
+        const rows = await supabaseRequest("/wallets?select=server_id,channel_id", { method: "GET" });
+        if (!Array.isArray(rows)) return;
+        const badChannels = new Set();
+        for (const row of rows) {
+            const serverId = normalizeServerId(row.server_id || firstEnabledServerId());
+            const channelId = normalizeChannelId(row.channel_id || "");
+            if (!isAllowedChannelId(channelId, serverId)) {
+                badChannels.add(`${serverId}::${channelId}`);
+            }
+        }
+        for (const value of badChannels) {
+            const [serverId, channelId] = value.split("::");
+            await supabaseRequest(`/wallets?server_id=eq.${encodeURIComponent(serverId)}&channel_id=eq.${encodeURIComponent(channelId)}`, {
+                method: "DELETE",
+                headers: { Prefer: "return=minimal" }
+            });
+            console.log(`[SUPABASE] Purged invalid wallet rows for server_id=${serverId}, channel_id=${channelId}.`);
+        }
+    } catch (error) {
+        console.error("[SUPABASE] Failed purging invalid-channel wallet rows.", error);
     }
 }
 
@@ -469,7 +552,9 @@ async function loadPersistentData() {
 
     await loadWalletsFromSupabase();
     prunePlaceholderWalletsFromMemory();
+    pruneInvalidChannelWalletsFromMemory();
     await purgePlaceholderWalletsFromSupabase();
+    await purgeInvalidChannelWalletsFromSupabase();
     await loadTrainingFromSupabase();
     await loadForgeryFromSupabase();
 
@@ -591,7 +676,7 @@ async function syncAllWalletsToSupabase() {
                 || /^\d+$/.test(String(wallet.viewer || ""));
         })
         .map(walletToSupabaseRow)
-        .filter(row => !isPlaceholderChannelId(row.channel_id));
+        .filter(row => isAllowedChannelId(row.channel_id, row.server_id));
 
     if (rows.length === 0) {
         return;
@@ -633,7 +718,7 @@ async function loadWalletsFromSupabase() {
         }
 
         for (const row of rows) {
-            if (isPlaceholderChannelId(row.channel_id)) {
+            if (!isAllowedChannelId(row.channel_id, row.server_id)) {
                 continue;
             }
 
@@ -1178,6 +1263,9 @@ function collectViewerAliases(identifier) {
 
     aliases.add(wanted);
 
+    const canonicalViewerId = resolveViewerIdInput(wanted);
+    if (canonicalViewerId) aliases.add(canonicalViewerId);
+
     const parsedWanted = parseScopedViewerKey(wanted);
     if (parsedWanted.viewerId) aliases.add(normalizeViewer(parsedWanted.viewerId));
 
@@ -1254,6 +1342,30 @@ function resolveWalletKeyForChannel(requestedViewer, channelInput, serverIdOverr
     const parsedInput = parseScopedViewerKey(raw);
     const serverId = normalizeServerId(serverIdOverride || parsedInput.serverId || resolveServerIdFromChannel(channelInput));
     const channelId = resolveChannelIdInput(channelInput || parsedInput.channelId, serverId);
+    const canonicalViewerId = resolveViewerIdInput(raw, serverId);
+
+    // Known Twitch/channel names such as DjHilha must resolve to their numeric
+    // Twitch id before any display_name matching. This prevents a bad row like
+    // viewer=133543020, display_name=DjHilha from stealing the command intended
+    // for viewer/twitch_id=145555184.
+    if (channelId && canonicalViewerId) {
+        const exactCanonicalScoped = scopedViewerKey(canonicalViewerId, channelId, serverId);
+        if (wallets[exactCanonicalScoped]) {
+            return { key: exactCanonicalScoped, channelId, serverId, matchedBy: "canonical_scoped_key" };
+        }
+
+        for (const [key, wallet] of Object.entries(wallets)) {
+            const parsed = parseScopedViewerKey(wallet?.viewer || key);
+            if (normalizeChannelId(parsed.channelId || "") !== channelId) continue;
+            const viewerId = normalizeViewer(parsed.viewerId || "");
+            const twitchId = normalizeViewer(wallet?.twitchId || "");
+            if (viewerId === canonicalViewerId || twitchId === canonicalViewerId) {
+                return { key, channelId, serverId, matchedBy: "canonical_viewer_id" };
+            }
+        }
+
+        return { key: "", channelId, serverId, matchedBy: "canonical_not_found" };
+    }
 
     // Exact scoped key first: server::channel::viewer
     if (channelId && !normalized.includes("::")) {
