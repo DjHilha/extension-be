@@ -105,51 +105,6 @@ function configuredChannelIds(serverIdOverride = "") {
     return ids;
 }
 
-function canonicalChannelById(channelId, serverIdOverride = "") {
-    const sid = normalizeServerId(serverIdOverride || firstEnabledServerId());
-    const wanted = normalizeChannelId(channelId);
-    const serverMap = CANONICAL_CHANNELS[sid] || {};
-    for (const channel of Object.values(serverMap)) {
-        if (normalizeChannelId(channel.id) === wanted) return channel;
-    }
-    return null;
-}
-
-function ownerNameForChannel(channelId, serverIdOverride = "") {
-    const sid = normalizeServerId(serverIdOverride || firstEnabledServerId());
-    const clean = normalizeChannelId(channelId || "");
-    const canonical = canonicalChannelById(clean, sid);
-    if (canonical && canonical.ownerName) return canonical.ownerName;
-    const config = streamerChannels?.servers?.[sid] || {};
-    const owners = config.owners || {};
-    const channels = config.channels || {};
-    return String(owners[clean] || channels[clean] || "").trim();
-}
-
-function displayNameForChannel(channelId, serverIdOverride = "") {
-    const sid = normalizeServerId(serverIdOverride || firstEnabledServerId());
-    const clean = normalizeChannelId(channelId || "");
-    const canonical = canonicalChannelById(clean, sid);
-    if (canonical && canonical.displayName) return canonical.displayName;
-    const config = streamerChannels?.servers?.[sid] || {};
-    const channels = config.channels || {};
-    return String(channels[clean] || clean || "").trim();
-}
-
-function requestChannelId(req, fallback = "") {
-    const raw = String(
-        req?.body?.channelId || req?.body?.channel ||
-        req?.query?.channelId || req?.query?.channel ||
-        req?.headers?.["x-channel-id"] || fallback || ""
-    ).trim();
-    const serverId = normalizeServerId(req?.body?.serverId || req?.query?.serverId || resolveServerIdFromChannel(raw));
-    return resolveChannelIdInput(raw, serverId) || normalizeChannelId(raw);
-}
-
-function requestServerId(req, channelId = "") {
-    return normalizeServerId(req?.body?.serverId || req?.query?.serverId || resolveServerIdFromChannel(channelId));
-}
-
 function isAllowedChannelId(channelId, serverIdOverride = "") {
     const clean = normalizeChannelId(channelId);
     if (!clean || isPlaceholderChannelId(clean)) return false;
@@ -1739,10 +1694,10 @@ function resolveViewerForState(identifier) {
     if (!normalized) return "";
 
     // Public extension calls should usually send scoped keys: server::channel::viewer.
-    // Resolve within that channel first so Academy/Forgery/Training do not fall back
-    // to another stream's displayName wallet.
-    const scopedResolved = resolveScopedWalletKey(raw);
-    if (scopedResolved) return scopedResolved;
+    // Resolve exact/scoped first. If not found, keep the scoped key so state and Dirt
+    // remain channel-isolated instead of falling back to another channel's displayName.
+    const resolved = resolveWalletKey(raw) || resolveWalletKey(normalized);
+    if (resolved) return resolved;
     return normalized;
 }
 
@@ -1820,40 +1775,9 @@ function transferWalletBalance(fromViewer, toViewer) {
 }
 
 
-function resolveScopedWalletKey(identifier) {
-    const raw = String(identifier || "").trim();
-    const normalized = normalizeViewer(raw);
-    if (!normalized) return "";
-
-    if (wallets[normalized]) return normalized;
-
-    const parsed = parseScopedViewerKey(raw);
-    if (parsed.channelId) {
-        const serverId = normalizeServerId(parsed.serverId || firstEnabledServerId());
-        const viewerId = normalizeViewer(parsed.viewerId || "");
-        if (viewerId) {
-            const exact = scopedViewerKey(viewerId, parsed.channelId, serverId);
-            if (wallets[exact]) return exact;
-
-            const channelResolved = resolveWalletKeyForChannel(viewerId, parsed.channelId, serverId);
-            if (channelResolved && channelResolved.key) return channelResolved.key;
-
-            const canonicalViewerId = resolveViewerIdInput(viewerId, serverId);
-            if (canonicalViewerId) {
-                const canonicalExact = scopedViewerKey(canonicalViewerId, parsed.channelId, serverId);
-                if (wallets[canonicalExact]) return canonicalExact;
-                const canonicalResolved = resolveWalletKeyForChannel(canonicalViewerId, parsed.channelId, serverId);
-                if (canonicalResolved && canonicalResolved.key) return canonicalResolved.key;
-            }
-        }
-    }
-
-    return resolveWalletKey(raw) || resolveWalletKey(normalized) || "";
-}
-
 function spendDirt(viewer, amount, reason) {
     const requested = normalizeViewer(viewer);
-    const resolvedKey = resolveScopedWalletKey(viewer);
+    const resolvedKey = resolveWalletKey(viewer) || (wallets[requested] ? requested : "");
     const wallet = resolvedKey ? getWallet(resolvedKey) : null;
     const cost = Math.floor(Number(amount || 0));
     if (!wallet) return { ok: false, error: "Wallet not found for this channel. Viewer must open/link the extension on this stream first.", viewer: requested };
@@ -1883,22 +1807,29 @@ function queueShopAction(action) {
 }
 
 function shopCompanionFields(req, serverId = "") {
-    const channelId = requestChannelId(req);
-    const resolvedServerId = requestServerId(req, channelId || serverId);
-    const ownerName = String(
-        req.body.ownerName ||
-        req.body.minecraftName ||
-        ownerNameForChannel(channelId, resolvedServerId) ||
-        ""
-    ).trim();
+    const ownerName = String(req.body.ownerName || req.body.minecraftName || "").trim();
     return {
         companionUuid: String(req.body.companionUuid || req.body.uuid || "").trim(),
         ownerUuid: String(req.body.ownerUuid || "").trim(),
         ownerName,
         minecraftName: ownerName,
-        channelId: normalizeChannelId(channelId),
-        serverId: normalizeServerId(serverId || resolvedServerId)
+        channelId: normalizeChannelId(req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || ""),
+        serverId: normalizeServerId(serverId || req.body.serverId || resolveServerIdFromChannel(req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || ""))
     };
+}
+
+
+function taskKeyFor(serverId, channelId) {
+    const sid = normalizeServerId(serverId || firstEnabledServerId());
+    const cid = normalizeChannelId(channelId || firstChannelId(sid));
+    return `${sid}::${cid}`;
+}
+
+function resolveRequestChannel(req) {
+    const rawChannel = String(req?.body?.channelId || req?.query?.channelId || req?.headers?.["x-channel-id"] || "").trim();
+    const serverId = normalizeServerId(req?.body?.serverId || req?.query?.serverId || resolveServerIdFromChannel(rawChannel));
+    const channelId = resolveChannelIdInput(rawChannel, serverId) || firstChannelId(serverId);
+    return { serverId, channelId, key: taskKeyFor(serverId, channelId) };
 }
 
 function requireApiKey(req, res, next) {
@@ -2059,41 +1990,38 @@ app.post("/companions", requireApiKey, (req, res) => {
     res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace" });
 });
 app.get("/tasks", (req, res) => {
-    const channelId = requestChannelId(req);
-    const serverId = requestServerId(req, channelId);
-    const key = channelId ? `${serverId}::${channelId}` : "";
-    const channelTasks = key && tasksByChannel[key] ? tasksByChannel[key] : null;
-    res.json(channelTasks || tasksData || { active: false, tasks: [] });
+    const resolved = resolveRequestChannel(req);
+    const scoped = tasksByChannel[resolved.key];
+    res.json(scoped || { ...tasksData, serverId: resolved.serverId, channelId: resolved.channelId });
 });
 app.post("/tasks", requireApiKey, (req, res) => {
     if (!req.body || typeof req.body.active !== "boolean" || !Array.isArray(req.body.tasks)) return res.status(400).json({ ok: false, error: "Expected body with active boolean and tasks array" });
 
-    const channelId = requestChannelId(req);
-    const serverId = requestServerId(req, channelId);
-    const key = channelId ? `${serverId}::${channelId}` : "";
-    const previous = key && tasksByChannel[key] ? tasksByChannel[key] : tasksData;
+    const rawChannel = String(req.body.channelId || "").trim();
+    const serverId = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(rawChannel));
+    const channelId = resolveChannelIdInput(rawChannel, serverId) || firstChannelId(serverId);
+    const key = taskKeyFor(serverId, channelId);
 
-    const previousSignature =
-        Array.isArray(previous.tasks)
-            ? previous.tasks.map(task => task.description || "").join("|")
-            : "";
+    const previous = tasksByChannel[key] || tasksData || { tasks: [] };
+    const previousSignature = Array.isArray(previous.tasks) ? previous.tasks.map(task => task.description || "").join("|") : "";
+    const nextSignature = req.body.tasks.map(task => task.description || "").join("|");
 
-    const nextSignature =
-        req.body.tasks.map(task => task.description || "").join("|");
+    const next = {
+        ...req.body,
+        serverId,
+        channelId,
+        ownerUuid: String(req.body.ownerUuid || ""),
+        ownerName: String(req.body.ownerName || "")
+    };
 
-    const nextTasks = { ...req.body, serverId, channelId };
-
-    if (nextTasks.active && !nextTasks.startedAt) {
-        nextTasks.startedAt =
-            previousSignature === nextSignature && previous.startedAt
-                ? previous.startedAt
-                : Date.now();
+    if (next.active && !next.startedAt) {
+        next.startedAt = previousSignature === nextSignature && previous.startedAt ? previous.startedAt : Date.now();
     }
 
-    tasksData = nextTasks;
-    if (key) tasksByChannel[key] = nextTasks;
+    tasksByChannel[key] = next;
+    tasksData = next;
 
-    res.json({ ok: true, active: nextTasks.active, count: nextTasks.tasks.length, serverId, channelId });
+    res.json({ ok: true, serverId, channelId, active: next.active, count: next.tasks.length });
 });
 app.get("/wallet/:viewer", (req, res) => {
     const scopedViewer = scopeViewerFromRequest(req, req.params.viewer);
@@ -2634,7 +2562,7 @@ app.post("/shop/create-companion", (req, res) => {
         companionName,
         minecraftName,
         ownerName: minecraftName,
-        channelId: normalizeChannelId(channelId),
+        channelId,
         serverId,
         cost: PRICES.CREATE_COMPANION
     });
@@ -4073,10 +4001,10 @@ app.post("/tasks/join", (req, res) => {
         action: "task_join",
         viewer,
         companionName,
-        ...shopCompanionFields(req),
         displayName,
         twitchId,
         voteKey,
+        ...shopCompanionFields(req),
         cost: 0
     });
 
@@ -4124,11 +4052,11 @@ app.post("/tasks/vote", (req, res) => {
         action: "task_vote",
         viewer,
         companionName,
-        ...shopCompanionFields(req),
         displayName,
         twitchId,
         vote,
         voteKey,
+        ...shopCompanionFields(req),
         cost: 0
     });
 
@@ -4141,12 +4069,11 @@ app.post("/tasks/vote", (req, res) => {
 
 
 app.get("/shop/actions/queue", requireApiKey, (req, res) => {
-    const channelId = requestChannelId(req);
-    const serverId = requestServerId(req, channelId);
-    const queue = channelId
-        ? shopActionQueue.filter(item => normalizeServerId(item.serverId || serverId) === serverId && normalizeChannelId(item.channelId || "") === channelId)
-        : shopActionQueue;
-    res.json({ ok: true, queue });
+    const requestedChannel = String(req.query.channelId || req.headers["x-channel-id"] || "").trim();
+    if (!requestedChannel) return res.json({ ok: true, queue: shopActionQueue });
+    const serverId = normalizeServerId(req.query.serverId || resolveServerIdFromChannel(requestedChannel));
+    const channelId = resolveChannelIdInput(requestedChannel, serverId);
+    return res.json({ ok: true, queue: shopActionQueue.filter(item => !item.channelId || normalizeChannelId(item.channelId) === channelId) });
 });
 app.post("/shop/actions/queue/clear", requireApiKey, (req, res) => {
     const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
@@ -4154,15 +4081,7 @@ app.post("/shop/actions/queue/clear", requireApiKey, (req, res) => {
     saveQueue();
     res.json({ ok: true, remaining: shopActionQueue.length });
 });
-app.get("/shop/trail/queue", requireApiKey, (req, res) => {
-    const channelId = requestChannelId(req);
-    const serverId = requestServerId(req, channelId);
-    const queue = shopActionQueue.filter(item =>
-        item.action === "buy_trail" &&
-        (!channelId || (normalizeServerId(item.serverId || serverId) === serverId && normalizeChannelId(item.channelId || "") === channelId))
-    );
-    res.json({ ok: true, queue });
-});
+app.get("/shop/trail/queue", requireApiKey, (req, res) => res.json({ ok: true, queue: shopActionQueue.filter(item => item.action === "buy_trail") }));
 app.post("/shop/trail/queue/clear", requireApiKey, (req, res) => {
     const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
     shopActionQueue = shopActionQueue.filter(item => !ids.includes(item.id));
