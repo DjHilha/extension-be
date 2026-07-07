@@ -77,6 +77,16 @@ const CANONICAL_CHANNELS = {
 
 const PLACEHOLDER_CHANNEL_IDS = new Set(["123456789"]);
 
+const STREAMER_UUID_TO_CHANNEL = {
+    "4c48aee5-182a-4645-a0dd-ebb021df99ef": { channelId: "145555184", displayName: "DjHilha", ownerName: "Hilha" },
+    "bc5cd9bb-0fc5-4bbe-b6a1-b7e73ea7b608": { channelId: "133543020", displayName: "HalosiaPaage", ownerName: "HalosiaPaage" }
+};
+
+function streamerChannelForUuid(uuid) {
+    const clean = String(uuid || "").trim().toLowerCase();
+    return STREAMER_UUID_TO_CHANNEL[clean] || null;
+}
+
 function canonicalChannelForInput(channelInput, serverIdOverride = "") {
     const sid = normalizeServerId(serverIdOverride || firstEnabledServerId());
     const wanted = normalizeViewer(channelInput);
@@ -1484,113 +1494,6 @@ function companionNameExistsForOwner(serverId, minecraftName, companionName) {
     });
 }
 
-
-function valueLooksPresent(value) {
-    if (value === true) return true;
-    if (typeof value === "number") return Number.isFinite(value) && value > 0;
-    if (typeof value === "string") {
-        const clean = value.trim().toLowerCase();
-        if (!clean || clean === "false" || clean === "0" || clean === "none" || clean === "null" || clean === "undefined") return false;
-        return true;
-    }
-    if (Array.isArray(value)) return value.length > 0;
-    if (value && typeof value === "object") return Object.keys(value).length > 0;
-    return false;
-}
-
-function objectLooksLikeAncientRelic(value, depth = 0) {
-    if (depth > 5 || value == null) return false;
-
-    if (Array.isArray(value)) {
-        return value.some(entry => objectLooksLikeAncientRelic(entry, depth + 1));
-    }
-
-    if (typeof value === "string") {
-        const clean = value.toLowerCase();
-        return clean.includes("ancient") && clean.includes("relic");
-    }
-
-    if (typeof value !== "object") return false;
-
-    const typeLike = String(value.type || value.relicType || value.kind || value.category || "").toLowerCase();
-    if (typeLike === "ancient" || typeLike === "ancient_relic" || typeLike === "ancient-relic") return true;
-    if (value.isAncient === true || value.ancient === true) return true;
-
-    const labelLike = String(value.id || value.key || value.name || value.label || value.modifier || "").toLowerCase();
-    if (labelLike.includes("ancient") && labelLike.includes("relic")) return true;
-
-    for (const [rawKey, child] of Object.entries(value)) {
-        const key = String(rawKey || "").toLowerCase();
-
-        // Do not treat fragment counters/chances/costs as equipped ancient relics.
-        if (key.includes("fragment") || key.includes("chance") || key.includes("cost") || key.includes("price")) continue;
-
-        if (key.includes("ancient") && key.includes("relic") && valueLooksPresent(child)) {
-            return true;
-        }
-
-        if (objectLooksLikeAncientRelic(child, depth + 1)) return true;
-    }
-
-    return false;
-}
-
-function findCompanionForAncientCheck(viewer, companionName) {
-    const wantedName = String(companionName || "").trim().toLowerCase();
-    if (!wantedName || !Array.isArray(companionsData.companions)) return null;
-
-    const wallet = getWalletResolved(viewer, false) || wallets[normalizeViewer(viewer)] || null;
-    const linked = wallet ? parseCompanionLink(wallet.companionName || "") : null;
-
-    if (linked && linked.companionName) {
-        const exact = companionsData.companions.find(c => companionMatchesLinked(c, linked));
-        if (exact) return exact;
-    }
-
-    const scoped = parseScopedViewerKey(wallet?.viewer || viewer || "");
-    const serverId = normalizeServerId(scoped.serverId || linked?.serverId || firstEnabledServerId());
-    const ownerName = String(linked?.ownerName || "").trim().toLowerCase();
-    const ownerUuid = String(linked?.ownerUuid || "").trim().toLowerCase();
-
-    return companionsData.companions.find(c => {
-        const cServer = normalizeServerId(c.serverId || serverId);
-        const cName = String(c.name || "").trim().toLowerCase();
-        const cOwner = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
-        const cOwnerUuid = String(c.ownerUuid || "").trim().toLowerCase();
-        if (cServer !== serverId || cName !== wantedName) return false;
-        if (ownerUuid && cOwnerUuid === ownerUuid) return true;
-        if (ownerName && cOwner === ownerName) return true;
-        return !ownerUuid && !ownerName;
-    }) || null;
-}
-
-function requestHasAncientRelic(req, viewer, companionName) {
-    const body = req?.body || {};
-
-    if (body.hasAncientRelic === true || body.ancientRelicOwned === true) return true;
-    if (Number(body.ancientRelicsFilled || body.ancientRelicCount || body.ancientRelicsCount || 0) >= 1) return true;
-
-    const directPayloads = [
-        body.ancientRelic,
-        body.ancientRelics,
-        body.ancient_relic,
-        body.ancient_relics,
-        body.equippedAncientRelic,
-        body.equippedAncientRelics,
-        body.companion,
-        body.relics,
-        body.relicSlots,
-        body.ancientRelicSlots
-    ];
-
-    if (directPayloads.some(payload => objectLooksLikeAncientRelic(payload))) return true;
-
-    const companion = findCompanionForAncientCheck(viewer, companionName);
-    if (companion && objectLooksLikeAncientRelic(companion)) return true;
-
-    return false;
-}
-
 const FORGERY_MODIFIERS = new Set([
     "companion_challenge",
     "extended",
@@ -2081,28 +1984,85 @@ app.post("/companions", requireApiKey, (req, res) => {
 
     res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace" });
 });
-app.get("/tasks", (req, res) => res.json(tasksData));
+function taskScopeFromRequest(req) {
+    const body = req && req.body ? req.body : {};
+    const query = req && req.query ? req.query : {};
+    const headers = req && req.headers ? req.headers : {};
+
+    const uuidChannel = streamerChannelForUuid(
+        body.ownerUuid || body.streamerUuid || body.playerId || query.ownerUuid || query.streamerUuid || query.playerId || ""
+    );
+
+    const rawChannel =
+        body.channelId || body.channel || query.channelId || query.channel || headers["x-channel-id"] ||
+        (uuidChannel ? uuidChannel.channelId : "");
+
+    const serverId = normalizeServerId(
+        body.serverId || query.serverId || resolveServerIdFromChannel(rawChannel)
+    );
+
+    let channelId = resolveChannelIdInput(rawChannel, serverId);
+    if (!channelId && uuidChannel) channelId = uuidChannel.channelId;
+    if (!channelId) channelId = firstChannelId(serverId);
+
+    return {
+        serverId,
+        channelId,
+        key: `${serverId}::${channelId}`
+    };
+}
+
+function inactiveTasksPayload(scope) {
+    return {
+        active: false,
+        allComplete: false,
+        tasks: [],
+        serverId: scope.serverId,
+        channelId: scope.channelId,
+        startedAt: 0
+    };
+}
+
+app.get("/tasks", (req, res) => {
+    const scope = taskScopeFromRequest(req);
+    const scopedTasks = tasksData[scope.key] || inactiveTasksPayload(scope);
+    res.json(scopedTasks);
+});
+
 app.post("/tasks", requireApiKey, (req, res) => {
     if (!req.body || typeof req.body.active !== "boolean" || !Array.isArray(req.body.tasks)) return res.status(400).json({ ok: false, error: "Expected body with active boolean and tasks array" });
 
+    const scope = taskScopeFromRequest(req);
+    const previous = tasksData[scope.key] || inactiveTasksPayload(scope);
+
     const previousSignature =
-        Array.isArray(tasksData.tasks)
-            ? tasksData.tasks.map(task => task.description || "").join("|")
+        Array.isArray(previous.tasks)
+            ? previous.tasks.map(task => task.description || "").join("|")
             : "";
 
     const nextSignature =
         req.body.tasks.map(task => task.description || "").join("|");
 
-    tasksData = req.body;
+    const next = {
+        ...req.body,
+        serverId: scope.serverId,
+        channelId: scope.channelId
+    };
 
-    if (tasksData.active && !tasksData.startedAt) {
-        tasksData.startedAt =
-            previousSignature === nextSignature && tasksData.startedAt
-                ? tasksData.startedAt
+    if (next.active && !next.startedAt) {
+        next.startedAt =
+            previousSignature === nextSignature && previous.startedAt
+                ? previous.startedAt
                 : Date.now();
     }
 
-    res.json({ ok: true, active: tasksData.active, count: tasksData.tasks.length });
+    if (!next.active) {
+        next.startedAt = 0;
+    }
+
+    tasksData[scope.key] = next;
+
+    res.json({ ok: true, active: next.active, count: next.tasks.length, serverId: scope.serverId, channelId: scope.channelId });
 });
 app.get("/wallet/:viewer", (req, res) => {
     const scopedViewer = scopeViewerFromRequest(req, req.params.viewer);
@@ -2782,7 +2742,7 @@ app.post("/forgery/create", (req, res) => {
     if (level < 10) return res.status(400).json({ ok: false, error: "Forgery unlocks at companion level 10." });
 
     const relicType = String(req.body.relicType || req.body.type || "normal").toLowerCase() === "ancient" ? "ancient" : "normal";
-    const hasAncientRelic = requestHasAncientRelic(req, valid.viewer, valid.companionName);
+    const hasAncientRelic = !!(req.body.hasAncientRelic || req.body.ancientRelicOwned || Number(req.body.ancientRelicsFilled || 0) >= 1);
 
     if (relicType === "ancient" && !hasAncientRelic) {
         return res.status(400).json({ ok: false, error: "You need an Ancient Relic equipped before you can craft an Ancient Custom Relic." });
@@ -2896,7 +2856,7 @@ app.post("/forgery/forge", (req, res) => {
     if (!relic) return res.status(400).json({ ok: false, error: "Create a custom relic first." });
 
     const relicType = relic.type === "ancient" ? "ancient" : "normal";
-    const hasAncientRelic = requestHasAncientRelic(req, valid.viewer, valid.companionName);
+    const hasAncientRelic = !!(req.body.hasAncientRelic || req.body.ancientRelicOwned || Number(req.body.ancientRelicsFilled || 0) >= 1);
 
     let replaceSlot = Number(req.body.replaceSlot);
 
@@ -4060,11 +4020,12 @@ app.get("/wallets", requireApiKey, (req, res) => {
 let taskVotes = {};
 
 app.post("/tasks/join", (req, res) => {
+    const scope = taskScopeFromRequest(req);
     const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     const displayName = String(req.body.displayName || "").trim();
     const twitchId = String(req.body.twitchId || "").trim();
-    const voteKey = String(req.body.voteKey || "current");
+    const voteKey = `${scope.key}::${String(req.body.voteKey || "current")}`;
 
     if (!viewer) {
         return res.status(400).json({
@@ -4084,6 +4045,10 @@ app.post("/tasks/join", (req, res) => {
         displayName,
         twitchId,
         voteKey,
+        serverId: scope.serverId,
+        channelId: scope.channelId,
+        ownerUuid: req.body.ownerUuid || "",
+        ownerName: req.body.ownerName || req.body.minecraftName || "",
         cost: 0
     });
 
@@ -4095,12 +4060,13 @@ app.post("/tasks/join", (req, res) => {
 });
 
 app.post("/tasks/vote", (req, res) => {
+    const scope = taskScopeFromRequest(req);
     const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     const displayName = String(req.body.displayName || "").trim();
     const twitchId = String(req.body.twitchId || "").trim();
     const vote = String(req.body.vote || "").toLowerCase();
-    const voteKey = String(req.body.voteKey || "current");
+    const voteKey = `${scope.key}::${String(req.body.voteKey || "current")}`;
 
     if (!viewer || !["support", "doubt"].includes(vote)) {
         return res.status(400).json({
@@ -4135,6 +4101,10 @@ app.post("/tasks/vote", (req, res) => {
         twitchId,
         vote,
         voteKey,
+        serverId: scope.serverId,
+        channelId: scope.channelId,
+        ownerUuid: req.body.ownerUuid || "",
+        ownerName: req.body.ownerName || req.body.minecraftName || "",
         cost: 0
     });
 
