@@ -77,16 +77,6 @@ const CANONICAL_CHANNELS = {
 
 const PLACEHOLDER_CHANNEL_IDS = new Set(["123456789"]);
 
-const STREAMER_UUID_TO_CHANNEL = {
-    "4c48aee5-182a-4645-a0dd-ebb021df99ef": { channelId: "145555184", displayName: "DjHilha", ownerName: "Hilha" },
-    "bc5cd9bb-0fc5-4bbe-b6a1-b7e73ea7b608": { channelId: "133543020", displayName: "HalosiaPaage", ownerName: "HalosiaPaage" }
-};
-
-function streamerChannelForUuid(uuid) {
-    const clean = String(uuid || "").trim().toLowerCase();
-    return STREAMER_UUID_TO_CHANNEL[clean] || null;
-}
-
 function canonicalChannelForInput(channelInput, serverIdOverride = "") {
     const sid = normalizeServerId(serverIdOverride || firstEnabledServerId());
     const wanted = normalizeViewer(channelInput);
@@ -1352,6 +1342,21 @@ function resolveWalletKeyForChannel(requestedViewer, channelInput, serverIdOverr
     const parsedInput = parseScopedViewerKey(raw);
     const serverId = normalizeServerId(serverIdOverride || parsedInput.serverId || resolveServerIdFromChannel(channelInput));
     const channelId = resolveChannelIdInput(channelInput || parsedInput.channelId, serverId);
+
+    // For admin commands, prefer the exact readable Twitch display name inside
+    // the requested channel before any global alias/canonical matching.
+    // This prevents /mm dirt queenofharts78 100 HalosiaPaage from hitting an
+    // older wallet that happens to share another alias.
+    if (channelId) {
+        for (const [key, wallet] of Object.entries(wallets)) {
+            const parsed = parseScopedViewerKey(wallet?.viewer || key);
+            if (normalizeChannelId(parsed.channelId || "") !== channelId) continue;
+            if (wallet.displayName && normalizeViewer(wallet.displayName) === normalized) {
+                return { key, channelId, serverId, matchedBy: "channel_display_name" };
+            }
+        }
+    }
+
     const canonicalViewerId = resolveViewerIdInput(raw, serverId);
 
     // Known Twitch/channel names such as DjHilha must resolve to their numeric
@@ -1984,85 +1989,28 @@ app.post("/companions", requireApiKey, (req, res) => {
 
     res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace" });
 });
-function taskScopeFromRequest(req) {
-    const body = req && req.body ? req.body : {};
-    const query = req && req.query ? req.query : {};
-    const headers = req && req.headers ? req.headers : {};
-
-    const uuidChannel = streamerChannelForUuid(
-        body.ownerUuid || body.streamerUuid || body.playerId || query.ownerUuid || query.streamerUuid || query.playerId || ""
-    );
-
-    const rawChannel =
-        body.channelId || body.channel || query.channelId || query.channel || headers["x-channel-id"] ||
-        (uuidChannel ? uuidChannel.channelId : "");
-
-    const serverId = normalizeServerId(
-        body.serverId || query.serverId || resolveServerIdFromChannel(rawChannel)
-    );
-
-    let channelId = resolveChannelIdInput(rawChannel, serverId);
-    if (!channelId && uuidChannel) channelId = uuidChannel.channelId;
-    if (!channelId) channelId = firstChannelId(serverId);
-
-    return {
-        serverId,
-        channelId,
-        key: `${serverId}::${channelId}`
-    };
-}
-
-function inactiveTasksPayload(scope) {
-    return {
-        active: false,
-        allComplete: false,
-        tasks: [],
-        serverId: scope.serverId,
-        channelId: scope.channelId,
-        startedAt: 0
-    };
-}
-
-app.get("/tasks", (req, res) => {
-    const scope = taskScopeFromRequest(req);
-    const scopedTasks = tasksData[scope.key] || inactiveTasksPayload(scope);
-    res.json(scopedTasks);
-});
-
+app.get("/tasks", (req, res) => res.json(tasksData));
 app.post("/tasks", requireApiKey, (req, res) => {
     if (!req.body || typeof req.body.active !== "boolean" || !Array.isArray(req.body.tasks)) return res.status(400).json({ ok: false, error: "Expected body with active boolean and tasks array" });
 
-    const scope = taskScopeFromRequest(req);
-    const previous = tasksData[scope.key] || inactiveTasksPayload(scope);
-
     const previousSignature =
-        Array.isArray(previous.tasks)
-            ? previous.tasks.map(task => task.description || "").join("|")
+        Array.isArray(tasksData.tasks)
+            ? tasksData.tasks.map(task => task.description || "").join("|")
             : "";
 
     const nextSignature =
         req.body.tasks.map(task => task.description || "").join("|");
 
-    const next = {
-        ...req.body,
-        serverId: scope.serverId,
-        channelId: scope.channelId
-    };
+    tasksData = req.body;
 
-    if (next.active && !next.startedAt) {
-        next.startedAt =
-            previousSignature === nextSignature && previous.startedAt
-                ? previous.startedAt
+    if (tasksData.active && !tasksData.startedAt) {
+        tasksData.startedAt =
+            previousSignature === nextSignature && tasksData.startedAt
+                ? tasksData.startedAt
                 : Date.now();
     }
 
-    if (!next.active) {
-        next.startedAt = 0;
-    }
-
-    tasksData[scope.key] = next;
-
-    res.json({ ok: true, active: next.active, count: next.tasks.length, serverId: scope.serverId, channelId: scope.channelId });
+    res.json({ ok: true, active: tasksData.active, count: tasksData.tasks.length });
 });
 app.get("/wallet/:viewer", (req, res) => {
     const scopedViewer = scopeViewerFromRequest(req, req.params.viewer);
@@ -3987,19 +3935,35 @@ app.post("/wallet/alias", requireApiKey, (req, res) => {
 
 app.get("/wallet/resolve/:identifier", requireApiKey, (req, res) => {
     const identifier = String(req.params.identifier || "").trim();
-    const wallet = getWalletResolved(identifier, false);
+    const requestedChannel = String(req.query.channelId || req.query.channel || req.headers["x-channel-id"] || "").trim();
+    const requestedServer = String(req.query.serverId || "").trim();
+
+    let wallet = null;
+    let channelResolution = null;
+
+    if (requestedChannel) {
+        channelResolution = resolveWalletKeyForChannel(identifier, requestedChannel, requestedServer);
+        wallet = channelResolution.key ? getWallet(channelResolution.key) : null;
+    } else {
+        wallet = getWalletResolved(identifier, false);
+    }
 
     if (!wallet) {
         return res.status(404).json({
             ok: false,
             error: "Wallet not found",
-            identifier
+            identifier,
+            requestedChannel,
+            resolvedChannelId: channelResolution?.channelId || ""
         });
     }
 
     res.json({
         ok: true,
         identifier,
+        requestedChannel,
+        resolvedChannelId: channelResolution?.channelId || parseScopedViewerKey(wallet.viewer).channelId || "",
+        matchedBy: channelResolution?.matchedBy || "global",
         wallet: publicWallet(wallet)
     });
 });
@@ -4020,12 +3984,11 @@ app.get("/wallets", requireApiKey, (req, res) => {
 let taskVotes = {};
 
 app.post("/tasks/join", (req, res) => {
-    const scope = taskScopeFromRequest(req);
     const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     const displayName = String(req.body.displayName || "").trim();
     const twitchId = String(req.body.twitchId || "").trim();
-    const voteKey = `${scope.key}::${String(req.body.voteKey || "current")}`;
+    const voteKey = String(req.body.voteKey || "current");
 
     if (!viewer) {
         return res.status(400).json({
@@ -4045,10 +4008,6 @@ app.post("/tasks/join", (req, res) => {
         displayName,
         twitchId,
         voteKey,
-        serverId: scope.serverId,
-        channelId: scope.channelId,
-        ownerUuid: req.body.ownerUuid || "",
-        ownerName: req.body.ownerName || req.body.minecraftName || "",
         cost: 0
     });
 
@@ -4060,13 +4019,12 @@ app.post("/tasks/join", (req, res) => {
 });
 
 app.post("/tasks/vote", (req, res) => {
-    const scope = taskScopeFromRequest(req);
     const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     const displayName = String(req.body.displayName || "").trim();
     const twitchId = String(req.body.twitchId || "").trim();
     const vote = String(req.body.vote || "").toLowerCase();
-    const voteKey = `${scope.key}::${String(req.body.voteKey || "current")}`;
+    const voteKey = String(req.body.voteKey || "current");
 
     if (!viewer || !["support", "doubt"].includes(vote)) {
         return res.status(400).json({
@@ -4101,10 +4059,6 @@ app.post("/tasks/vote", (req, res) => {
         twitchId,
         vote,
         voteKey,
-        serverId: scope.serverId,
-        channelId: scope.channelId,
-        ownerUuid: req.body.ownerUuid || "",
-        ownerName: req.body.ownerName || req.body.minecraftName || "",
         cost: 0
     });
 
