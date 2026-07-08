@@ -1342,21 +1342,6 @@ function resolveWalletKeyForChannel(requestedViewer, channelInput, serverIdOverr
     const parsedInput = parseScopedViewerKey(raw);
     const serverId = normalizeServerId(serverIdOverride || parsedInput.serverId || resolveServerIdFromChannel(channelInput));
     const channelId = resolveChannelIdInput(channelInput || parsedInput.channelId, serverId);
-
-    // For admin commands, prefer the exact readable Twitch display name inside
-    // the requested channel before any global alias/canonical matching.
-    // This prevents /mm dirt queenofharts78 100 HalosiaPaage from hitting an
-    // older wallet that happens to share another alias.
-    if (channelId) {
-        for (const [key, wallet] of Object.entries(wallets)) {
-            const parsed = parseScopedViewerKey(wallet?.viewer || key);
-            if (normalizeChannelId(parsed.channelId || "") !== channelId) continue;
-            if (wallet.displayName && normalizeViewer(wallet.displayName) === normalized) {
-                return { key, channelId, serverId, matchedBy: "channel_display_name" };
-            }
-        }
-    }
-
     const canonicalViewerId = resolveViewerIdInput(raw, serverId);
 
     // Known Twitch/channel names such as DjHilha must resolve to their numeric
@@ -2164,22 +2149,7 @@ app.post("/wallet/add-channel", requireApiKey, (req, res) => {
 });
 
 app.post("/wallet/spend", requireApiKey, (req, res) => {
-    const requestedViewer = String(req.body.viewer || "").trim();
-    const requestedChannel = String(req.body.channelId || req.body.channel || req.query.channelId || req.query.channel || "").trim();
-    const requestedServer = String(req.body.serverId || req.query.serverId || "").trim();
-    let viewerForSpend = requestedViewer;
-
-    if (requestedChannel) {
-        const resolved = resolveWalletKeyForChannel(requestedViewer, requestedChannel, requestedServer);
-        if (!resolved.key) {
-            return res.status(404).json({ ok: false, error: "Wallet not found in that channel.", requestedViewer, requestedChannel, resolvedChannelId: resolved.channelId || "" });
-        }
-        viewerForSpend = resolved.key;
-    } else {
-        viewerForSpend = resolveWalletKey(requestedViewer) || requestedViewer;
-    }
-
-    const result = spendDirt(viewerForSpend, req.body.amount, String(req.body.reason || "spend"));
+    const result = spendDirt(req.body.viewer, req.body.amount, String(req.body.reason || "spend"));
     if (!result.ok) return res.status(400).json(result);
     res.json(result);
 });
@@ -3589,50 +3559,67 @@ app.post("/training/upgrade-academy", (req, res) => {
    Admin Testing Endpoints
    All require x-api-key
    ========================= */
-function resolveAdminViewerIdentifier(identifier, channelInput = "", serverIdOverride = "") {
+function resolveAdminViewerIdentifier(identifier, channelInput = "") {
     const raw = String(identifier || "").trim();
     const normalized = normalizeViewer(raw);
     const requestedChannel = String(channelInput || "").trim();
-    const serverId = normalizeServerId(serverIdOverride || resolveServerIdFromChannel(requestedChannel));
 
     if (!normalized) {
-        return { ok: false, viewer: "", requestedViewer: raw, resolved: false, channelId: "", serverId, error: "Missing viewer." };
+        return { ok: false, viewer: "", requestedViewer: raw, channelId: "", serverId: firstEnabledServerId(), resolved: false, error: "Missing viewer." };
     }
 
+    /*
+     * Admin commands should target the wallet/state inside the requested stream.
+     * Example:
+     *   /meowtyadmin setfragments DjHilha Hilha 50 50 DjHilha
+     *   /meowtyadmin setfragments DjHilha Hilha 50 50 HalosiaPaage
+     *
+     * Without this channel-aware lookup, display names can resolve to the first
+     * matching wallet from another stream, which is exactly what caused fragment
+     * edits to land on Paage's stream instead of DjHilha's.
+     */
     if (requestedChannel) {
-        const channelResolved = resolveWalletKeyForChannel(raw, requestedChannel, serverId);
-        if (channelResolved && channelResolved.key) {
+        const match = resolveWalletKeyForChannel(raw, requestedChannel);
+        if (match && match.key) {
             return {
                 ok: true,
-                viewer: channelResolved.key,
+                viewer: match.key,
                 requestedViewer: raw,
-                resolved: channelResolved.key !== normalized,
-                channelId: channelResolved.channelId || "",
-                serverId: channelResolved.serverId || serverId,
-                matchedBy: channelResolved.matchedBy || "channel"
+                channelId: match.channelId || resolveChannelIdInput(requestedChannel, match.serverId),
+                serverId: match.serverId || resolveServerIdFromChannel(requestedChannel),
+                resolved: match.key !== normalized,
+                matchedBy: match.matchedBy || "channel"
             };
         }
-        return {
-            ok: false,
-            viewer: "",
-            requestedViewer: raw,
-            resolved: false,
-            channelId: channelResolved?.channelId || resolveChannelIdInput(requestedChannel, serverId),
-            serverId,
-            error: "Wallet not found for that viewer in that channel."
-        };
+
+        const serverId = normalizeServerId(match?.serverId || resolveServerIdFromChannel(requestedChannel));
+        const channelId = resolveChannelIdInput(requestedChannel, serverId);
+        const viewerId = resolveViewerIdInput(raw, serverId) || normalized;
+        if (channelId) {
+            return {
+                ok: true,
+                viewer: scopedViewerKey(viewerId, channelId, serverId),
+                requestedViewer: raw,
+                channelId,
+                serverId,
+                resolved: true,
+                matchedBy: "channel_scoped_fallback"
+            };
+        }
     }
 
     const resolvedKey = resolveWalletKey(raw) || resolveWalletKey(normalized);
 
     if (resolvedKey) {
+        const parsed = parseScopedViewerKey(resolvedKey);
         return {
             ok: true,
             viewer: resolvedKey,
             requestedViewer: raw,
+            channelId: parsed.channelId || "",
+            serverId: parsed.serverId || firstEnabledServerId(),
             resolved: resolvedKey !== normalized,
-            channelId: parseScopedViewerKey(resolvedKey).channelId || "",
-            serverId: parseScopedViewerKey(resolvedKey).serverId || serverId
+            matchedBy: "global"
         };
     }
 
@@ -3640,9 +3627,10 @@ function resolveAdminViewerIdentifier(identifier, channelInput = "", serverIdOve
         ok: true,
         viewer: normalized,
         requestedViewer: raw,
-        resolved: false,
         channelId: "",
-        serverId
+        serverId: firstEnabledServerId(),
+        resolved: false,
+        matchedBy: "raw"
     };
 }
 
@@ -3656,31 +3644,26 @@ function adminTrainingAndForgeryState(viewer, companionName, requestedViewer, ch
         requestedViewer: requestedViewer || resolved.requestedViewer || viewer,
         resolvedViewer: finalViewer,
         resolvedFromDisplayName: !!resolved.resolved,
-        channelId: resolved.channelId || parseScopedViewerKey(finalViewer).channelId || "",
+        channelId: resolved.channelId || "",
+        serverId: resolved.serverId || firstEnabledServerId(),
+        matchedBy: resolved.matchedBy || "",
         training: publicTrainingState(training),
         forgery: publicForgeryState(forgery),
-        wallet: publicWallet(getWalletResolved(finalViewer, false) || wallets[normalizeViewer(finalViewer)] || null)
+        wallet: publicWallet(getWallet(finalViewer))
     };
 }
 
-function companionNameFromResolvedWallet(viewer) {
-    const wallet = getWalletResolved(viewer, false) || wallets[normalizeViewer(viewer)] || null;
-    if (!wallet) return "";
-    const linked = parseCompanionLink(wallet.companionName || "");
-    return String(linked.companionName || wallet.companionName || "").trim();
+function adminChannelFromRequest(req) {
+    return String(req.body.channelId || req.body.channel || req.query.channelId || req.query.channel || req.headers["x-channel-id"] || "").trim();
 }
 
 function validateAdminCompanionBody(req) {
     const requestedViewer = String(req.body.viewer || req.body.identifier || "").trim();
-    const requestedChannel = String(req.body.channelId || req.body.channel || req.query.channelId || req.query.channel || "").trim();
-    const requestedServer = String(req.body.serverId || req.query.serverId || "").trim();
-    const resolved = resolveAdminViewerIdentifier(requestedViewer, requestedChannel, requestedServer);
-    let companionName = String(req.body.companionName || req.body.companion || "").trim();
-    if (!companionName && resolved.ok && resolved.viewer) {
-        companionName = companionNameFromResolvedWallet(resolved.viewer);
-    }
+    const channel = adminChannelFromRequest(req);
+    const resolved = resolveAdminViewerIdentifier(requestedViewer, channel);
+    const companionName = String(req.body.companionName || req.body.companion || "").trim();
     if (!resolved.ok || !resolved.viewer || !companionName) {
-        return { ok: false, status: 400, error: resolved.error || "Missing viewer or companionName.", requestedViewer, requestedChannel };
+        return { ok: false, status: 400, error: "Missing viewer or companionName." };
     }
     return {
         ok: true,
@@ -3688,17 +3671,18 @@ function validateAdminCompanionBody(req) {
         requestedViewer: resolved.requestedViewer,
         resolvedFromDisplayName: resolved.resolved,
         channelId: resolved.channelId || "",
-        serverId: resolved.serverId || "",
+        serverId: resolved.serverId || firstEnabledServerId(),
+        matchedBy: resolved.matchedBy || "",
         companionName
     };
 }
 
 app.get("/admin/training/:viewer/:companionName", requireApiKey, (req, res) => {
-    const requestedChannel = String(req.query.channelId || req.query.channel || "").trim();
-    const resolved = resolveAdminViewerIdentifier(req.params.viewer, requestedChannel);
+    const channel = adminChannelFromRequest(req);
+    const resolved = resolveAdminViewerIdentifier(req.params.viewer, channel);
     const companionName = String(req.params.companionName || "").trim();
-    if (!resolved.ok || !resolved.viewer || !companionName) return res.status(400).json({ ok: false, error: resolved.error || "Missing viewer or companionName." });
-    res.json({ ok: true, ...adminTrainingAndForgeryState(resolved.viewer, companionName, resolved.requestedViewer, requestedChannel) });
+    if (!resolved.ok || !resolved.viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companionName." });
+    res.json({ ok: true, ...adminTrainingAndForgeryState(resolved.viewer, companionName, resolved.requestedViewer, channel) });
 });
 
 app.post("/admin/companion/reset", requireApiKey, (req, res) => {
@@ -3720,7 +3704,7 @@ app.post("/admin/companion/reset", requireApiKey, (req, res) => {
         ok: true,
         resetTraining,
         resetForgery,
-        ...adminTrainingAndForgeryState(valid.viewer, valid.companionName)
+        ...adminTrainingAndForgeryState(valid.viewer, valid.companionName, valid.requestedViewer, valid.channelId)
     });
 });
 
@@ -3729,7 +3713,7 @@ app.post("/admin/training/reset", requireApiKey, (req, res) => {
     if (!valid.ok) return res.status(valid.status).json(valid);
     delete trainingData[trainingKey(valid.viewer, valid.companionName)];
     saveTraining();
-    res.json({ ok: true, ...adminTrainingAndForgeryState(valid.viewer, valid.companionName) });
+    res.json({ ok: true, ...adminTrainingAndForgeryState(valid.viewer, valid.companionName, valid.requestedViewer, valid.channelId) });
 });
 
 app.post("/admin/forgery/reset", requireApiKey, (req, res) => {
@@ -3737,7 +3721,7 @@ app.post("/admin/forgery/reset", requireApiKey, (req, res) => {
     if (!valid.ok) return res.status(valid.status).json(valid);
     delete forgeryData[forgeryKey(valid.viewer, valid.companionName)];
     saveForgery();
-    res.json({ ok: true, ...adminTrainingAndForgeryState(valid.viewer, valid.companionName) });
+    res.json({ ok: true, ...adminTrainingAndForgeryState(valid.viewer, valid.companionName, valid.requestedViewer, valid.channelId) });
 });
 
 app.post("/admin/daily/reset", requireApiKey, (req, res) => {
@@ -3987,35 +3971,19 @@ app.post("/wallet/alias", requireApiKey, (req, res) => {
 
 app.get("/wallet/resolve/:identifier", requireApiKey, (req, res) => {
     const identifier = String(req.params.identifier || "").trim();
-    const requestedChannel = String(req.query.channelId || req.query.channel || req.headers["x-channel-id"] || "").trim();
-    const requestedServer = String(req.query.serverId || "").trim();
-
-    let wallet = null;
-    let channelResolution = null;
-
-    if (requestedChannel) {
-        channelResolution = resolveWalletKeyForChannel(identifier, requestedChannel, requestedServer);
-        wallet = channelResolution.key ? getWallet(channelResolution.key) : null;
-    } else {
-        wallet = getWalletResolved(identifier, false);
-    }
+    const wallet = getWalletResolved(identifier, false);
 
     if (!wallet) {
         return res.status(404).json({
             ok: false,
             error: "Wallet not found",
-            identifier,
-            requestedChannel,
-            resolvedChannelId: channelResolution?.channelId || ""
+            identifier
         });
     }
 
     res.json({
         ok: true,
         identifier,
-        requestedChannel,
-        resolvedChannelId: channelResolution?.channelId || parseScopedViewerKey(wallet.viewer).channelId || "",
-        matchedBy: channelResolution?.matchedBy || "global",
         wallet: publicWallet(wallet)
     });
 });
