@@ -2164,7 +2164,22 @@ app.post("/wallet/add-channel", requireApiKey, (req, res) => {
 });
 
 app.post("/wallet/spend", requireApiKey, (req, res) => {
-    const result = spendDirt(req.body.viewer, req.body.amount, String(req.body.reason || "spend"));
+    const requestedViewer = String(req.body.viewer || "").trim();
+    const requestedChannel = String(req.body.channelId || req.body.channel || req.query.channelId || req.query.channel || "").trim();
+    const requestedServer = String(req.body.serverId || req.query.serverId || "").trim();
+    let viewerForSpend = requestedViewer;
+
+    if (requestedChannel) {
+        const resolved = resolveWalletKeyForChannel(requestedViewer, requestedChannel, requestedServer);
+        if (!resolved.key) {
+            return res.status(404).json({ ok: false, error: "Wallet not found in that channel.", requestedViewer, requestedChannel, resolvedChannelId: resolved.channelId || "" });
+        }
+        viewerForSpend = resolved.key;
+    } else {
+        viewerForSpend = resolveWalletKey(requestedViewer) || requestedViewer;
+    }
+
+    const result = spendDirt(viewerForSpend, req.body.amount, String(req.body.reason || "spend"));
     if (!result.ok) return res.status(400).json(result);
     res.json(result);
 });
@@ -3574,23 +3589,40 @@ app.post("/training/upgrade-academy", (req, res) => {
    Admin Testing Endpoints
    All require x-api-key
    ========================= */
-function resolveAdminViewerIdentifier(identifier) {
+function resolveAdminViewerIdentifier(identifier, channelInput = "", serverIdOverride = "") {
     const raw = String(identifier || "").trim();
     const normalized = normalizeViewer(raw);
+    const requestedChannel = String(channelInput || "").trim();
+    const serverId = normalizeServerId(serverIdOverride || resolveServerIdFromChannel(requestedChannel));
 
     if (!normalized) {
-        return { ok: false, viewer: "", requestedViewer: raw, resolved: false, error: "Missing viewer." };
+        return { ok: false, viewer: "", requestedViewer: raw, resolved: false, channelId: "", serverId, error: "Missing viewer." };
     }
 
-    /*
-     * Admin commands are meant to be used with readable Twitch display names,
-     * for example:
-     *   /meowtyadmin setfragments DjHilha Hilha 10 10
-     *
-     * The extension usually stores the real viewer key as Twitch numeric ID
-     * such as 145555184.  Resolve the admin input through the wallet table so
-     * commands update the same profile that the extension reads.
-     */
+    if (requestedChannel) {
+        const channelResolved = resolveWalletKeyForChannel(raw, requestedChannel, serverId);
+        if (channelResolved && channelResolved.key) {
+            return {
+                ok: true,
+                viewer: channelResolved.key,
+                requestedViewer: raw,
+                resolved: channelResolved.key !== normalized,
+                channelId: channelResolved.channelId || "",
+                serverId: channelResolved.serverId || serverId,
+                matchedBy: channelResolved.matchedBy || "channel"
+            };
+        }
+        return {
+            ok: false,
+            viewer: "",
+            requestedViewer: raw,
+            resolved: false,
+            channelId: channelResolved?.channelId || resolveChannelIdInput(requestedChannel, serverId),
+            serverId,
+            error: "Wallet not found for that viewer in that channel."
+        };
+    }
+
     const resolvedKey = resolveWalletKey(raw) || resolveWalletKey(normalized);
 
     if (resolvedKey) {
@@ -3598,7 +3630,9 @@ function resolveAdminViewerIdentifier(identifier) {
             ok: true,
             viewer: resolvedKey,
             requestedViewer: raw,
-            resolved: resolvedKey !== normalized
+            resolved: resolvedKey !== normalized,
+            channelId: parseScopedViewerKey(resolvedKey).channelId || "",
+            serverId: parseScopedViewerKey(resolvedKey).serverId || serverId
         };
     }
 
@@ -3606,12 +3640,14 @@ function resolveAdminViewerIdentifier(identifier) {
         ok: true,
         viewer: normalized,
         requestedViewer: raw,
-        resolved: false
+        resolved: false,
+        channelId: "",
+        serverId
     };
 }
 
-function adminTrainingAndForgeryState(viewer, companionName, requestedViewer) {
-    const resolved = resolveAdminViewerIdentifier(viewer);
+function adminTrainingAndForgeryState(viewer, companionName, requestedViewer, channelInput = "") {
+    const resolved = resolveAdminViewerIdentifier(viewer, channelInput);
     const finalViewer = resolved.ok ? resolved.viewer : normalizeViewer(viewer);
     const training = getTrainingState(finalViewer, companionName);
     const forgery = getForgeryState(finalViewer, companionName);
@@ -3620,33 +3656,49 @@ function adminTrainingAndForgeryState(viewer, companionName, requestedViewer) {
         requestedViewer: requestedViewer || resolved.requestedViewer || viewer,
         resolvedViewer: finalViewer,
         resolvedFromDisplayName: !!resolved.resolved,
+        channelId: resolved.channelId || parseScopedViewerKey(finalViewer).channelId || "",
         training: publicTrainingState(training),
         forgery: publicForgeryState(forgery),
-        wallet: publicWallet(getWallet(finalViewer))
+        wallet: publicWallet(getWalletResolved(finalViewer, false) || wallets[normalizeViewer(finalViewer)] || null)
     };
+}
+
+function companionNameFromResolvedWallet(viewer) {
+    const wallet = getWalletResolved(viewer, false) || wallets[normalizeViewer(viewer)] || null;
+    if (!wallet) return "";
+    const linked = parseCompanionLink(wallet.companionName || "");
+    return String(linked.companionName || wallet.companionName || "").trim();
 }
 
 function validateAdminCompanionBody(req) {
     const requestedViewer = String(req.body.viewer || req.body.identifier || "").trim();
-    const resolved = resolveAdminViewerIdentifier(requestedViewer);
-    const companionName = String(req.body.companionName || req.body.companion || "").trim();
+    const requestedChannel = String(req.body.channelId || req.body.channel || req.query.channelId || req.query.channel || "").trim();
+    const requestedServer = String(req.body.serverId || req.query.serverId || "").trim();
+    const resolved = resolveAdminViewerIdentifier(requestedViewer, requestedChannel, requestedServer);
+    let companionName = String(req.body.companionName || req.body.companion || "").trim();
+    if (!companionName && resolved.ok && resolved.viewer) {
+        companionName = companionNameFromResolvedWallet(resolved.viewer);
+    }
     if (!resolved.ok || !resolved.viewer || !companionName) {
-        return { ok: false, status: 400, error: "Missing viewer or companionName." };
+        return { ok: false, status: 400, error: resolved.error || "Missing viewer or companionName.", requestedViewer, requestedChannel };
     }
     return {
         ok: true,
         viewer: resolved.viewer,
         requestedViewer: resolved.requestedViewer,
         resolvedFromDisplayName: resolved.resolved,
+        channelId: resolved.channelId || "",
+        serverId: resolved.serverId || "",
         companionName
     };
 }
 
 app.get("/admin/training/:viewer/:companionName", requireApiKey, (req, res) => {
-    const resolved = resolveAdminViewerIdentifier(req.params.viewer);
+    const requestedChannel = String(req.query.channelId || req.query.channel || "").trim();
+    const resolved = resolveAdminViewerIdentifier(req.params.viewer, requestedChannel);
     const companionName = String(req.params.companionName || "").trim();
-    if (!resolved.ok || !resolved.viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companionName." });
-    res.json({ ok: true, ...adminTrainingAndForgeryState(resolved.viewer, companionName, resolved.requestedViewer) });
+    if (!resolved.ok || !resolved.viewer || !companionName) return res.status(400).json({ ok: false, error: resolved.error || "Missing viewer or companionName." });
+    res.json({ ok: true, ...adminTrainingAndForgeryState(resolved.viewer, companionName, resolved.requestedViewer, requestedChannel) });
 });
 
 app.post("/admin/companion/reset", requireApiKey, (req, res) => {
