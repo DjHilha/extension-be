@@ -1500,6 +1500,126 @@ function companionNameExistsForOwner(serverId, minecraftName, companionName) {
     });
 }
 
+
+function truthyBodyValue(value) {
+    if (value === true) return true;
+    if (value === false || value === null || value === undefined) return false;
+    const raw = String(value).trim().toLowerCase();
+    return raw === "true" || raw === "1" || raw === "yes" || raw === "y" || raw === "owned" || raw === "equipped";
+}
+
+function isFilledRelicSlot(slot) {
+    if (slot === null || slot === undefined || slot === false) return false;
+    if (typeof slot === "string") return slot.trim() !== "" && slot.trim().toLowerCase() !== "empty" && slot.trim().toLowerCase() !== "none";
+    if (Array.isArray(slot)) return slot.some(isFilledRelicSlot);
+    if (typeof slot === "object") {
+        if (truthyBodyValue(slot.empty) || truthyBodyValue(slot.isEmpty)) return false;
+        if (truthyBodyValue(slot.owned) || truthyBodyValue(slot.equipped) || truthyBodyValue(slot.filled)) return true;
+        if (Array.isArray(slot.modifiers) && slot.modifiers.length > 0) return true;
+        if (Array.isArray(slot.modifierIds) && slot.modifierIds.length > 0) return true;
+        if (Array.isArray(slot.inscriptions) && slot.inscriptions.length > 0) return true;
+        for (const field of ["id", "name", "type", "key", "modifier", "value", "model", "rarity"]) {
+            if (slot[field] !== null && slot[field] !== undefined && String(slot[field]).trim() !== "") return true;
+        }
+        return Object.keys(slot).length > 0;
+    }
+    return true;
+}
+
+function countFilledRelicSlotsFromCompanion(companion) {
+    if (!companion || typeof companion !== "object") return 0;
+    const sources = [
+        companion.relics,
+        companion.relicSlots,
+        companion.relic_slots,
+        companion.companionRelics,
+        companion.companion_relics
+    ];
+    for (const source of sources) {
+        if (Array.isArray(source)) return source.filter(isFilledRelicSlot).length;
+    }
+    return 0;
+}
+
+function countFilledAncientRelicSlotsFromCompanion(companion) {
+    if (!companion || typeof companion !== "object") return 0;
+    const sources = [
+        companion.ancientRelics,
+        companion.ancient_relics,
+        companion.ancientRelicSlots,
+        companion.ancient_relic_slots,
+        companion.ancientRelic,
+        companion.ancient_relic,
+        companion.ancient
+    ];
+    let count = 0;
+    for (const source of sources) {
+        if (Array.isArray(source)) count = Math.max(count, source.filter(isFilledRelicSlot).length);
+        else if (isFilledRelicSlot(source)) count = Math.max(count, 1);
+    }
+    return count;
+}
+
+function findCompanionForViewerAndName(viewer, companionName) {
+    if (!Array.isArray(companionsData.companions)) return null;
+
+    const wallet = getWalletResolved(viewer, false) || wallets[normalizeViewer(viewer)] || null;
+    const linked = wallet ? parseCompanionLink(wallet.companionName || "") : null;
+
+    if (linked && linked.companionName) {
+        const exact = companionsData.companions.find(c => companionMatchesLinked(c, linked));
+        if (exact) return exact;
+    }
+
+    const wantedName = String(companionName || linked?.companionName || "").trim().toLowerCase();
+    if (!wantedName) return null;
+
+    const parsed = parseScopedViewerKey(wallet?.viewer || viewer);
+    const serverId = normalizeServerId(parsed.serverId || linked?.serverId || firstEnabledServerId());
+    const ownerWanted = String(linked?.ownerName || "").trim().toLowerCase();
+    const ownerUuidWanted = String(linked?.ownerUuid || "").trim().toLowerCase();
+
+    const matches = companionsData.companions.filter(c => {
+        const cServer = normalizeServerId(c.serverId || serverId);
+        const cName = String(c.name || "").trim().toLowerCase();
+        if (cServer !== serverId || cName !== wantedName) return false;
+        const cOwner = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
+        const cOwnerUuid = String(c.ownerUuid || "").trim().toLowerCase();
+        if (ownerUuidWanted && cOwnerUuid === ownerUuidWanted) return true;
+        if (ownerWanted && cOwner === ownerWanted) return true;
+        return !ownerWanted && !ownerUuidWanted;
+    });
+
+    return matches.length === 1 ? matches[0] : null;
+}
+
+function relicSlotStatusForRequest(req, viewer, companionName) {
+    const companion = findCompanionForViewerAndName(viewer, companionName);
+    const exportedRelicsFilled = countFilledRelicSlotsFromCompanion(companion);
+    const exportedAncientRelicsFilled = countFilledAncientRelicSlotsFromCompanion(companion);
+
+    const bodyRelicsFilled = Number(req.body.relicsFilled ?? req.body.relicSlotsFilled ?? req.body.normalRelicsFilled ?? 0);
+    const bodyAncientFilled = Number(req.body.ancientRelicsFilled ?? req.body.ancientRelicSlotsFilled ?? 0);
+
+    const relicsFilled = Math.max(
+        Number.isFinite(bodyRelicsFilled) ? bodyRelicsFilled : 0,
+        exportedRelicsFilled
+    );
+
+    const ancientRelicsFilled = Math.max(
+        Number.isFinite(bodyAncientFilled) ? bodyAncientFilled : 0,
+        exportedAncientRelicsFilled,
+        truthyBodyValue(req.body.hasAncientRelic) || truthyBodyValue(req.body.ancientRelicOwned) ? 1 : 0
+    );
+
+    return {
+        companionFound: !!companion,
+        relicsFilled,
+        ancientRelicsFilled,
+        hasAncientRelic: ancientRelicsFilled >= 1
+    };
+}
+
 const FORGERY_MODIFIERS = new Set([
     "companion_challenge",
     "extended",
@@ -2690,9 +2810,9 @@ app.post("/forgery/create", (req, res) => {
     if (level < 10) return res.status(400).json({ ok: false, error: "Forgery unlocks at companion level 10." });
 
     const relicType = String(req.body.relicType || req.body.type || "normal").toLowerCase() === "ancient" ? "ancient" : "normal";
-    const hasAncientRelic = !!(req.body.hasAncientRelic || req.body.ancientRelicOwned || Number(req.body.ancientRelicsFilled || 0) >= 1);
+    const slotStatus = relicSlotStatusForRequest(req, valid.viewer, valid.companionName);
 
-    if (relicType === "ancient" && !hasAncientRelic) {
+    if (relicType === "ancient" && !slotStatus.hasAncientRelic) {
         return res.status(400).json({ ok: false, error: "You need an Ancient Relic equipped before you can craft an Ancient Custom Relic." });
     }
 
@@ -2804,17 +2924,17 @@ app.post("/forgery/forge", (req, res) => {
     if (!relic) return res.status(400).json({ ok: false, error: "Create a custom relic first." });
 
     const relicType = relic.type === "ancient" ? "ancient" : "normal";
-    const hasAncientRelic = !!(req.body.hasAncientRelic || req.body.ancientRelicOwned || Number(req.body.ancientRelicsFilled || 0) >= 1);
+    const slotStatus = relicSlotStatusForRequest(req, valid.viewer, valid.companionName);
 
     let replaceSlot = Number(req.body.replaceSlot);
 
     if (relicType === "ancient") {
         replaceSlot = 0;
-        if (!hasAncientRelic) return res.status(400).json({ ok: false, error: "You need an Ancient Relic equipped before forging an Ancient Custom Relic." });
+        if (!slotStatus.hasAncientRelic) return res.status(400).json({ ok: false, error: "You need an Ancient Relic equipped before forging an Ancient Custom Relic.", slotStatus });
     } else {
-        const relicsFilled = Number(req.body.relicsFilled || 0);
+        const relicsFilled = Number(slotStatus.relicsFilled || 0);
         if (!Number.isInteger(replaceSlot) || replaceSlot < 0 || replaceSlot > 3) return res.status(400).json({ ok: false, error: "Invalid relic slot to replace." });
-        if (relicsFilled < 4) return res.status(400).json({ ok: false, error: "All 4 relic slots must be filled before forging." });
+        if (relicsFilled < 4) return res.status(400).json({ ok: false, error: "All 4 relic slots must be filled before forging.", slotStatus });
     }
 
     if (!Array.isArray(relic.modifiers) || relic.modifiers.length !== Number(relic.slots || 0) || relic.modifiers.some(mod => !mod)) {
