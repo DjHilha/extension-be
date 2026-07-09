@@ -1569,7 +1569,20 @@ function isFilledAncientRelicSlot(slot) {
 
 function countFilledRelicSlotsFromSource(source, ancientOnly = false) {
     if (Array.isArray(source)) {
-        return source.filter(slot => ancientOnly ? isFilledAncientRelicSlot(slot) : (isFilledRelicSlot(slot) && !isFilledAncientRelicSlot(slot))).length;
+        /*
+         * Vault Hunters exports can store the Ancient Relic as the 5th relic slot
+         * instead of putting it in a dedicated ancientRelic/ancientRelics field.
+         * Slots 0-3 = normal relic slots, slot 4+ = ancient relic slot(s).
+         * If the slot itself explicitly says ancient, that still counts too.
+         */
+        return source.filter((slot, index) => {
+            const filled = isFilledRelicSlot(slot);
+            if (!filled) return false;
+            const explicitAncient = isFilledAncientRelicSlot(slot);
+            const indexAncient = index >= 4;
+            if (ancientOnly) return explicitAncient || indexAncient;
+            return index < 4 && !explicitAncient;
+        }).length;
     }
     return ancientOnly ? (isFilledAncientRelicSlot(source) ? 1 : 0) : (isFilledRelicSlot(source) && !isFilledAncientRelicSlot(source) ? 1 : 0);
 }
@@ -1633,6 +1646,14 @@ function countFilledRelicSlotsFromBody(req, ancientOnly = false) {
     let count = 0;
     for (const field of numberFields) {
         if (body[field] !== undefined) count = Math.max(count, numericBodyValue(body[field], 0));
+    }
+
+    // Some viewer builds only send total relic count. In your layout the 5th filled
+    // relic slot is the Ancient Relic slot, so total relicsFilled >= 5 means ancient owned.
+    if (ancientOnly) {
+        for (const field of ["relicsFilled", "relicSlotsFilled", "totalRelicsFilled", "filledRelics"]) {
+            if (body[field] !== undefined && numericBodyValue(body[field], 0) >= 5) count = Math.max(count, 1);
+        }
     }
 
     const arrayFields = ancientOnly
