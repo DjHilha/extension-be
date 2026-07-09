@@ -1104,13 +1104,18 @@ function updateWalletIdentity(viewer, twitchId, displayName) {
     }
 
     /*
-     * Twitch mobile often sends the numeric Twitch ID as displayName.
-     * Do NOT let that overwrite a real readable Twitch name set by walletalias
-     * or by the extension manual Twitch-name box.
+     * Twitch mobile/identity heartbeats can send a stale or wrong displayName.
+     * IMPORTANT: never overwrite an existing readable displayName automatically,
+     * because /mm walletalias stores the corrected name in displayName.
+     * Only fill displayName when the current value is missing, numeric, scoped,
+     * or otherwise not readable. Manual/admin aliases stay permanent.
      */
-    if (cleanDisplayName && !looksLikeNumericId(cleanDisplayName) && !looksLikeInternalScopedId(cleanDisplayName)) {
-        wallet.displayName = cleanDisplayName;
-    } else {
+    const currentDisplayName = safeDisplayName(wallet.displayName, "");
+    const incomingDisplayName = safeDisplayName(cleanDisplayName, "");
+
+    if (!currentDisplayName && incomingDisplayName) {
+        wallet.displayName = incomingDisplayName;
+    } else if (!currentDisplayName) {
         repairWalletDisplayName(wallet, "");
     }
 
@@ -3947,6 +3952,8 @@ app.post("/wallet/alias", requireApiKey, (req, res) => {
     }
 
     wallet.displayName = displayName;
+    // This alias is now the authoritative readable name. Identity/heartbeat
+    // updates must not overwrite it automatically.
     wallet.updatedAt = new Date().toISOString();
 
     saveWallets();
