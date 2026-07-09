@@ -610,6 +610,7 @@ function supabaseRowToWallet(row) {
         twitchId: String(row.twitch_id || ""),
         displayName: safeDisplayName(row.display_name, row.twitch_id || rawViewer || ""),
         companionName: String(row.companion_name || ""),
+        manualAlias: false,
         updatedAt: String(row.updated_at || new Date().toISOString())
     };
 }
@@ -1011,6 +1012,7 @@ function getWallet(viewer) {
             twitchId: "",
             displayName: key,
             companionName: "",
+            manualAlias: false,
             updatedAt: new Date().toISOString()
         };
         saveWallets();
@@ -1020,6 +1022,7 @@ function getWallet(viewer) {
         wallets[key].twitchId = String(wallets[key].twitchId || "");
         wallets[key].displayName = String(wallets[key].displayName || key);
         wallets[key].companionName = String(wallets[key].companionName || "");
+        wallets[key].manualAlias = !!wallets[key].manualAlias;
         wallets[key].updatedAt = wallets[key].updatedAt || new Date().toISOString();
     }
 
@@ -1065,6 +1068,12 @@ function findReadableDisplayNameForIdentity(identifier) {
 
 function repairWalletDisplayName(wallet, preferredName = "") {
     if (!wallet) return false;
+
+    // Manual aliases are authoritative. Admin commands like /mm dirt must not
+    // rename a wallet just because the command used another readable name.
+    if (wallet.manualAlias && safeDisplayName(wallet.displayName, "")) {
+        return false;
+    }
 
     const preferred = safeDisplayName(preferredName, "");
     if (preferred) {
@@ -1113,7 +1122,9 @@ function updateWalletIdentity(viewer, twitchId, displayName) {
     const currentDisplayName = safeDisplayName(wallet.displayName, "");
     const incomingDisplayName = safeDisplayName(cleanDisplayName, "");
 
-    if (!currentDisplayName && incomingDisplayName) {
+    if (wallet.manualAlias && currentDisplayName) {
+        // Keep the alias set by /mm walletalias.
+    } else if (!currentDisplayName && incomingDisplayName) {
         wallet.displayName = incomingDisplayName;
     } else if (!currentDisplayName) {
         repairWalletDisplayName(wallet, "");
@@ -2053,11 +2064,10 @@ app.post("/wallet/add", requireApiKey, (req, res) => {
     const added = Math.floor(amount);
 
     wallet.dirt += added;
-    // Admin commands may target a wallet by readable Twitch name while the
-    // wallet row itself is keyed by numeric Twitch id. Keep the readable name
-    // on the row and never let internal scoped ids such as
-    // meowtys_s3::channel::viewer come back as display_name.
-    repairWalletDisplayName(wallet, requestedViewer);
+    // IMPORTANT: giving Dirt must never rename the wallet.
+    // /mm dirt grim_stoner should add Dirt only; it must not overwrite a
+    // corrected /mm walletalias such as MommyNikki284.
+    repairWalletDisplayName(wallet, "");
     wallet.updatedAt = new Date().toISOString();
 
     saveWallets();
@@ -3953,7 +3963,8 @@ app.post("/wallet/alias", requireApiKey, (req, res) => {
 
     wallet.displayName = displayName;
     // This alias is now the authoritative readable name. Identity/heartbeat
-    // updates must not overwrite it automatically.
+    // updates and /mm dirt must not overwrite it automatically.
+    wallet.manualAlias = true;
     wallet.updatedAt = new Date().toISOString();
 
     saveWallets();
