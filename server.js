@@ -1567,7 +1567,40 @@ function isFilledAncientRelicSlot(slot) {
     return isFilledRelicSlot(slot) && valueLooksAncientRelic(slot);
 }
 
+function slotIndexFromKey(key) {
+    const raw = String(key || "").trim().toLowerCase();
+    if (/^\d+$/.test(raw)) return Number(raw);
+    const match = raw.match(/(?:slot|relic|relicslot|ancientrelicslot)[_\- ]*(\d+)$/i);
+    return match ? Number(match[1]) : null;
+}
+
+function slotArrayFromObject(source) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+
+    // Common exporter wrappers.
+    for (const field of ["slots", "relics", "relicSlots", "relic_slots", "companionRelics", "companion_relics", "items", "values"]) {
+        if (Array.isArray(source[field])) return source[field];
+    }
+
+    const entries = [];
+    for (const [key, value] of Object.entries(source)) {
+        const index = slotIndexFromKey(key);
+        if (index !== null && Number.isFinite(index)) entries.push([index, value]);
+    }
+    if (entries.length === 0) return null;
+    entries.sort((a, b) => a[0] - b[0]);
+
+    // Build a sparse-ish ordered array so index 4 stays the Ancient Relic slot
+    // even if the exporter sends an object like {"0":..., "1":..., "4":...}.
+    const arr = [];
+    for (const [index, value] of entries) arr[index] = value;
+    return arr;
+}
+
 function countFilledRelicSlotsFromSource(source, ancientOnly = false) {
+    const objectSlots = slotArrayFromObject(source);
+    if (objectSlots) return countFilledRelicSlotsFromSource(objectSlots, ancientOnly);
+
     if (Array.isArray(source)) {
         /*
          * Vault Hunters exports can store the Ancient Relic as the 5th relic slot
@@ -1673,43 +1706,62 @@ function countFilledRelicSlotsFromBody(req, ancientOnly = false) {
     return count;
 }
 
-function findCompanionForViewerAndName(viewer, companionName) {
-    if (!Array.isArray(companionsData.companions)) return null;
+function companionCandidatesForViewerAndName(req, viewer, companionName) {
+    if (!Array.isArray(companionsData.companions)) return [];
 
     const wallet = getWalletResolved(viewer, false) || wallets[normalizeViewer(viewer)] || null;
     const linked = wallet ? parseCompanionLink(wallet.companionName || "") : null;
+    const requestedName = String(companionName || linked?.companionName || "").trim().toLowerCase();
+    if (!requestedName) return [];
 
-    if (linked && linked.companionName) {
-        const exact = companionsData.companions.find(c => companionMatchesLinked(c, linked));
-        if (exact) return exact;
-    }
+    const scoped = parseScopedViewerKey(wallet?.viewer || viewer);
+    const requestChannelId = req?.body?.channelId || req?.query?.channelId || req?.headers?.["x-channel-id"] || scoped.channelId || "";
+    const requestServerId = normalizeServerId(req?.body?.serverId || req?.query?.serverId || scoped.serverId || linked?.serverId || resolveServerIdFromChannel(requestChannelId));
+    const bodyOwner = String(req?.body?.ownerName || req?.body?.minecraftName || "").trim().toLowerCase();
+    const linkedOwner = String(linked?.ownerName || "").trim().toLowerCase();
+    const linkedOwnerUuid = String(linked?.ownerUuid || "").trim().toLowerCase();
 
-    const wantedName = String(companionName || linked?.companionName || "").trim().toLowerCase();
-    if (!wantedName) return null;
+    const ownerCandidates = new Set(ownerCandidatesForRequest(req || { body: {}, query: {}, headers: {} }, requestServerId, requestChannelId));
+    if (bodyOwner) ownerCandidates.add(bodyOwner);
+    if (linkedOwner) ownerCandidates.add(linkedOwner);
 
-    const parsed = parseScopedViewerKey(wallet?.viewer || viewer);
-    const serverId = normalizeServerId(parsed.serverId || linked?.serverId || firstEnabledServerId());
-    const ownerWanted = String(linked?.ownerName || "").trim().toLowerCase();
-    const ownerUuidWanted = String(linked?.ownerUuid || "").trim().toLowerCase();
+    const exact = [];
+    const loose = [];
 
-    const matches = companionsData.companions.filter(c => {
-        const cServer = normalizeServerId(c.serverId || serverId);
+    for (const c of companionsData.companions) {
+        const cServer = normalizeServerId(c.serverId || requestServerId);
         const cName = String(c.name || "").trim().toLowerCase();
-        if (cServer !== serverId || cName !== wantedName) return false;
+        if (cServer !== requestServerId || cName !== requestedName) continue;
+
         const cOwner = String(c.owner || c.ownerName || c.minecraftName || "").trim().toLowerCase();
         const cOwnerUuid = String(c.ownerUuid || "").trim().toLowerCase();
-        if (ownerUuidWanted && cOwnerUuid === ownerUuidWanted) return true;
-        if (ownerWanted && cOwner === ownerWanted) return true;
-        return !ownerWanted && !ownerUuidWanted;
-    });
+        const ownerMatches = (linkedOwnerUuid && cOwnerUuid === linkedOwnerUuid) || (ownerCandidates.size > 0 && ownerCandidates.has(cOwner));
 
-    return matches.length === 1 ? matches[0] : null;
+        if (ownerMatches) exact.push(c);
+        loose.push(c);
+    }
+
+    // Prefer channel/owner matched companions. If that fails, fall back to same
+    // server + same companion name so a stale/missing wallet link does not make
+    // Ancient Relic detection randomly fail.
+    return exact.length > 0 ? exact : loose;
+}
+
+function findCompanionForViewerAndName(viewer, companionName) {
+    const candidates = companionCandidatesForViewerAndName({ body: {}, query: {}, headers: {} }, viewer, companionName);
+    return candidates.length === 1 ? candidates[0] : (candidates[0] || null);
 }
 
 function relicSlotStatusForRequest(req, viewer, companionName) {
-    const companion = findCompanionForViewerAndName(viewer, companionName);
-    const exportedRelicsFilled = countFilledRelicSlotsFromCompanion(companion);
-    const exportedAncientRelicsFilled = countFilledAncientRelicSlotsFromCompanion(companion);
+    const candidates = companionCandidatesForViewerAndName(req, viewer, companionName);
+    let exportedRelicsFilled = 0;
+    let exportedAncientRelicsFilled = 0;
+
+    for (const companion of candidates) {
+        exportedRelicsFilled = Math.max(exportedRelicsFilled, countFilledRelicSlotsFromCompanion(companion));
+        exportedAncientRelicsFilled = Math.max(exportedAncientRelicsFilled, countFilledAncientRelicSlotsFromCompanion(companion));
+    }
+
     const bodyRelicsFilled = countFilledRelicSlotsFromBody(req, false);
     const bodyAncientFilled = countFilledRelicSlotsFromBody(req, true);
 
@@ -1717,7 +1769,8 @@ function relicSlotStatusForRequest(req, viewer, companionName) {
     const ancientRelicsFilled = Math.max(bodyAncientFilled, exportedAncientRelicsFilled);
 
     return {
-        companionFound: !!companion,
+        companionFound: candidates.length > 0,
+        companionMatchesChecked: candidates.length,
         relicsFilled,
         ancientRelicsFilled,
         hasAncientRelic: ancientRelicsFilled >= 1,
