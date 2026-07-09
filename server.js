@@ -1505,25 +1505,73 @@ function truthyBodyValue(value) {
     if (value === true) return true;
     if (value === false || value === null || value === undefined) return false;
     const raw = String(value).trim().toLowerCase();
-    return raw === "true" || raw === "1" || raw === "yes" || raw === "y" || raw === "owned" || raw === "equipped";
+    return raw === "true" || raw === "1" || raw === "yes" || raw === "y" || raw === "owned" || raw === "equipped" || raw === "filled";
+}
+
+function numericBodyValue(value, fallback = 0) {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : fallback;
+}
+
+function isEmptyRelicSlotValue(value) {
+    if (value === null || value === undefined || value === false) return true;
+    if (typeof value === "string") {
+        const raw = value.trim().toLowerCase();
+        return raw === "" || raw === "empty" || raw === "none" || raw === "null" || raw === "undefined";
+    }
+    return false;
 }
 
 function isFilledRelicSlot(slot) {
-    if (slot === null || slot === undefined || slot === false) return false;
-    if (typeof slot === "string") return slot.trim() !== "" && slot.trim().toLowerCase() !== "empty" && slot.trim().toLowerCase() !== "none";
+    if (isEmptyRelicSlotValue(slot)) return false;
+    if (typeof slot === "string") return true;
     if (Array.isArray(slot)) return slot.some(isFilledRelicSlot);
     if (typeof slot === "object") {
-        if (truthyBodyValue(slot.empty) || truthyBodyValue(slot.isEmpty)) return false;
-        if (truthyBodyValue(slot.owned) || truthyBodyValue(slot.equipped) || truthyBodyValue(slot.filled)) return true;
+        if (truthyBodyValue(slot.empty) || truthyBodyValue(slot.isEmpty) || truthyBodyValue(slot.unlockedEmpty)) return false;
+        if (truthyBodyValue(slot.owned) || truthyBodyValue(slot.equipped) || truthyBodyValue(slot.filled) || truthyBodyValue(slot.hasRelic)) return true;
         if (Array.isArray(slot.modifiers) && slot.modifiers.length > 0) return true;
         if (Array.isArray(slot.modifierIds) && slot.modifierIds.length > 0) return true;
         if (Array.isArray(slot.inscriptions) && slot.inscriptions.length > 0) return true;
-        for (const field of ["id", "name", "type", "key", "modifier", "value", "model", "rarity"]) {
-            if (slot[field] !== null && slot[field] !== undefined && String(slot[field]).trim() !== "") return true;
+        for (const field of ["id", "name", "type", "key", "modifier", "value", "model", "rarity", "relicType", "slotType"]) {
+            if (!isEmptyRelicSlotValue(slot[field])) return true;
         }
         return Object.keys(slot).length > 0;
     }
     return true;
+}
+
+function valueLooksAncientRelic(value) {
+    if (value === null || value === undefined) return false;
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value > 0;
+    if (typeof value === "string") {
+        const raw = value.trim().toLowerCase();
+        if (!raw || raw === "false" || raw === "0" || raw === "empty" || raw === "none") return false;
+        return raw.includes("ancient");
+    }
+    if (Array.isArray(value)) return value.some(valueLooksAncientRelic);
+    if (typeof value === "object") {
+        if (truthyBodyValue(value.isAncient) || truthyBodyValue(value.ancient) || truthyBodyValue(value.hasAncientRelic) || truthyBodyValue(value.ancientRelicOwned)) return true;
+        for (const field of ["type", "relicType", "slotType", "kind", "id", "name", "key", "rarity", "item", "itemId"]) {
+            if (valueLooksAncientRelic(value[field])) return true;
+        }
+        // Some exporters put all NBT/raw data under value/tag/nbt. Search one level deeper.
+        for (const field of ["value", "tag", "nbt", "data", "relic"]) {
+            if (valueLooksAncientRelic(value[field])) return true;
+        }
+    }
+    return false;
+}
+
+function isFilledAncientRelicSlot(slot) {
+    return isFilledRelicSlot(slot) && valueLooksAncientRelic(slot);
+}
+
+function countFilledRelicSlotsFromSource(source, ancientOnly = false) {
+    if (Array.isArray(source)) {
+        return source.filter(slot => ancientOnly ? isFilledAncientRelicSlot(slot) : (isFilledRelicSlot(slot) && !isFilledAncientRelicSlot(slot))).length;
+    }
+    return ancientOnly ? (isFilledAncientRelicSlot(source) ? 1 : 0) : (isFilledRelicSlot(source) && !isFilledAncientRelicSlot(source) ? 1 : 0);
 }
 
 function countFilledRelicSlotsFromCompanion(companion) {
@@ -1535,28 +1583,72 @@ function countFilledRelicSlotsFromCompanion(companion) {
         companion.companionRelics,
         companion.companion_relics
     ];
+    let count = 0;
     for (const source of sources) {
-        if (Array.isArray(source)) return source.filter(isFilledRelicSlot).length;
+        if (source !== undefined) count = Math.max(count, countFilledRelicSlotsFromSource(source, false));
     }
-    return 0;
+    return count;
 }
 
 function countFilledAncientRelicSlotsFromCompanion(companion) {
     if (!companion || typeof companion !== "object") return 0;
-    const sources = [
+    const ancientSources = [
         companion.ancientRelics,
         companion.ancient_relics,
         companion.ancientRelicSlots,
         companion.ancient_relic_slots,
         companion.ancientRelic,
         companion.ancient_relic,
-        companion.ancient
+        companion.ancient,
+        companion.ancientSlot,
+        companion.ancient_slot
+    ];
+    const mixedSources = [
+        companion.relics,
+        companion.relicSlots,
+        companion.relic_slots,
+        companion.companionRelics,
+        companion.companion_relics
     ];
     let count = 0;
-    for (const source of sources) {
-        if (Array.isArray(source)) count = Math.max(count, source.filter(isFilledRelicSlot).length);
-        else if (isFilledRelicSlot(source)) count = Math.max(count, 1);
+    for (const source of ancientSources) {
+        if (source !== undefined) {
+            // Dedicated ancient fields usually mean the source itself is the ancient slot,
+            // even if the value does not literally contain the word "ancient".
+            if (Array.isArray(source)) count = Math.max(count, source.filter(isFilledRelicSlot).length);
+            else if (isFilledRelicSlot(source)) count = Math.max(count, 1);
+        }
     }
+    for (const source of mixedSources) {
+        if (source !== undefined) count = Math.max(count, countFilledRelicSlotsFromSource(source, true));
+    }
+    return count;
+}
+
+function countFilledRelicSlotsFromBody(req, ancientOnly = false) {
+    const body = req?.body || {};
+    const numberFields = ancientOnly
+        ? ["ancientRelicsFilled", "ancientRelicSlotsFilled", "ancientRelicFilled", "ancientSlotsFilled"]
+        : ["relicsFilled", "relicSlotsFilled", "normalRelicsFilled", "normalRelicSlotsFilled"];
+    let count = 0;
+    for (const field of numberFields) {
+        if (body[field] !== undefined) count = Math.max(count, numericBodyValue(body[field], 0));
+    }
+
+    const arrayFields = ancientOnly
+        ? ["ancientRelics", "ancientRelicSlots", "ancient_relics", "ancient_relic_slots"]
+        : ["relics", "relicSlots", "relic_slots", "companionRelics", "companion_relics"];
+    for (const field of arrayFields) {
+        if (body[field] !== undefined) count = Math.max(count, countFilledRelicSlotsFromSource(body[field], ancientOnly));
+    }
+
+    if (ancientOnly) {
+        for (const field of ["ancientRelic", "ancient_relic", "ancient", "ancientSlot", "ancientRelicSlot"]) {
+            if (body[field] !== undefined && isFilledRelicSlot(body[field])) count = Math.max(count, 1);
+        }
+        if (truthyBodyValue(body.hasAncientRelic) || truthyBodyValue(body.ancientRelicOwned) || truthyBodyValue(body.hasAncientRelicSlot)) count = Math.max(count, 1);
+    }
+
     return count;
 }
 
@@ -1597,26 +1689,23 @@ function relicSlotStatusForRequest(req, viewer, companionName) {
     const companion = findCompanionForViewerAndName(viewer, companionName);
     const exportedRelicsFilled = countFilledRelicSlotsFromCompanion(companion);
     const exportedAncientRelicsFilled = countFilledAncientRelicSlotsFromCompanion(companion);
+    const bodyRelicsFilled = countFilledRelicSlotsFromBody(req, false);
+    const bodyAncientFilled = countFilledRelicSlotsFromBody(req, true);
 
-    const bodyRelicsFilled = Number(req.body.relicsFilled ?? req.body.relicSlotsFilled ?? req.body.normalRelicsFilled ?? 0);
-    const bodyAncientFilled = Number(req.body.ancientRelicsFilled ?? req.body.ancientRelicSlotsFilled ?? 0);
-
-    const relicsFilled = Math.max(
-        Number.isFinite(bodyRelicsFilled) ? bodyRelicsFilled : 0,
-        exportedRelicsFilled
-    );
-
-    const ancientRelicsFilled = Math.max(
-        Number.isFinite(bodyAncientFilled) ? bodyAncientFilled : 0,
-        exportedAncientRelicsFilled,
-        truthyBodyValue(req.body.hasAncientRelic) || truthyBodyValue(req.body.ancientRelicOwned) ? 1 : 0
-    );
+    const relicsFilled = Math.max(bodyRelicsFilled, exportedRelicsFilled);
+    const ancientRelicsFilled = Math.max(bodyAncientFilled, exportedAncientRelicsFilled);
 
     return {
         companionFound: !!companion,
         relicsFilled,
         ancientRelicsFilled,
-        hasAncientRelic: ancientRelicsFilled >= 1
+        hasAncientRelic: ancientRelicsFilled >= 1,
+        debug: {
+            bodyRelicsFilled,
+            bodyAncientFilled,
+            exportedRelicsFilled,
+            exportedAncientRelicsFilled
+        }
     };
 }
 
@@ -2813,7 +2902,11 @@ app.post("/forgery/create", (req, res) => {
     const slotStatus = relicSlotStatusForRequest(req, valid.viewer, valid.companionName);
 
     if (relicType === "ancient" && !slotStatus.hasAncientRelic) {
-        return res.status(400).json({ ok: false, error: "You need an Ancient Relic equipped before you can craft an Ancient Custom Relic." });
+        return res.status(400).json({
+            ok: false,
+            error: "You need an Ancient Relic equipped before you can craft an Ancient Custom Relic.",
+            slotStatus
+        });
     }
 
     const state = getForgeryState(valid.viewer, valid.companionName);
