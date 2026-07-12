@@ -59,7 +59,8 @@ const PRICES = {
 };
 
 let companionsData = { companions: [] };
-let tasksData = { active: false, tasks: [] };
+let tasksData = { active: false, tasks: [] }; // legacy fallback
+let tasksDataByChannel = {};
 let shopActionQueue = [];
 let wallets = {};
 let watchers = {};
@@ -2273,28 +2274,51 @@ app.post("/companions", requireApiKey, (req, res) => {
 
     res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace" });
 });
-app.get("/tasks", (req, res) => res.json(tasksData));
+function taskChannelScope(serverInput, channelInput) {
+    const serverId = normalizeServerId(serverInput || resolveServerIdFromChannel(channelInput));
+    const channelId = resolveChannelIdInput(channelInput, serverId);
+    return { serverId, channelId, key: `${serverId}::${channelId || "unknown"}` };
+}
+
+function emptyTasksForScope(scope) {
+    return { active: false, allComplete: false, tasks: [], serverId: scope.serverId, channelId: scope.channelId };
+}
+
+app.get("/tasks", (req, res) => {
+    const scope = taskChannelScope(
+        req.query.serverId || "",
+        req.query.channelId || req.headers["x-channel-id"] || ""
+    );
+    res.json(tasksDataByChannel[scope.key] || emptyTasksForScope(scope));
+});
+
 app.post("/tasks", requireApiKey, (req, res) => {
-    if (!req.body || typeof req.body.active !== "boolean" || !Array.isArray(req.body.tasks)) return res.status(400).json({ ok: false, error: "Expected body with active boolean and tasks array" });
-
-    const previousSignature =
-        Array.isArray(tasksData.tasks)
-            ? tasksData.tasks.map(task => task.description || "").join("|")
-            : "";
-
-    const nextSignature =
-        req.body.tasks.map(task => task.description || "").join("|");
-
-    tasksData = req.body;
-
-    if (tasksData.active && !tasksData.startedAt) {
-        tasksData.startedAt =
-            previousSignature === nextSignature && tasksData.startedAt
-                ? tasksData.startedAt
-                : Date.now();
+    if (!req.body || typeof req.body.active !== "boolean" || !Array.isArray(req.body.tasks)) {
+        return res.status(400).json({ ok: false, error: "Expected body with active boolean and tasks array" });
     }
 
-    res.json({ ok: true, active: tasksData.active, count: tasksData.tasks.length });
+    const scope = taskChannelScope(req.body.serverId || "", req.body.channelId || req.body.channel || "");
+    if (!scope.channelId) {
+        return res.status(400).json({ ok: false, error: "Missing or invalid channelId for task upload" });
+    }
+
+    const previous = tasksDataByChannel[scope.key] || emptyTasksForScope(scope);
+    const previousSignature = Array.isArray(previous.tasks) ? previous.tasks.map(task => task.description || "").join("|") : "";
+    const nextSignature = req.body.tasks.map(task => task.description || "").join("|");
+    const incomingStartedAt = Number(req.body.startedAt || req.body.voteStartedAt || 0);
+    const startedAt = req.body.active
+        ? (incomingStartedAt > 0
+            ? incomingStartedAt
+            : previous.active && previousSignature === nextSignature && Number(previous.startedAt || 0) > 0
+                ? Number(previous.startedAt)
+                : Date.now())
+        : 0;
+
+    const scopedTasks = { ...req.body, serverId: scope.serverId, channelId: scope.channelId, startedAt };
+    tasksDataByChannel[scope.key] = scopedTasks;
+    tasksData = scopedTasks;
+
+    res.json({ ok: true, serverId: scope.serverId, channelId: scope.channelId, active: scopedTasks.active, count: scopedTasks.tasks.length });
 });
 app.get("/wallet/:viewer", (req, res) => {
     const scopedViewer = scopeViewerFromRequest(req, req.params.viewer);
@@ -3786,7 +3810,17 @@ app.post("/training/spar", (req, res) => {
     }
 
     const xpPercent = won ? 0.07 : 0.025;
-    const request = queueShopAction({ action: "training_xp", viewer: valid.viewer, companionName: valid.companionName, xpPercent, trainingType: "sparring", cost: PRICES.TRAINING_SPARRING });
+    const sparScope = parseScopedViewerKey(valid.viewer);
+    const request = queueShopAction({
+        action: "training_xp",
+        viewer: valid.viewer,
+        companionName: valid.companionName,
+        xpPercent,
+        trainingType: "sparring",
+        serverId: sparScope.serverId,
+        channelId: sparScope.channelId,
+        cost: PRICES.TRAINING_SPARRING
+    });
 
     const sparBonusType = randomItem(Object.keys(SPARRING_BONUS_RATING));
     const sparBonus = addSparringRatingBonus(state, sparBonusType);
@@ -3818,7 +3852,16 @@ app.post("/training/spar", (req, res) => {
         bonusAmount: sparBonus,
         flavor: flavorMessage
     });
-    queueShopAction({ action: "chat_message", message: chatMessage, source: "sparring", viewer: valid.viewer, companionName: valid.companionName, cost: 0 });
+    queueShopAction({
+        action: "chat_message",
+        message: chatMessage,
+        source: "sparring",
+        viewer: valid.viewer,
+        companionName: valid.companionName,
+        serverId: sparScope.serverId,
+        channelId: sparScope.channelId,
+        cost: 0
+    });
 
     const studyText = studyBonus && studyBonus.added > 0 ? ` ${studyBonus.focus.replace(/_/g, " ")} +${studyBonus.added}%.` : "";
     addTrainingHistory(state, `Sparring vs ${opponent}: ${won ? "won" : "lost"}. Rating ${challengerRating.roll} vs ${opponentRating.roll}. ${Math.round(xpPercent * 100)}% TNL XP queued. ${bonusLabel} sparring rating +${sparBonus}.${studyText}`);
