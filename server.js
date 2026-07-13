@@ -3441,23 +3441,23 @@ function recordSparResult(state, won) {
     }
 }
 
-function minecraftVisibleSpaces(value) {
-    // Use EM SPACE characters. They render as real blank spaces in Minecraft
-    // even when the active chat font gives the normal ASCII space zero width.
-    return String(value || "").replace(/\\s+/g, "\u2003");
+function minecraftBlankSpaceText(value) {
+    // The active Minecraft chat font gives the normal ASCII space no width.
+    // IDEOGRAPHIC SPACE is still visually blank, but has a real rendered width.
+    return String(value || "").replace(/\\s+/g, "\u3000");
 }
 
 function buildSparringChatMessage(challengerName, opponentName, winnerName, captainFight = false, opponentSelected = false) {
-    if (captainFight) return minecraftVisibleSpaces(randomItem(CAPTAIN_WIN_MESSAGES));
+    if (captainFight) return minecraftBlankSpaceText(randomItem(CAPTAIN_WIN_MESSAGES));
 
-    const gap = "\u2003";
-    const challenger = minecraftVisibleSpaces(displayFighterName(challengerName, "A viewer"));
-    const opponent = minecraftVisibleSpaces(
+    const gap = "\u3000";
+    const challenger = minecraftBlankSpaceText(displayFighterName(challengerName, "A viewer"));
+    const opponent = minecraftBlankSpaceText(
         opponentSelected
             ? displayFighterName(opponentName, "Training Dummy")
             : "a training dummy"
     );
-    const winner = minecraftVisibleSpaces(displayFighterName(winnerName, challenger));
+    const winner = minecraftBlankSpaceText(displayFighterName(winnerName, challenger));
 
     if (opponentSelected) {
         return `${challenger}${gap}sparred${gap}with${gap}${opponent}.${gap}${winner}${gap}won!`;
@@ -3485,12 +3485,12 @@ function buildSparringArenaChatBlock(details) {
     const opponentColor = isCaptainName(opponent) ? "§6" : "§c";
     const winnerColor = isCaptainName(winner) ? "§6" : "§e";
 
-    const gap = "\u2003";
-    const safeChallenger = minecraftVisibleSpaces(challenger);
-    const safeOpponent = minecraftVisibleSpaces(opponent);
-    const safeWinner = minecraftVisibleSpaces(winner);
-    const safeBonusLabel = minecraftVisibleSpaces(bonusLabel);
-    const safeFlavor = minecraftVisibleSpaces(flavor);
+    const gap = "\u3000";
+    const safeChallenger = minecraftBlankSpaceText(challenger);
+    const safeOpponent = minecraftBlankSpaceText(opponent);
+    const safeWinner = minecraftBlankSpaceText(winner);
+    const safeBonusLabel = minecraftBlankSpaceText(bonusLabel);
+    const safeFlavor = minecraftBlankSpaceText(flavor);
 
     const lines = [
         "§6==============================",
