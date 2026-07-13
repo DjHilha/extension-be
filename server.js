@@ -3441,14 +3441,23 @@ function recordSparResult(state, won) {
     }
 }
 
+function minecraftVisibleSpaces(value) {
+    // Use EM SPACE characters. They render as real blank spaces in Minecraft
+    // even when the active chat font gives the normal ASCII space zero width.
+    return String(value || "").replace(/\\s+/g, "\u2003");
+}
+
 function buildSparringChatMessage(challengerName, opponentName, winnerName, captainFight = false, opponentSelected = false) {
-    if (captainFight) return randomItem(CAPTAIN_WIN_MESSAGES);
-    const challenger = displayFighterName(challengerName, "A viewer");
-    const opponent = opponentSelected ? displayFighterName(opponentName, "Training Dummy") : "a training dummy";
-    const winner = displayFighterName(winnerName, challenger);
-    // Use non-breaking spaces in the one-line arena result. Minecraft chat
-    // was visually collapsing the normal spaces in this line.
-    const gap = "\u00A0";
+    if (captainFight) return minecraftVisibleSpaces(randomItem(CAPTAIN_WIN_MESSAGES));
+
+    const gap = "\u2003";
+    const challenger = minecraftVisibleSpaces(displayFighterName(challengerName, "A viewer"));
+    const opponent = minecraftVisibleSpaces(
+        opponentSelected
+            ? displayFighterName(opponentName, "Training Dummy")
+            : "a training dummy"
+    );
+    const winner = minecraftVisibleSpaces(displayFighterName(winnerName, challenger));
 
     if (opponentSelected) {
         return `${challenger}${gap}sparred${gap}with${gap}${opponent}.${gap}${winner}${gap}won!`;
@@ -3476,23 +3485,30 @@ function buildSparringArenaChatBlock(details) {
     const opponentColor = isCaptainName(opponent) ? "§6" : "§c";
     const winnerColor = isCaptainName(winner) ? "§6" : "§e";
 
+    const gap = "\u2003";
+    const safeChallenger = minecraftVisibleSpaces(challenger);
+    const safeOpponent = minecraftVisibleSpaces(opponent);
+    const safeWinner = minecraftVisibleSpaces(winner);
+    const safeBonusLabel = minecraftVisibleSpaces(bonusLabel);
+    const safeFlavor = minecraftVisibleSpaces(flavor);
+
     const lines = [
         "§6==============================",
-        "§e        MEOWTY TRAINING ARENA",
+        `§eMEOWTY${gap}TRAINING${gap}ARENA`,
         "§6==============================",
-        `${challengerColor}${challenger} §a(${challengerRating}) §7x VS x ${opponentColor}${opponent} §c(${opponentRating})`,
+        `${challengerColor}${safeChallenger}${gap}§a(${challengerRating})${gap}§7x${gap}VS${gap}x${gap}${opponentColor}${safeOpponent}${gap}§c(${opponentRating})`,
         "§8------------------------------",
-        `§6Winner: ${winnerColor}${winner}`,
-        `§bXP Reward: §a+${xpPercent}% §fTNL XP`,
-        `§dWin Streak: §f${streak}`
+        `§6Winner:${gap}${winnerColor}${safeWinner}`,
+        `§bXP${gap}Reward:${gap}§a+${xpPercent}%${gap}§fTNL${gap}XP`,
+        `§dWin${gap}Streak:${gap}§f${streak}`
     ];
 
-    if (bonusLabel && bonusAmount > 0) {
-        lines.push(`§9Training Bonus: §b${bonusLabel} §a(+${bonusAmount})`);
+    if (safeBonusLabel && bonusAmount > 0) {
+        lines.push(`§9Training${gap}Bonus:${gap}§b${safeBonusLabel}${gap}§a(+${bonusAmount})`);
     }
 
-    if (flavor) {
-        lines.push("§8------------------------------", `§6${flavor}`);
+    if (safeFlavor) {
+        lines.push("§8------------------------------", `§6${safeFlavor}`);
     }
 
     lines.push("§6==============================");
