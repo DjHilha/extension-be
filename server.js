@@ -3446,10 +3446,15 @@ function buildSparringChatMessage(challengerName, opponentName, winnerName, capt
     const challenger = displayFighterName(challengerName, "A viewer");
     const opponent = opponentSelected ? displayFighterName(opponentName, "Training Dummy") : "a training dummy";
     const winner = displayFighterName(winnerName, challenger);
+    // Use non-breaking spaces in the one-line arena result. Minecraft chat
+    // was visually collapsing the normal spaces in this line.
+    const gap = "\u00A0";
+
     if (opponentSelected) {
-        return `${challenger} sparred with ${opponent}. ${winner} won!`;
+        return `${challenger}${gap}sparred${gap}with${gap}${opponent}.${gap}${winner}${gap}won!`;
     }
-    return `${challenger} went sparring and ${winner} won!`;
+
+    return `${challenger}${gap}went${gap}sparring${gap}and${gap}${winner}${gap}won!`;
 }
 
 function buildSparringArenaChatBlock(details) {
