@@ -1353,59 +1353,65 @@ function walletMatchesIdentifierInChannel(wallet, requestedViewer, channelId, se
 
 function resolveWalletKeyForChannel(requestedViewer, channelInput, serverIdOverride = "") {
     const raw = String(requestedViewer || "").trim();
-    const normalized = normalizeViewer(raw);
-    if (!normalized) return { key: "", channelId: "", serverId: normalizeServerId(serverIdOverride), matchedBy: "missing" };
+    const wanted = normalizeViewer(raw);
+
+    if (!wanted) {
+        return { key: "", channelId: "", serverId: normalizeServerId(serverIdOverride), matchedBy: "missing" };
+    }
 
     const parsedInput = parseScopedViewerKey(raw);
     const serverId = normalizeServerId(serverIdOverride || parsedInput.serverId || resolveServerIdFromChannel(channelInput));
     const channelId = resolveChannelIdInput(channelInput || parsedInput.channelId, serverId);
-    const canonicalViewerId = resolveViewerIdInput(raw, serverId);
 
-    // Known Twitch/channel names such as DjHilha must resolve to their numeric
-    // Twitch id before any display_name matching. This prevents a bad row like
-    // viewer=133543020, display_name=DjHilha from stealing the command intended
-    // for viewer/twitch_id=145555184.
-    if (channelId && canonicalViewerId) {
-        const exactCanonicalScoped = scopedViewerKey(canonicalViewerId, channelId, serverId);
-        if (wallets[exactCanonicalScoped]) {
-            return { key: exactCanonicalScoped, channelId, serverId, matchedBy: "canonical_scoped_key" };
-        }
-
-        for (const [key, wallet] of Object.entries(wallets)) {
-            const parsed = parseScopedViewerKey(wallet?.viewer || key);
-            if (normalizeChannelId(parsed.channelId || "") !== channelId) continue;
-            const viewerId = normalizeViewer(parsed.viewerId || "");
-            const twitchId = normalizeViewer(wallet?.twitchId || "");
-            if (viewerId === canonicalViewerId || twitchId === canonicalViewerId) {
-                return { key, channelId, serverId, matchedBy: "canonical_viewer_id" };
-            }
-        }
-
-        return { key: "", channelId, serverId, matchedBy: "canonical_not_found" };
+    if (!channelId) {
+        return { key: "", channelId: "", serverId, matchedBy: "invalid_channel" };
     }
 
-    // Exact scoped key first: server::channel::viewer
-    if (channelId && !normalized.includes("::")) {
+    const channelWallets = Object.entries(wallets || {}).filter(([key, wallet]) => {
+        if (!wallet) return false;
+        const parsed = parseScopedViewerKey(wallet.viewer || key);
+        return normalizeServerId(parsed.serverId || serverId) === serverId
+            && normalizeChannelId(parsed.channelId || "") === channelId;
+    });
+
+    // Exact display name must always win inside the requested channel.
+    const exactDisplayMatches = channelWallets.filter(([, wallet]) =>
+        normalizeViewer(wallet.displayName || "") === wanted
+    );
+
+    if (exactDisplayMatches.length === 1) {
+        return { key: exactDisplayMatches[0][0], channelId, serverId, matchedBy: "exact_display_name" };
+    }
+
+    if (exactDisplayMatches.length > 1) {
+        return { key: "", channelId, serverId, matchedBy: "ambiguous_display_name" };
+    }
+
+    // Exact scoped wallet key.
+    if (!wanted.includes("::")) {
         const exactScoped = scopedViewerKey(raw, channelId, serverId);
         if (wallets[exactScoped]) {
-            return { key: exactScoped, channelId, serverId, matchedBy: "scoped_key" };
+            return { key: exactScoped, channelId, serverId, matchedBy: "exact_scoped_viewer" };
         }
     }
 
-    // Exact raw key, but only if it belongs to this channel when scoped.
-    if (wallets[normalized]) {
-        const parsed = parseScopedViewerKey(normalized);
-        if (!channelId || !parsed.channelId || normalizeChannelId(parsed.channelId) === channelId) {
-            return { key: normalized, channelId: channelId || normalizeChannelId(parsed.channelId || ""), serverId, matchedBy: "exact_key" };
-        }
+    // Exact Twitch/viewer ID inside the requested channel.
+    const exactIdentityMatches = channelWallets.filter(([key, wallet]) => {
+        const parsed = parseScopedViewerKey(wallet.viewer || key);
+        const viewerId = normalizeViewer(parsed.viewerId || "");
+        const twitchId = normalizeViewer(wallet.twitchId || "");
+        return viewerId === wanted || twitchId === wanted;
+    });
+
+    if (exactIdentityMatches.length === 1) {
+        return { key: exactIdentityMatches[0][0], channelId, serverId, matchedBy: "exact_identity" };
     }
 
-    for (const [key, wallet] of Object.entries(wallets)) {
-        if (walletMatchesIdentifierInChannel(wallet, raw, channelId, serverId)) {
-            return { key, channelId, serverId, matchedBy: "channel_alias" };
-        }
+    if (exactIdentityMatches.length > 1) {
+        return { key: "", channelId, serverId, matchedBy: "ambiguous_identity" };
     }
 
+    // Never resolve Dirt commands through companion/owner aliases.
     return { key: "", channelId, serverId, matchedBy: "not_found" };
 }
 
@@ -3441,29 +3447,15 @@ function recordSparResult(state, won) {
     }
 }
 
-function minecraftBlankSpaceText(value) {
-    // The active Minecraft chat font gives the normal ASCII space no width.
-    // IDEOGRAPHIC SPACE is still visually blank, but has a real rendered width.
-    return String(value || "").replace(/\\s+/g, "\u3000");
-}
-
 function buildSparringChatMessage(challengerName, opponentName, winnerName, captainFight = false, opponentSelected = false) {
-    if (captainFight) return minecraftBlankSpaceText(randomItem(CAPTAIN_WIN_MESSAGES));
-
-    const gap = "\u3000";
-    const challenger = minecraftBlankSpaceText(displayFighterName(challengerName, "A viewer"));
-    const opponent = minecraftBlankSpaceText(
-        opponentSelected
-            ? displayFighterName(opponentName, "Training Dummy")
-            : "a training dummy"
-    );
-    const winner = minecraftBlankSpaceText(displayFighterName(winnerName, challenger));
-
+    if (captainFight) return randomItem(CAPTAIN_WIN_MESSAGES);
+    const challenger = displayFighterName(challengerName, "A viewer");
+    const opponent = opponentSelected ? displayFighterName(opponentName, "Training Dummy") : "a training dummy";
+    const winner = displayFighterName(winnerName, challenger);
     if (opponentSelected) {
-        return `${challenger}${gap}sparred${gap}with${gap}${opponent}.${gap}${winner}${gap}won!`;
+        return `${challenger} sparred with ${opponent}. ${winner} won!`;
     }
-
-    return `${challenger}${gap}went${gap}sparring${gap}and${gap}${winner}${gap}won!`;
+    return `${challenger} went sparring and ${winner} won!`;
 }
 
 function buildSparringArenaChatBlock(details) {
@@ -3485,30 +3477,23 @@ function buildSparringArenaChatBlock(details) {
     const opponentColor = isCaptainName(opponent) ? "§6" : "§c";
     const winnerColor = isCaptainName(winner) ? "§6" : "§e";
 
-    const gap = "\u3000";
-    const safeChallenger = minecraftBlankSpaceText(challenger);
-    const safeOpponent = minecraftBlankSpaceText(opponent);
-    const safeWinner = minecraftBlankSpaceText(winner);
-    const safeBonusLabel = minecraftBlankSpaceText(bonusLabel);
-    const safeFlavor = minecraftBlankSpaceText(flavor);
-
     const lines = [
         "§6==============================",
-        `§eMEOWTY${gap}TRAINING${gap}ARENA`,
+        "§e        MEOWTY TRAINING ARENA",
         "§6==============================",
-        `${challengerColor}${safeChallenger}${gap}§a(${challengerRating})${gap}§7x${gap}VS${gap}x${gap}${opponentColor}${safeOpponent}${gap}§c(${opponentRating})`,
+        `${challengerColor}${challenger} §a(${challengerRating}) §7x VS x ${opponentColor}${opponent} §c(${opponentRating})`,
         "§8------------------------------",
-        `§6Winner:${gap}${winnerColor}${safeWinner}`,
-        `§bXP${gap}Reward:${gap}§a+${xpPercent}%${gap}§fTNL${gap}XP`,
-        `§dWin${gap}Streak:${gap}§f${streak}`
+        `§6Winner: ${winnerColor}${winner}`,
+        `§bXP Reward: §a+${xpPercent}% §fTNL XP`,
+        `§dWin Streak: §f${streak}`
     ];
 
-    if (safeBonusLabel && bonusAmount > 0) {
-        lines.push(`§9Training${gap}Bonus:${gap}§b${safeBonusLabel}${gap}§a(+${bonusAmount})`);
+    if (bonusLabel && bonusAmount > 0) {
+        lines.push(`§9Training Bonus: §b${bonusLabel} §a(+${bonusAmount})`);
     }
 
-    if (safeFlavor) {
-        lines.push("§8------------------------------", `§6${safeFlavor}`);
+    if (flavor) {
+        lines.push("§8------------------------------", `§6${flavor}`);
     }
 
     lines.push("§6==============================");
