@@ -802,14 +802,84 @@ async function loadTrainingFromSupabase() {
 
         if (rows.length > 0) {
             const loaded = {};
+
             for (const row of rows) {
-                const key = String(row.key || "");
-                if (!key) continue;
-                loaded[key] = stateRowToObject(row);
+                const rawState = stateRowToObject(row);
+                const serverId = normalizeServerId(rawState.serverId || row.server_id || firstEnabledServerId());
+                const channelId = normalizeChannelId(rawState.channelId || row.channel_id || firstChannelId(serverId));
+                const rawViewer = normalizeViewer(rawState.viewer || row.viewer || "");
+                const scopedViewer = scopedViewerKey(rawViewer, channelId, serverId);
+                const companionName = String(rawState.companionName || row.companion_name || "").trim();
+
+                if (!scopedViewer || !companionName) continue;
+
+                const canonicalKey = companionStateKeyFor(scopedViewer, companionName);
+                const existing = loaded[canonicalKey];
+
+                if (!existing) {
+                    loaded[canonicalKey] = {
+                        ...rawState,
+                        viewer: scopedViewer,
+                        serverId,
+                        channelId,
+                        companionName,
+                        academyLevel: Math.max(1, Number(rawState.academyLevel || 1))
+                    };
+                    continue;
+                }
+
+                // Consolidate duplicate/legacy rows without ever losing progress.
+                const existingUpdated = Date.parse(existing.updatedAt || "") || 0;
+                const incomingUpdated = Date.parse(rawState.updatedAt || "") || 0;
+                const newer = incomingUpdated >= existingUpdated ? rawState : existing;
+                const older = newer === rawState ? existing : rawState;
+
+                loaded[canonicalKey] = {
+                    ...older,
+                    ...newer,
+                    viewer: scopedViewer,
+                    serverId,
+                    channelId,
+                    companionName,
+                    academyLevel: Math.max(
+                        Number(existing.academyLevel || 1),
+                        Number(rawState.academyLevel || 1)
+                    ),
+                    masteryXp: Math.max(
+                        Number(existing.masteryXp || 0),
+                        Number(rawState.masteryXp || 0)
+                    ),
+                    masteryLevel: Math.max(
+                        Number(existing.masteryLevel || 1),
+                        Number(rawState.masteryLevel || 1)
+                    ),
+                    relicFragments: Math.max(
+                        Number(existing.relicFragments || 0),
+                        Number(rawState.relicFragments || 0)
+                    ),
+                    ancientRelicFragments: Math.max(
+                        Number(existing.ancientRelicFragments || 0),
+                        Number(rawState.ancientRelicFragments || 0)
+                    ),
+                    modifierKnowledge: {
+                        ...(existing.modifierKnowledge || {}),
+                        ...(rawState.modifierKnowledge || {}),
+                        companion_challenge: true
+                    },
+                    sparWins: Math.max(Number(existing.sparWins || 0), Number(rawState.sparWins || 0)),
+                    sparLosses: Math.max(Number(existing.sparLosses || 0), Number(rawState.sparLosses || 0)),
+                    bestWinStreak: Math.max(Number(existing.bestWinStreak || 0), Number(rawState.bestWinStreak || 0)),
+                    updatedAt: new Date(Math.max(existingUpdated, incomingUpdated, Date.now())).toISOString()
+                };
             }
+
             trainingData = loaded;
             writeJsonFile(TRAINING_FILE, trainingData);
-            console.log(`[SUPABASE] Loaded ${rows.length} training state(s).`);
+
+            // Rewrite the consolidated canonical states back to Supabase.
+            await syncAllTrainingToSupabase();
+
+            console.log(`[SUPABASE] Loaded ${rows.length} training row(s) into ${Object.keys(trainingData).length} canonical state(s).`);
             return;
         }
 
@@ -3168,6 +3238,12 @@ const TRAINING_TIERS = {
 
 const STUDY_FOCUSES = ["vault_xp", "watchtime_dirt", "quest_rewards"];
 const TRAINING_MODIFIERS = Array.from(FORGERY_MODIFIERS || []);
+
+function academyUpgradeCostForLevel(levelInput) {
+    const level = Math.max(1, Math.min(9, Math.floor(Number(levelInput || 1))));
+    return Math.floor(500 * level * 1.35);
+}
+
 const EXPEDITION_DURATION_MS = 5 * 60 * 1000;
 
 const STUDY_MANUAL_CAP = 10;
@@ -3351,11 +3427,17 @@ function publicTrainingState(state) {
         history: Array.isArray(state.history) ? state.history.slice(-8).reverse() : [],
         updatedAt: state.updatedAt || "",
         tiers: TRAINING_TIERS,
+        academyUpgradeCost: Number(state.academyLevel || 1) >= 10
+            ? 0
+            : academyUpgradeCostForLevel(state.academyLevel),
         prices: {
             study: PRICES.TRAINING_STUDY,
             expedition: PRICES.TRAINING_EXPEDITION,
             minigame: PRICES.TRAINING_MINIGAME,
-            sparring: PRICES.TRAINING_SPARRING
+            sparring: PRICES.TRAINING_SPARRING,
+            academyUpgrade: Number(state.academyLevel || 1) >= 10
+                ? 0
+                : academyUpgradeCostForLevel(state.academyLevel)
         }
     };
 }
@@ -3895,7 +3977,7 @@ app.post("/training/upgrade-academy", (req, res) => {
     const level = Number(state.academyLevel || 1);
     if (level >= 10) return res.status(400).json({ ok: false, error: "Academy is already level 10." });
 
-    const cost = Math.floor(500 * level * 1.35);
+    const cost = academyUpgradeCostForLevel(level);
     const spend = spendDirt(valid.viewer, cost, "training_upgrade_academy");
     if (!spend.ok) return res.status(400).json(spend);
     state.academyLevel = level + 1;
