@@ -489,11 +489,11 @@ function companionStateKeyFor(viewer, companionName) {
     if (requestedLower && Array.isArray(companionsData.companions)) {
         const config = streamerChannels?.servers?.[serverId] || {};
         const ownerNames = new Set();
-        const owners = Array.isArray(config.owners) ? config.owners : [];
-        for (const owner of owners) {
-            const ownerChannelId = normalizeChannelId(owner?.id || owner?.channelId || "");
+        const owners = config.owners || {};
+        for (const [ownerChannelIdRaw, ownerNameRaw] of Object.entries(owners)) {
+            const ownerChannelId = normalizeChannelId(ownerChannelIdRaw);
             if (channelId && ownerChannelId && ownerChannelId !== channelId) continue;
-            const name = normalizeOwnerName(owner?.ingameName || owner?.name || owner?.ownerName || "");
+            const name = normalizeOwnerName(ownerNameRaw);
             if (name) ownerNames.add(name);
         }
 
@@ -2388,26 +2388,15 @@ function configuredStreamerOwner(serverIdInput, channelInput) {
     const serverId = normalizeServerId(serverIdInput || resolveServerIdFromChannel(channelInput));
     const channelId = resolveChannelIdInput(channelInput, serverId);
     const config = streamerChannels?.servers?.[serverId] || {};
-    const owners = Array.isArray(config.owners) ? config.owners : [];
 
-    const owner = owners.find(entry =>
-        normalizeChannelId(entry?.id || entry?.channelId || "") === normalizeChannelId(channelId)
-    );
-
-    if (!owner) {
-        return {
-            serverId,
-            channelId: normalizeChannelId(channelId),
-            ownerUuid: "",
-            ownerName: ""
-        };
-    }
+    const ownerName = String(config.owners?.[channelId] || "").trim();
+    const profile = config.ownerProfiles?.[channelId] || {};
 
     return {
         serverId,
         channelId: normalizeChannelId(channelId),
-        ownerUuid: String(owner.minecraftUuid || owner.uuid || owner.ownerUuid || "").trim(),
-        ownerName: String(owner.ingameName || owner.name || owner.ownerName || "").trim()
+        ownerUuid: String(profile.minecraftUuid || profile.uuid || profile.ownerUuid || config.ownerUuids?.[channelId] || "").trim(),
+        ownerName: String(profile.ingameName || profile.name || profile.ownerName || ownerName || "").trim()
     };
 }
 
@@ -3324,15 +3313,32 @@ app.post("/shop/buy-trail", (req, res) => {
 });
 app.post("/shop/trail", (req, res) => { req.body.companionName = req.body.companionName || req.body.viewer; return app._router.handle({ ...req, url: "/shop/buy-trail", method: "POST" }, res, () => {}); });
 
+function viewerBoughtDailyRelicForOffer(viewer, offerKey) {
+    const wanted = parseScopedViewerKey(viewer);
+    const wantedServer = normalizeServerId(wanted.serverId || firstEnabledServerId());
+    const wantedChannel = normalizeChannelId(wanted.channelId || "");
+    const wantedViewer = normalizeViewer(wanted.viewerId || viewer);
+
+    return Object.values(trainingData || {}).some(state => {
+        if (!state || String(state.dailyFeaturedRelicPurchaseKey || "") !== String(offerKey || "")) return false;
+        const stateScoped = parseScopedViewerKey(state.viewer || "");
+        const stateServer = normalizeServerId(state.serverId || stateScoped.serverId || wantedServer);
+        const stateChannel = normalizeChannelId(state.channelId || stateScoped.channelId || "");
+        const stateViewer = normalizeViewer(stateScoped.viewerId || state.viewer || "");
+        return stateServer === wantedServer &&
+            stateChannel === wantedChannel &&
+            stateViewer === wantedViewer;
+    });
+}
+
 app.get("/shop/daily-relic", (req, res) => {
     const viewer = scopeViewerFromRequest(req, req.query.viewer || "");
     const scoped = parseScopedViewerKey(viewer);
     const offer = currentDailyRelicOffer(Date.now(), scoped.serverId, scoped.channelId);
     const companionName = String(req.query.companionName || "").trim();
     let purchased = false;
-    if (viewer && companionName) {
-        const state = getTrainingState(viewer, companionName);
-        purchased = String(state?.dailyFeaturedRelicPurchaseKey || "") === offer.key;
+    if (viewer) {
+        purchased = viewerBoughtDailyRelicForOffer(viewer, offer.key);
     }
     res.json({ ok: true, offer: { ...offer, purchased } });
 });
@@ -3390,8 +3396,8 @@ app.post("/shop/buy-daily-relic", (req, res) => {
     }
 
     const state = getTrainingState(viewer, companionName);
-    if (String(state?.dailyFeaturedRelicPurchaseKey || "") === offer.key) {
-        return res.status(400).json({ ok: false, error: "You already bought today's featured relic." });
+    if (viewerBoughtDailyRelicForOffer(viewer, offer.key)) {
+        return res.status(400).json({ ok: false, error: "You already bought today's featured relic on this stream." });
     }
 
     const spend = spendDirt(viewer, offer.price, "buy_daily_relic");
