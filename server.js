@@ -629,6 +629,7 @@ async function loadPersistentData() {
     // survives Render restarts/redeploys.
     forgeryData = readJsonFile(FORGERY_FILE, {});
     trainingData = readJsonFile(TRAINING_FILE, {});
+    for (const state of Object.values(trainingData || {})) migrateLegacyModifierKnowledge(state);
 
     await loadWalletsFromSupabase();
     prunePlaceholderWalletsFromMemory();
@@ -883,7 +884,7 @@ async function loadTrainingFromSupabase() {
             const loaded = {};
 
             for (const row of rows) {
-                const rawState = stateRowToObject(row);
+                const rawState = migrateLegacyModifierKnowledge(stateRowToObject(row));
                 const serverId = normalizeServerId(rawState.serverId || row.server_id || firstEnabledServerId());
                 const channelId = normalizeChannelId(rawState.channelId || row.channel_id || firstChannelId(serverId));
                 const rawViewer = normalizeViewer(rawState.viewer || row.viewer || "");
@@ -1942,11 +1943,10 @@ const FORGERY_MODIFIERS = new Set([
     "ornate_cascade",
     "coin_cascade",
     "wooden_cascade",
-    "gilded",
-    "living",
-    "ornate",
-    "wooden_bonus",
-    "coin_pile",
+    "gilded_mob_drops",
+    "living_mob_drops",
+    "ornate_mob_drops",
+    "wooden_mob_drops",
     "phoenix",
     "plentiful",
     "xp_gain",
@@ -1982,11 +1982,10 @@ const MODIFIER_RESEARCH = {
         costFragments: 15,
         durationMs: 2 * 60 * 60 * 1000,
         modifiers: [
-            "wooden_bonus",
-            "gilded",
-            "living",
-            "ornate",
-            "coin_pile",
+            "wooden_mob_drops",
+            "gilded_mob_drops",
+            "living_mob_drops",
+            "ornate_mob_drops",
             "buffed",
             "more_mobs_cata"
         ]
@@ -2010,13 +2009,12 @@ const MODIFIER_LABELS = {
     gilded_cascade: "Gilded",
     living_cascade: "Living",
     ornate_cascade: "Ornate",
-    coin_cascade: "Bonus Coins",
+    coin_cascade: "Wealthy",
     wooden_cascade: "Wooden",
-    gilded: "Bonus Gilded",
-    living: "Bonus Living",
-    ornate: "Bonus Ornate",
-    wooden_bonus: "Bonus Wooden",
-    coin_pile: "Bonus Coins",
+    gilded_mob_drops: "Gilded Mob Drops",
+    living_mob_drops: "Living Mob Drops",
+    ornate_mob_drops: "Ornate Mob Drops",
+    wooden_mob_drops: "Wooden Mob Drops",
     phoenix: "Phoenix",
     plentiful: "Plentiful",
     xp_gain: "XP Gain",
@@ -2024,6 +2022,36 @@ const MODIFIER_LABELS = {
     buffed: "Buffed",
     more_mobs_cata: "Onslaught"
 };
+
+// Migrate the old extension-only "Bonus chest" research IDs to the real Vault
+// modifier IDs. This preserves viewers' completed research after the rename.
+const LEGACY_RESEARCH_MODIFIER_IDS = {
+    wooden_bonus: "wooden_mob_drops",
+    living: "living_mob_drops",
+    gilded: "gilded_mob_drops",
+    ornate: "ornate_mob_drops"
+};
+
+function migrateLegacyModifierKnowledge(state) {
+    if (!state || typeof state !== "object") return state;
+    const knowledge = state.modifierKnowledge && typeof state.modifierKnowledge === "object"
+        ? state.modifierKnowledge
+        : {};
+
+    for (const [oldId, newId] of Object.entries(LEGACY_RESEARCH_MODIFIER_IDS)) {
+        if (knowledge[oldId] && !knowledge[newId]) knowledge[newId] = true;
+    }
+    // coin_pile / Bonus Coins is intentionally not migrated into Academy/Forgery.
+    state.modifierKnowledge = knowledge;
+
+    if (state.activeResearch && LEGACY_RESEARCH_MODIFIER_IDS[state.activeResearch.modifier]) {
+        state.activeResearch.modifier = LEGACY_RESEARCH_MODIFIER_IDS[state.activeResearch.modifier];
+    }
+    if (state.research && LEGACY_RESEARCH_MODIFIER_IDS[state.research.modifier]) {
+        state.research.modifier = LEGACY_RESEARCH_MODIFIER_IDS[state.research.modifier];
+    }
+    return state;
+}
 
 function modifierResearchTier(modifier) {
     for (const [tier, config] of Object.entries(MODIFIER_RESEARCH)) {
@@ -2415,29 +2443,14 @@ app.get("/companions", (req, res) => {
         list = list.filter(c => allowedOwners.has(companionOwnerName(c)));
     }
 
-    const requestedViewer = String(req.query.viewer || "").trim();
-    const scopedViewer = requestedViewer ? scopeViewerFromRequest(req, requestedViewer) : "";
-    const wallet = scopedViewer ? getWalletResolved(scopedViewer, false) : null;
-    const linked = wallet ? parseCompanionLink(wallet.companionName) : null;
-
-    if (wallet && linked && linked.companionName) {
-        const exact = list.find(c => companionMatchesLinked(c, linked));
-
-        if (exact) {
-            // Return only the exact linked companion. Do not fall back to another
-            // companion with the same name.
-            list = [exact];
-        } else {
-            // The linked companion was deleted or belongs to a different owner.
-            // Clear the stale wallet link and return no companion.
-            console.log(`[LINK] Linked companion not found for ${wallet.viewer}; clearing stale link: ${wallet.companionName}`);
-            wallet.companionName = "";
-            wallet.updatedAt = new Date().toISOString();
-            saveWallets();
-            list = [];
-        }
-    }
-
+    // IMPORTANT:
+    // /companions is the streamer's SEARCHABLE companion catalogue.
+    // Do not reduce this list to the viewer's currently linked companion.
+    //
+    // The extension needs the full owner-scoped list so "Find your Meowty"
+    // can switch from one companion to another. Exact linked-companion
+    // resolution and stale-link cleanup belong in /viewer-init and wallet
+    // endpoints, not in this catalogue route.
     res.json({
         ...companionsData,
         serverId,
