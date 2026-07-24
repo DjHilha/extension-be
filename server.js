@@ -2151,9 +2151,22 @@ function transferWalletBalance(fromViewer, toViewer) {
 }
 
 
-function spendDirt(viewer, amount, reason) {
+function spendDirt(viewer, amount, reason, channelInput = "", serverIdOverride = "") {
     const requested = normalizeViewer(viewer);
-    const resolvedKey = resolveWalletKey(viewer) || (wallets[requested] ? requested : "");
+    const cleanChannel = String(channelInput || "").trim();
+    let resolvedKey = "";
+    let resolvedChannelId = "";
+    let resolvedServerId = normalizeServerId(serverIdOverride || resolveServerIdFromChannel(cleanChannel));
+
+    if (cleanChannel) {
+        const resolved = resolveWalletKeyForChannel(viewer, cleanChannel, resolvedServerId);
+        resolvedKey = resolved && resolved.key ? resolved.key : "";
+        resolvedChannelId = resolved && resolved.channelId ? resolved.channelId : "";
+        resolvedServerId = resolved && resolved.serverId ? resolved.serverId : resolvedServerId;
+    } else {
+        resolvedKey = resolveWalletKey(viewer) || (wallets[requested] ? requested : "");
+    }
+
     const wallet = resolvedKey ? getWallet(resolvedKey) : null;
     const cost = Math.floor(Number(amount || 0));
     if (!wallet) return { ok: false, error: "Wallet not found for this channel. Viewer must open/link the extension on this stream first.", viewer: requested };
@@ -2164,7 +2177,15 @@ function spendDirt(viewer, amount, reason) {
     wallet.dirt -= cost;
     saveWallets();
     console.log(`[WALLET] -${cost} Dirt from ${wallet.viewer} | Reason: ${reason} | Balance: ${wallet.dirt}`);
-    return { ok: true, viewer: wallet.viewer, dirt: wallet.dirt, spent: cost, reason };
+    return {
+        ok: true,
+        viewer: wallet.viewer,
+        dirt: wallet.dirt,
+        spent: cost,
+        reason,
+        channelId: resolvedChannelId || parseScopedViewerKey(wallet.viewer).channelId || "",
+        serverId: resolvedServerId || parseScopedViewerKey(wallet.viewer).serverId || firstEnabledServerId()
+    };
 }
 
 
@@ -2604,7 +2625,13 @@ app.post("/wallet/add-channel", requireApiKey, (req, res) => {
 });
 
 app.post("/wallet/spend", requireApiKey, (req, res) => {
-    const result = spendDirt(req.body.viewer, req.body.amount, String(req.body.reason || "spend"));
+    const result = spendDirt(
+        req.body.viewer,
+        req.body.amount,
+        String(req.body.reason || "spend"),
+        req.body.channelId || req.body.channel || "",
+        req.body.serverId || ""
+    );
     if (!result.ok) return res.status(400).json(result);
     res.json(result);
 });
@@ -4416,7 +4443,61 @@ app.post("/admin/modifier/lock", requireApiKey, (req, res) => {
     res.json({ ok: true, locked: modifier, training: publicTrainingState(state) });
 });
 
+function completeAllResearchForViewer(req, res) {
+    const requestedViewer = String(req.body.viewer || req.body.identifier || "").trim();
+    const channelInput = adminChannelInputFromRequest(req);
+    const resolved = resolveAdminViewerIdentifier(requestedViewer, channelInput, req.body.serverId || "");
+    if (!resolved.ok || !resolved.viewer) {
+        return res.status(400).json({ ok: false, error: resolved.error || "Missing viewer.", requestedViewer, channel: channelInput });
+    }
+
+    const wantedViewer = normalizeViewer(resolved.viewer);
+    const wantedChannel = normalizeChannelId(resolved.channelId || parseScopedViewerKey(resolved.viewer).channelId || "");
+    let statesMatched = 0;
+    let jobsCompleted = 0;
+    const companions = [];
+
+    for (const state of Object.values(trainingData || {})) {
+        if (!state) continue;
+        const stateViewer = normalizeViewer(state.viewer || "");
+        const parsed = parseScopedViewerKey(state.viewer || "");
+        const stateChannel = normalizeChannelId(state.channelId || parsed.channelId || "");
+        if (stateViewer !== wantedViewer) continue;
+        if (wantedChannel && stateChannel && stateChannel !== wantedChannel) continue;
+
+        statesMatched++;
+        const active = Array.isArray(state.activeResearch) ? state.activeResearch : [];
+        state.modifierKnowledge = state.modifierKnowledge || {};
+        state.modifierKnowledge.companion_challenge = true;
+        for (const job of active) {
+            if (!job || !job.modifier) continue;
+            state.modifierKnowledge[job.modifier] = true;
+            jobsCompleted++;
+        }
+        state.activeResearch = [];
+        addTrainingHistory(state, "Admin: completed all active research for viewer.");
+        if (state.companionName) companions.push(state.companionName);
+    }
+
+    saveTraining();
+    res.json({
+        ok: true,
+        requestedViewer,
+        resolvedViewer: resolved.viewer,
+        channelId: wantedChannel,
+        serverId: resolved.serverId || firstEnabledServerId(),
+        statesMatched,
+        jobsCompleted,
+        companions
+    });
+}
+
+app.post("/admin/research/complete-all", requireApiKey, completeAllResearchForViewer);
+
 app.post("/admin/research/complete", requireApiKey, (req, res) => {
+    if ((req.body.modifier === "all" || req.body.modifiers === "all") && !String(req.body.companionName || req.body.companion || "").trim()) {
+        return completeAllResearchForViewer(req, res);
+    }
     const valid = validateAdminCompanionBody(req);
     if (!valid.ok) return res.status(valid.status).json(valid);
     const state = getTrainingState(valid.viewer, valid.companionName);
@@ -4502,7 +4583,16 @@ app.post("/wallet/alias", requireApiKey, (req, res) => {
         });
     }
 
-    const wallet = getWalletResolved(identifier, false);
+    const channelInput = String(req.body.channelId || req.body.channel || "").trim();
+    const serverId = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(channelInput));
+    let wallet = null;
+
+    if (channelInput) {
+        const resolved = resolveWalletKeyForChannel(identifier, channelInput, serverId);
+        wallet = resolved && resolved.key ? getWallet(resolved.key) : null;
+    } else {
+        wallet = getWalletResolved(identifier, false);
+    }
 
     if (!wallet) {
         return res.status(404).json({
