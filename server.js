@@ -69,13 +69,9 @@ let forgeryData = {};
 let trainingData = {};
 let streamerChannels = {};
 
-const CANONICAL_CHANNELS = {
-    meowtys_s3: {
-        djhilha: { id: "145555184", displayName: "DjHilha", ownerName: "Hilha" },
-        hilha: { id: "145555184", displayName: "DjHilha", ownerName: "Hilha" },
-        halosiapaage: { id: "133543020", displayName: "HalosiaPaage", ownerName: "HalosiaPaage" }
-    }
-};
+// streamer_channels.json is the single source of truth for servers, Twitch channels,
+// Minecraft owners and owner UUIDs. Keep no hidden streamer mapping in code.
+const CANONICAL_CHANNELS = {};
 
 const PLACEHOLDER_CHANNEL_IDS = new Set(["123456789"]);
 
@@ -238,15 +234,100 @@ function defaultStreamerChannels() {
             meowtys_s3: {
                 enabled: true,
                 name: "Meowtys S3",
+                uuid: "",
                 channels: {
-                    "145555184": "DjHilha"
+                    "145555184": "DjHilha",
+                    "133543020": "HalosiaPaage"
                 },
                 owners: {
-                    "145555184": "Hilha"
+                    "145555184": "Hilha",
+                    "133543020": "HalosiaPaage"
+                },
+                ownerProfiles: {
+                    "145555184": {
+                        id: "145555184",
+                        channelId: "145555184",
+                        ingameName: "Hilha",
+                        minecraftUuid: "4c48aee5-182a-4645-a0dd-ebb021df99ef"
+                    },
+                    "133543020": {
+                        id: "133543020",
+                        channelId: "133543020",
+                        ingameName: "HalosiaPaage",
+                        minecraftUuid: "bc5cd9bb-0fc5-4bbe-b6a1-b7e73ea7b608"
+                    }
                 }
             }
         }
     };
+}
+
+function normalizeStreamerChannelsConfig(input) {
+    const root = input && typeof input === "object" ? input : {};
+    if (!root.servers || typeof root.servers !== "object") root.servers = {};
+
+    for (const [serverId, rawConfig] of Object.entries(root.servers)) {
+        const config = rawConfig && typeof rawConfig === "object" ? rawConfig : {};
+        config.enabled = config.enabled !== false;
+        config.name = String(config.name || serverId);
+        config.uuid = String(config.uuid || config.serverUuid || "");
+
+        const channelMap = {};
+        const rawChannels = config.channels;
+        if (Array.isArray(rawChannels)) {
+            for (const entry of rawChannels) {
+                if (!entry || typeof entry !== "object") continue;
+                const id = normalizeChannelId(entry.id || entry.channelId || entry.numericId || "");
+                const name = String(entry.name || entry.channelName || entry.displayName || "").trim();
+                if (id && name) channelMap[id] = name;
+            }
+        } else if (rawChannels && typeof rawChannels === "object") {
+            for (const [key, value] of Object.entries(rawChannels)) {
+                const id = normalizeChannelId((value && typeof value === "object") ? (value.id || value.channelId || key) : key);
+                const name = String((value && typeof value === "object") ? (value.name || value.channelName || value.displayName || "") : value || "").trim();
+                if (id && name) channelMap[id] = name;
+            }
+        }
+
+        const ownerMap = {};
+        const ownerProfiles = {};
+        const rawOwners = config.ownerProfiles || config.owners;
+        const addOwner = (key, value) => {
+            if (value && typeof value === "object") {
+                const id = normalizeChannelId(value.id || value.channelId || value.numericId || key || "");
+                const ingameName = String(value.ingameName || value.minecraftName || value.ownerName || value.name || "").trim();
+                const minecraftUuid = String(value.minecraftUuid || value.uuid || value.ownerUuid || "").trim().toLowerCase();
+                if (!id || !ingameName) return;
+                ownerMap[id] = ingameName;
+                ownerProfiles[id] = { id, channelId: id, ingameName, minecraftUuid };
+            } else {
+                const id = normalizeChannelId(key || "");
+                const ingameName = String(value || "").trim();
+                if (!id || !ingameName) return;
+                const legacyUuid = String(config.ownerUuids?.[id] || "").trim().toLowerCase();
+                ownerMap[id] = ingameName;
+                ownerProfiles[id] = { id, channelId: id, ingameName, minecraftUuid: legacyUuid };
+            }
+        };
+        if (Array.isArray(rawOwners)) rawOwners.forEach((value, index) => addOwner(String(index), value));
+        else if (rawOwners && typeof rawOwners === "object") Object.entries(rawOwners).forEach(([key, value]) => addOwner(key, value));
+
+        // Fill owner profiles from legacy ownerUuids, and guarantee every configured owner has a profile.
+        for (const [id, ingameName] of Object.entries(config.owners && !Array.isArray(config.owners) ? config.owners : {})) {
+            if (typeof ingameName === "string" && !ownerMap[id]) addOwner(id, ingameName);
+        }
+        for (const [id, ingameName] of Object.entries(ownerMap)) {
+            if (!ownerProfiles[id]) ownerProfiles[id] = { id, channelId: id, ingameName, minecraftUuid: "" };
+            if (!ownerProfiles[id].minecraftUuid && config.ownerUuids?.[id]) ownerProfiles[id].minecraftUuid = String(config.ownerUuids[id]).trim().toLowerCase();
+        }
+
+        config.channels = channelMap;
+        config.owners = ownerMap;
+        config.ownerProfiles = ownerProfiles;
+        config.ownerUuids = Object.fromEntries(Object.entries(ownerProfiles).map(([id, p]) => [id, p.minecraftUuid || ""]));
+        root.servers[serverId] = config;
+    }
+    return root;
 }
 
 function loadStreamerChannels() {
@@ -272,9 +353,9 @@ function loadStreamerChannels() {
         console.log(`[CHANNELS] Loaded ${STREAMER_CHANNELS_FILE}`);
     }
 
-    streamerChannels = loaded;
-    if (!streamerChannels || typeof streamerChannels !== "object") streamerChannels = defaultStreamerChannels();
-    if (!streamerChannels.servers || typeof streamerChannels.servers !== "object") streamerChannels.servers = defaultStreamerChannels().servers;
+    streamerChannels = normalizeStreamerChannelsConfig(loaded);
+    if (!streamerChannels || typeof streamerChannels !== "object") streamerChannels = normalizeStreamerChannelsConfig(defaultStreamerChannels());
+    if (!streamerChannels.servers || typeof streamerChannels.servers !== "object") streamerChannels.servers = normalizeStreamerChannelsConfig(defaultStreamerChannels()).servers;
 
     applyCanonicalChannelOverrides();
 
@@ -298,7 +379,7 @@ function firstChannelId(serverIdOverride = "") {
     const config = streamerChannels?.servers?.[serverId];
     const channels = config?.channels || {};
     const first = Object.keys(channels)[0];
-    return normalizeChannelId(first || "145555184");
+    return normalizeChannelId(first || "");
 }
 
 function resolveServerIdFromChannel(channelId) {
@@ -376,10 +457,6 @@ function ownerCandidatesForRequest(req, serverId, channelId) {
     } else if (cleanChannel && Object.prototype.hasOwnProperty.call(channels, cleanChannel)) {
         // Backwards-compatible fallback if an older config has no owners block.
         addOwnerCandidate(candidates, channels[cleanChannel]);
-    }
-
-    if (candidates.size === 0 && sid === "meowtys_s3") {
-        addOwnerCandidate(candidates, "Hilha");
     }
 
     return Array.from(candidates).filter(Boolean);
@@ -2294,7 +2371,10 @@ app.get("/servers", (req, res) => {
         servers[serverId] = {
             enabled: true,
             name: String(config.name || serverId),
-            channels: config.channels || {}
+            uuid: String(config.uuid || ""),
+            channels: config.channels || {},
+            owners: config.owners || {},
+            ownerProfiles: config.ownerProfiles || {}
         };
     }
     res.json({
@@ -2416,7 +2496,23 @@ app.post("/companions", requireApiKey, (req, res) => {
     }
 
     const serverId = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(req.body.channelId));
-    const incoming = req.body.companions.map(c => ({ ...c, serverId }));
+    const serverConfig = streamerChannels?.servers?.[serverId] || {};
+    const configuredOwnerNames = new Set(Object.values(serverConfig.owners || {}).map(normalizeOwnerName).filter(Boolean));
+    const configuredOwnerUuids = new Set(Object.values(serverConfig.ownerProfiles || {})
+        .map(profile => String(profile?.minecraftUuid || profile?.uuid || "").trim().toLowerCase())
+        .filter(Boolean));
+
+    if (configuredOwnerNames.size === 0 && configuredOwnerUuids.size === 0) {
+        return res.status(409).json({ ok: false, error: `No streamer owners configured for ${serverId}; refusing companion replacement` });
+    }
+
+    const incoming = req.body.companions
+        .map(c => ({ ...c, serverId }))
+        .filter(c => {
+            const ownerName = companionOwnerName(c);
+            const ownerUuid = String(c.ownerUuid || "").trim().toLowerCase();
+            return (ownerUuid && configuredOwnerUuids.has(ownerUuid)) || (ownerName && configuredOwnerNames.has(ownerName));
+        });
 
     // The Minecraft exporter sends the FULL current companion list.
     // Replace this server's cached list instead of merging, otherwise deleted
@@ -2682,6 +2778,70 @@ app.post("/wallet/reset", requireApiKey, (req, res) => {
     saveWallets();
     console.log(`[WALLET] Reset ${viewer} to 0 Dirt.`);
     res.json({ ok: true, viewer: wallet.viewer, dirt: wallet.dirt });
+});
+
+app.post("/admin/migrate-server-wallets", requireApiKey, async (req, res) => {
+    const fromServer = normalizeServerId(req.body?.fromServer || req.body?.sourceServer || "");
+    const toServer = normalizeServerId(req.body?.toServer || req.body?.targetServer || "");
+
+    if (!fromServer || !toServer || fromServer === toServer) {
+        return res.status(400).json({ ok: false, error: "fromServer and toServer must be different valid server ids" });
+    }
+    if (!streamerChannels?.servers?.[fromServer]) {
+        return res.status(404).json({ ok: false, error: `Unknown source server: ${fromServer}` });
+    }
+    if (!streamerChannels?.servers?.[toServer]) {
+        return res.status(404).json({ ok: false, error: `Unknown target server: ${toServer}` });
+    }
+
+    const sourceWallets = Object.values(wallets || {}).filter(wallet => {
+        const parsed = parseScopedViewerKey(wallet?.viewer || "");
+        return normalizeServerId(parsed.serverId || "") === fromServer;
+    });
+
+    let migrated = 0;
+    let created = 0;
+    let updated = 0;
+    for (const source of sourceWallets) {
+        const parsed = parseScopedViewerKey(source.viewer || "");
+        const channelId = normalizeChannelId(parsed.channelId || "");
+        const viewerId = normalizeViewer(parsed.viewerId || "");
+        const targetChannels = configuredChannelIds(toServer);
+        if (!channelId || !viewerId || !targetChannels.has(channelId)) continue;
+
+        const targetKey = scopedViewerKey(viewerId, channelId, toServer);
+        const existing = wallets[targetKey] || null;
+        const sourceDirt = Number(source.dirt || 0);
+
+        if (!existing) {
+            wallets[targetKey] = {
+                viewer: targetKey,
+                dirt: sourceDirt,
+                twitchId: String(source.twitchId || viewerId),
+                displayName: String(source.displayName || viewerId),
+                // Companion links are deliberately NOT migrated between Minecraft servers.
+                companionName: "",
+                manualAlias: !!source.manualAlias,
+                updatedAt: new Date().toISOString()
+            };
+            created++;
+        } else {
+            existing.dirt = Math.max(Number(existing.dirt || 0), sourceDirt);
+            if (!existing.twitchId && source.twitchId) existing.twitchId = String(source.twitchId);
+            if (!safeDisplayName(existing.displayName, "") && safeDisplayName(source.displayName, "")) existing.displayName = String(source.displayName);
+            existing.updatedAt = new Date().toISOString();
+            updated++;
+        }
+        migrated++;
+    }
+
+    saveWallets();
+    if (USE_SUPABASE) {
+        try { await syncAllWalletsToSupabase(); } catch (error) { console.error("[MIGRATE] Supabase wallet sync failed", error); }
+    }
+
+    console.log(`[MIGRATE] Wallets ${fromServer} -> ${toServer}: migrated=${migrated}, created=${created}, updated=${updated}`);
+    res.json({ ok: true, fromServer, toServer, migrated, created, updated, sourcePreserved: true, companionLinksMigrated: false });
 });
 
 app.post("/admin/reset-player", requireApiKey, (req, res) => {
