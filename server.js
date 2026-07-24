@@ -2331,9 +2331,13 @@ function seededDailyRandom(seed) {
     };
 }
 
-function currentDailyRelicOffer(now = Date.now()) {
-    const key = Math.floor(now / DAILY_RELIC_MS);
-    const random = seededDailyRandom(key ^ 0x51f15e);
+function currentDailyRelicOffer(now = Date.now(), serverIdInput = "", channelIdInput = "") {
+    const dayKey = Math.floor(now / DAILY_RELIC_MS);
+    const serverId = normalizeServerId(serverIdInput || firstEnabledServerId());
+    const channelId = resolveChannelIdInput(channelIdInput, serverId) || normalizeChannelId(channelIdInput || "");
+    const scopeSeed = hashDailyRelicScope(`${serverId}::${channelId}`);
+    const key = `${serverId}::${channelId}::${dayKey}`;
+    const random = seededDailyRandom((dayKey ^ scopeSeed ^ 0x51f15e) >>> 0);
     const roll = random() * 100;
     const slots = roll < 45 ? 4 : (roll < 85 ? 5 : 6); // pretty good, but still below intentional Forgery builds
     const modifiers = [];
@@ -2357,8 +2361,10 @@ function currentDailyRelicOffer(now = Date.now()) {
         price: PRICES.BUY_DAILY_RELIC,
         slots,
         modifiers,
-        startsAt: key * DAILY_RELIC_MS,
-        expiresAt: (key + 1) * DAILY_RELIC_MS
+        serverId,
+        channelId,
+        startsAt: dayKey * DAILY_RELIC_MS,
+        expiresAt: (dayKey + 1) * DAILY_RELIC_MS
     };
 }
 
@@ -2377,15 +2383,97 @@ function queueShopAction(action) {
     return request;
 }
 
-function shopCompanionFields(req, serverId = "") {
-    const ownerName = String(req.body.ownerName || req.body.minecraftName || "").trim();
+
+function configuredStreamerOwner(serverIdInput, channelInput) {
+    const serverId = normalizeServerId(serverIdInput || resolveServerIdFromChannel(channelInput));
+    const channelId = resolveChannelIdInput(channelInput, serverId);
+    const config = streamerChannels?.servers?.[serverId] || {};
+    const owners = Array.isArray(config.owners) ? config.owners : [];
+
+    const owner = owners.find(entry =>
+        normalizeChannelId(entry?.id || entry?.channelId || "") === normalizeChannelId(channelId)
+    );
+
+    if (!owner) {
+        return {
+            serverId,
+            channelId: normalizeChannelId(channelId),
+            ownerUuid: "",
+            ownerName: ""
+        };
+    }
+
     return {
-        companionUuid: String(req.body.companionUuid || req.body.uuid || "").trim(),
-        ownerUuid: String(req.body.ownerUuid || "").trim(),
-        ownerName,
-        minecraftName: ownerName,
-        channelId: normalizeChannelId(req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || ""),
-        serverId: normalizeServerId(serverId || req.body.serverId || resolveServerIdFromChannel(req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || ""))
+        serverId,
+        channelId: normalizeChannelId(channelId),
+        ownerUuid: String(owner.minecraftUuid || owner.uuid || owner.ownerUuid || "").trim(),
+        ownerName: String(owner.ingameName || owner.name || owner.ownerName || "").trim()
+    };
+}
+
+function exportedCompanionForStreamer(serverIdInput, channelInput, companionNameInput, companionUuidInput = "") {
+    const configured = configuredStreamerOwner(serverIdInput, channelInput);
+    const wantedName = String(companionNameInput || "").trim().toLowerCase();
+    const wantedUuid = String(companionUuidInput || "").trim().toLowerCase();
+
+    if (!wantedName || !Array.isArray(companionsData.companions)) return null;
+
+    const matches = companionsData.companions.filter(companion => {
+        const cServer = normalizeServerId(companion?.serverId || configured.serverId);
+        const cName = String(companion?.name || "").trim().toLowerCase();
+        const cUuid = String(companion?.uuid || companion?.companionUuid || "").trim().toLowerCase();
+        const cOwnerUuid = String(companion?.ownerUuid || "").trim().toLowerCase();
+        const cOwnerName = companionOwnerName(companion);
+
+        if (cServer !== configured.serverId || cName !== wantedName) return false;
+        if (wantedUuid && cUuid && cUuid !== wantedUuid) return false;
+
+        if (configured.ownerUuid && cOwnerUuid) {
+            return cOwnerUuid === configured.ownerUuid.toLowerCase();
+        }
+        if (configured.ownerName) {
+            return cOwnerName === normalizeOwnerName(configured.ownerName);
+        }
+        return false;
+    });
+
+    return matches.length === 1 ? matches[0] : null;
+}
+
+function hashDailyRelicScope(value) {
+    const text = String(value || "");
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return hash >>> 0;
+}
+
+function shopCompanionFields(req, serverId = "") {
+    const requestedChannel = req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || "";
+    const configured = configuredStreamerOwner(
+        serverId || req.body.serverId || resolveServerIdFromChannel(requestedChannel),
+        requestedChannel
+    );
+
+    const companionName = String(req.body.companionName || "").trim();
+    const exported = exportedCompanionForStreamer(
+        configured.serverId,
+        configured.channelId,
+        companionName,
+        req.body.companionUuid || req.body.uuid || ""
+    );
+
+    return {
+        // Never trust a stale owner identity from the browser.
+        // Twitch channel -> configured Minecraft streamer is the source of truth.
+        companionUuid: String(exported?.uuid || exported?.companionUuid || req.body.companionUuid || req.body.uuid || "").trim(),
+        ownerUuid: configured.ownerUuid,
+        ownerName: configured.ownerName,
+        minecraftName: configured.ownerName,
+        channelId: configured.channelId,
+        serverId: configured.serverId
     };
 }
 
@@ -3237,8 +3325,9 @@ app.post("/shop/buy-trail", (req, res) => {
 app.post("/shop/trail", (req, res) => { req.body.companionName = req.body.companionName || req.body.viewer; return app._router.handle({ ...req, url: "/shop/buy-trail", method: "POST" }, res, () => {}); });
 
 app.get("/shop/daily-relic", (req, res) => {
-    const offer = currentDailyRelicOffer();
     const viewer = scopeViewerFromRequest(req, req.query.viewer || "");
+    const scoped = parseScopedViewerKey(viewer);
+    const offer = currentDailyRelicOffer(Date.now(), scoped.serverId, scoped.channelId);
     const companionName = String(req.query.companionName || "").trim();
     let purchased = false;
     if (viewer && companionName) {
@@ -3284,7 +3373,22 @@ app.post("/shop/buy-daily-relic", (req, res) => {
     if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
     if (!Number.isInteger(slot) || slot < 0 || slot > 3) return res.status(400).json({ ok: false, error: "Choose a valid normal relic slot." });
 
-    const offer = currentDailyRelicOffer();
+    const scoped = parseScopedViewerKey(viewer);
+    const offer = currentDailyRelicOffer(Date.now(), scoped.serverId, scoped.channelId);
+
+    const selectedCompanion = exportedCompanionForStreamer(
+        scoped.serverId,
+        scoped.channelId,
+        companionName,
+        req.body.companionUuid || req.body.uuid || ""
+    );
+    if (!selectedCompanion) {
+        return res.status(400).json({
+            ok: false,
+            error: "That companion does not belong to the selected streamer's crew."
+        });
+    }
+
     const state = getTrainingState(viewer, companionName);
     if (String(state?.dailyFeaturedRelicPurchaseKey || "") === offer.key) {
         return res.status(400).json({ ok: false, error: "You already bought today's featured relic." });
