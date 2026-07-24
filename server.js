@@ -70,17 +70,9 @@ let trainingData = {};
 let streamerChannels = {};
 
 // streamer_channels.json is the single source of truth for servers, Twitch channels,
-// Minecraft owners and owner UUIDs. Keep no hidden streamer mapping in code.
-const CANONICAL_CHANNELS = {};
+// Minecraft owners and owner UUIDs. There are no streamer/server fallbacks in code.
 
 const PLACEHOLDER_CHANNEL_IDS = new Set(["123456789"]);
-
-function canonicalChannelForInput(channelInput, serverIdOverride = "") {
-    const sid = normalizeServerId(serverIdOverride || firstEnabledServerId());
-    const wanted = normalizeViewer(channelInput);
-    const serverMap = CANONICAL_CHANNELS[sid] || {};
-    return serverMap[wanted] || null;
-}
 
 function isPlaceholderChannelId(channelId) {
     return PLACEHOLDER_CHANNEL_IDS.has(normalizeChannelId(channelId));
@@ -92,11 +84,6 @@ function configuredChannelIds(serverIdOverride = "") {
     const config = streamerChannels?.servers?.[sid] || {};
     for (const id of Object.keys(config.channels || {})) {
         const clean = normalizeChannelId(id);
-        if (clean && !isPlaceholderChannelId(clean)) ids.add(clean);
-    }
-    const canonicalMap = CANONICAL_CHANNELS[sid] || {};
-    for (const channel of Object.values(canonicalMap)) {
-        const clean = normalizeChannelId(channel.id);
         if (clean && !isPlaceholderChannelId(clean)) ids.add(clean);
     }
     return ids;
@@ -116,42 +103,11 @@ function resolveViewerIdInput(viewerInput, serverIdOverride = "") {
     if (parsed.viewerId && parsed.viewerId !== wanted) return normalizeViewer(parsed.viewerId);
     if (/^\d+$/.test(wanted)) return wanted;
     const sid = normalizeServerId(serverIdOverride || firstEnabledServerId());
-    const canonicalMap = CANONICAL_CHANNELS[sid] || {};
-    const canonical = canonicalMap[wanted];
-    if (canonical && canonical.id) return normalizeViewer(canonical.id);
     const config = streamerChannels?.servers?.[sid] || {};
     for (const [id, name] of Object.entries(config.channels || {})) {
         if (normalizeViewer(name) === wanted) return normalizeViewer(id);
     }
     return "";
-}
-
-function applyCanonicalChannelOverrides() {
-    for (const [serverId, channelMap] of Object.entries(CANONICAL_CHANNELS)) {
-        if (!streamerChannels.servers[serverId]) {
-            streamerChannels.servers[serverId] = { enabled: true, name: serverId, channels: {}, owners: {} };
-        }
-
-        const config = streamerChannels.servers[serverId];
-        if (!config.channels || typeof config.channels !== "object") config.channels = {};
-        if (!config.owners || typeof config.owners !== "object") config.owners = {};
-
-        for (const badId of PLACEHOLDER_CHANNEL_IDS) {
-            delete config.channels[badId];
-            delete config.owners[badId];
-        }
-
-        for (const canonical of Object.values(channelMap)) {
-            for (const [id, name] of Object.entries({ ...config.channels })) {
-                if (normalizeViewer(name) === normalizeViewer(canonical.displayName) && normalizeChannelId(id) !== canonical.id) {
-                    delete config.channels[id];
-                    delete config.owners[id];
-                }
-            }
-            config.channels[canonical.id] = canonical.displayName;
-            config.owners[canonical.id] = canonical.ownerName;
-        }
-    }
 }
 
 function prunePlaceholderWalletsFromMemory() {
@@ -229,39 +185,10 @@ async function purgeInvalidChannelWalletsFromSupabase() {
 
 
 function defaultStreamerChannels() {
-    return {
-        servers: {
-            meowtys_s3: {
-                enabled: true,
-                name: "Meowtys S3",
-                uuid: "",
-                channels: {
-                    "145555184": "DjHilha",
-                    "133543020": "HalosiaPaage"
-                },
-                owners: {
-                    "145555184": "Hilha",
-                    "133543020": "HalosiaPaage"
-                },
-                ownerProfiles: {
-                    "145555184": {
-                        id: "145555184",
-                        channelId: "145555184",
-                        ingameName: "Hilha",
-                        minecraftUuid: "4c48aee5-182a-4645-a0dd-ebb021df99ef"
-                    },
-                    "133543020": {
-                        id: "133543020",
-                        channelId: "133543020",
-                        ingameName: "HalosiaPaage",
-                        minecraftUuid: "bc5cd9bb-0fc5-4bbe-b6a1-b7e73ea7b608"
-                    }
-                }
-            }
-        }
-    };
+    // Deliberately empty: deployments must define streamer_channels.json.
+    // This prevents a forgotten fallback from silently routing data to an old season/streamer.
+    return { servers: {} };
 }
-
 function normalizeStreamerChannelsConfig(input) {
     const root = input && typeof input === "object" ? input : {};
     if (!root.servers || typeof root.servers !== "object") root.servers = {};
@@ -357,7 +284,6 @@ function loadStreamerChannels() {
     if (!streamerChannels || typeof streamerChannels !== "object") streamerChannels = normalizeStreamerChannelsConfig(defaultStreamerChannels());
     if (!streamerChannels.servers || typeof streamerChannels.servers !== "object") streamerChannels.servers = normalizeStreamerChannelsConfig(defaultStreamerChannels()).servers;
 
-    applyCanonicalChannelOverrides();
 
     // Keep a runtime cache copy in DATA_DIR too.
     writeJsonFile(STREAMER_CHANNELS_FILE, streamerChannels);
@@ -371,7 +297,7 @@ function firstEnabledServerId() {
     for (const [serverId, config] of Object.entries(streamerChannels.servers || {})) {
         if (config && config.enabled !== false) return serverId;
     }
-    return "meowtys_s3";
+    return "default";
 }
 
 function firstChannelId(serverIdOverride = "") {
@@ -384,10 +310,6 @@ function firstChannelId(serverIdOverride = "") {
 
 function resolveServerIdFromChannel(channelId) {
     const wanted = String(channelId || "").trim();
-    const wantedNorm = normalizeViewer(wanted);
-    for (const [serverId, channelMap] of Object.entries(CANONICAL_CHANNELS || {})) {
-        if (channelMap[wantedNorm]) return serverId;
-    }
     for (const [serverId, config] of Object.entries(streamerChannels.servers || {})) {
         if (!config || config.enabled === false) continue;
         const channels = config.channels || {};
@@ -486,7 +408,7 @@ function companionMatchesLinked(c, linked) {
 }
 
 function normalizeServerId(serverId) {
-    return String(serverId || firstEnabledServerId() || "meowtys_s3").trim().toLowerCase();
+    return String(serverId || firstEnabledServerId() || "default").trim().toLowerCase();
 }
 
 function normalizeChannelId(channelId) {
@@ -1382,11 +1304,6 @@ function resolveChannelIdInput(channelInput, serverIdOverride = "") {
     const serverId = normalizeServerId(serverIdOverride || resolveServerIdFromChannel(raw));
     const config = streamerChannels?.servers?.[serverId] || {};
     const channels = config.channels || {};
-
-    const canonical = canonicalChannelForInput(raw, serverId);
-    if (canonical) {
-        return canonical.id;
-    }
 
     if (!wanted) {
         return firstChannelId(serverId);
