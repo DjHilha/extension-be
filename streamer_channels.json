@@ -2,14 +2,30 @@
   "servers": {
     "meowtys_s3": {
       "enabled": true,
-      "channels": {
-        "145555184": "DjHilha",
-        "123456789": "HalosiaPaage"
-      },
-      "owners": {
-        "145555184": "Hilha",
-        "123456789": "HalosiaPaage"
-      }
+      "name": "Meowtys S3",
+      "uuid": "",
+      "channels": [
+        {
+          "id": "145555184",
+          "name": "DjHilha"
+        },
+        {
+          "id": "133543020",
+          "name": "HalosiaPaage"
+        }
+      ],
+      "owners": [
+        {
+          "id": "145555184",
+          "ingameName": "Hilha",
+          "minecraftUuid": "4c48aee5-182a-4645-a0dd-ebb021df99ef"
+        },
+        {
+          "id": "133543020",
+          "ingameName": "HalosiaPaage",
+          "minecraftUuid": "bc5cd9bb-0fc5-4bbe-b6a1-b7e73ea7b608"
+        }
+      ]
     }
   }
 }
