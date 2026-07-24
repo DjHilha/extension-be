@@ -477,16 +477,95 @@ function companionStateKeyFor(viewer, companionName) {
     const wallet = getWalletResolved(viewer, false) || (wallets[normalizeViewer(viewer)] || null);
     const linked = parseCompanionLink(wallet && wallet.companionName);
     const scoped = parseScopedViewerKey(wallet?.viewer || viewer);
-    const requested = String(companionName || "").trim();
+    const requested = String(companionName || linked?.companionName || "").trim();
     const serverId = normalizeServerId(scoped.serverId || linked.serverId || firstEnabledServerId());
     const channelId = normalizeChannelId(scoped.channelId || "default");
     const viewerId = normalizeViewer(scoped.viewerId || viewer);
+    const requestedLower = requested.toLowerCase();
 
-    if (linked.ownerUuid && (!requested || linked.companionName.toLowerCase() === requested.toLowerCase())) {
-        return `${serverId}::${channelId}::${viewerId}::${linked.ownerUuid}::${linked.companionName.toLowerCase()}`;
+    // Keep Academy/Forgery state bound to the exported companion UUID, not to
+    // the temporary shape of the viewer's companion link. This prevents a
+    // stale/plain wallet link from creating a second blank state.
+    if (requestedLower && Array.isArray(companionsData.companions)) {
+        const config = streamerChannels?.servers?.[serverId] || {};
+        const ownerNames = new Set();
+        const owners = Array.isArray(config.owners) ? config.owners : [];
+        for (const owner of owners) {
+            const ownerChannelId = normalizeChannelId(owner?.id || owner?.channelId || "");
+            if (channelId && ownerChannelId && ownerChannelId !== channelId) continue;
+            const name = normalizeOwnerName(owner?.ingameName || owner?.name || owner?.ownerName || "");
+            if (name) ownerNames.add(name);
+        }
+
+        const matches = companionsData.companions.filter(c => {
+            const cServer = normalizeServerId(c?.serverId || serverId);
+            const cName = String(c?.name || "").trim().toLowerCase();
+            const cOwner = companionOwnerName(c);
+            if (cServer !== serverId || cName !== requestedLower) return false;
+            return ownerNames.size === 0 || ownerNames.has(cOwner);
+        });
+
+        if (matches.length === 1 && String(matches[0]?.ownerUuid || "").trim()) {
+            const ownerUuid = String(matches[0].ownerUuid).trim().toLowerCase();
+            return `${serverId}::${channelId}::${viewerId}::${ownerUuid}::${requestedLower}`;
+        }
     }
 
-    return `${serverId}::${channelId}::${viewerId}::viewer::${requested.toLowerCase()}`;
+    if (linked.ownerUuid && (!requestedLower || String(linked.companionName || "").toLowerCase() === requestedLower)) {
+        const ownerUuid = String(linked.ownerUuid).trim().toLowerCase();
+        const linkedName = String(linked.companionName || requested).toLowerCase();
+        return `${serverId}::${channelId}::${viewerId}::${ownerUuid}::${linkedName}`;
+    }
+
+    return `${serverId}::${channelId}::${viewerId}::viewer::${requestedLower}`;
+}
+
+function findExistingCompanionState(container, viewer, companionName, canonicalKey) {
+    if (!container || typeof container !== "object") return null;
+    if (canonicalKey && container[canonicalKey]) return { key: canonicalKey, state: container[canonicalKey] };
+
+    const wallet = getWalletResolved(viewer, false) || wallets[normalizeViewer(viewer)] || null;
+    const scoped = parseScopedViewerKey(wallet?.viewer || viewer);
+    const wantedServer = normalizeServerId(scoped.serverId || firstEnabledServerId());
+    const wantedChannel = normalizeChannelId(scoped.channelId || "default");
+    const wantedViewer = normalizeViewer(scoped.viewerId || viewer);
+    const wantedCompanion = String(companionName || "").trim().toLowerCase();
+
+    const candidates = [];
+    for (const [key, state] of Object.entries(container)) {
+        if (!state || typeof state !== "object") continue;
+        const stateScoped = parseScopedViewerKey(state.viewer || "");
+        const stateServer = normalizeServerId(state.serverId || stateScoped.serverId || wantedServer);
+        const stateChannel = normalizeChannelId(state.channelId || stateScoped.channelId || wantedChannel);
+        const stateViewer = normalizeViewer(stateScoped.viewerId || state.viewer || "");
+        const stateCompanion = String(state.companionName || "").trim().toLowerCase();
+
+        if (stateServer !== wantedServer) continue;
+        if (stateChannel && wantedChannel && stateChannel !== wantedChannel) continue;
+        if (stateViewer !== wantedViewer && normalizeViewer(state.viewer || "") !== normalizeViewer(viewer)) continue;
+        if (stateCompanion !== wantedCompanion) continue;
+        candidates.push({ key, state });
+    }
+
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => (Date.parse(b.state.updatedAt || "") || 0) - (Date.parse(a.state.updatedAt || "") || 0));
+    return candidates[0];
+}
+
+function moveCompanionStateToCanonicalKey(container, existing, canonicalKey) {
+    if (!existing || !canonicalKey || existing.key === canonicalKey) return existing?.state || null;
+    if (!container[canonicalKey]) container[canonicalKey] = existing.state;
+    else {
+        const current = container[canonicalKey];
+        const incoming = existing.state;
+        const currentUpdated = Date.parse(current?.updatedAt || "") || 0;
+        const incomingUpdated = Date.parse(incoming?.updatedAt || "") || 0;
+        container[canonicalKey] = incomingUpdated > currentUpdated
+            ? { ...current, ...incoming }
+            : { ...incoming, ...current };
+    }
+    delete container[existing.key];
+    return container[canonicalKey];
 }
 
 function findExportedCompanion(serverId, minecraftName, companionName) {
@@ -2019,6 +2098,17 @@ function getForgeryState(viewer, companionName) {
     if (!key || key === "::") return null;
 
     if (!forgeryData[key]) {
+        const existing = findExistingCompanionState(forgeryData, viewer, companionName, key);
+        if (existing) {
+            moveCompanionStateToCanonicalKey(forgeryData, existing, key);
+            forgeryData[key].viewer = normalizeViewer(viewer);
+            forgeryData[key].companionName = String(companionName || "").trim();
+            saveForgery();
+            console.log(`[FORGERY] Re-linked existing state ${existing.key} -> ${key}`);
+        }
+    }
+
+    if (!forgeryData[key]) {
         forgeryData[key] = {
             viewer: normalizeViewer(viewer),
             companionName: String(companionName || "").trim(),
@@ -3526,6 +3616,18 @@ function trainingKey(viewer, companionName) {
 function getTrainingState(viewer, companionName) {
     const key = trainingKey(viewer, companionName);
     if (!key || key === "::") return null;
+
+    if (!trainingData[key]) {
+        const existing = findExistingCompanionState(trainingData, viewer, companionName, key);
+        if (existing) {
+            moveCompanionStateToCanonicalKey(trainingData, existing, key);
+            trainingData[key].viewer = normalizeViewer(viewer);
+            trainingData[key].companionName = String(companionName || "").trim();
+            saveTraining();
+            console.log(`[TRAINING] Re-linked existing state ${existing.key} -> ${key}`);
+        }
+    }
+
     if (!trainingData[key]) {
         trainingData[key] = {
             viewer: normalizeViewer(viewer),
