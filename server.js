@@ -1877,7 +1877,9 @@ const FORGERY_MODIFIERS = new Set([
     "phoenix",
     "plentiful",
     "xp_gain",
-    "pandoras_box"
+    "pandoras_box",
+    "buffed",
+    "more_mobs_cata"
 ]);
 
 const STARTER_FORGING_MODIFIERS = new Set([
@@ -1911,7 +1913,9 @@ const MODIFIER_RESEARCH = {
             "gilded",
             "living",
             "ornate",
-            "coin_pile"
+            "coin_pile",
+            "buffed",
+            "more_mobs_cata"
         ]
     },
     legendary: {
@@ -1943,7 +1947,9 @@ const MODIFIER_LABELS = {
     phoenix: "Phoenix",
     plentiful: "Plentiful",
     xp_gain: "XP Gain",
-    pandoras_box: "Pandora's Box"
+    pandoras_box: "Pandora's Box",
+    buffed: "Buffed",
+    more_mobs_cata: "Onslaught"
 };
 
 function modifierResearchTier(modifier) {
