@@ -34,6 +34,7 @@ const PRICES = {
     BUY_TRAIL: 100,
     BUY_RELIC: 125,
     BUY_ANCIENT_RELIC: 200,
+    BUY_DAILY_RELIC: 350,
     REROLL_RELIC: 150,
     REROLL_ANCIENT_RELIC: 200,
     BOTTLE_RHUM: 100,
@@ -2166,6 +2167,62 @@ function spendDirt(viewer, amount, reason) {
     return { ok: true, viewer: wallet.viewer, dirt: wallet.dirt, spent: cost, reason };
 }
 
+
+const DAILY_RELIC_MS = 24 * 60 * 60 * 1000;
+const DAILY_RELIC_COMMON = [
+    "the_vault:ornate_cascade", "the_vault:living_cascade", "the_vault:gilded_cascade",
+    "the_vault:wooden_cascade", "the_vault:coin_cascade", "the_vault:plentiful",
+    "the_vault:companion_challenge"
+];
+const DAILY_RELIC_RARE = [
+    "the_vault:ornate_mob_drops", "the_vault:living_mob_drops", "the_vault:gilded_mob_drops",
+    "the_vault:wooden_mob_drops", "the_vault:pandoras_box", "the_vault:coin_pile",
+    "the_vault:buffed", "the_vault:more_mobs_cata"
+];
+const DAILY_RELIC_LEGENDARY = ["the_vault:phoenix", "the_vault:extended", "the_vault:xp_gain"];
+
+function seededDailyRandom(seed) {
+    let x = (seed >>> 0) || 0x9e3779b9;
+    return function() {
+        x += 0x6D2B79F5;
+        let t = x;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+function currentDailyRelicOffer(now = Date.now()) {
+    const key = Math.floor(now / DAILY_RELIC_MS);
+    const random = seededDailyRandom(key ^ 0x51f15e);
+    const roll = random() * 100;
+    const slots = roll < 45 ? 4 : (roll < 85 ? 5 : 6); // pretty good, but still below intentional Forgery builds
+    const modifiers = [];
+
+    function count(id) { return modifiers.filter(value => value === id).length; }
+    for (let i = 0; i < slots; i++) {
+        for (let attempt = 0; attempt < 40; attempt++) {
+            const rarityRoll = random() * 100;
+            const pool = rarityRoll < 55 ? DAILY_RELIC_COMMON : (rarityRoll < 90 ? DAILY_RELIC_RARE : DAILY_RELIC_LEGENDARY);
+            const candidate = pool[Math.floor(random() * pool.length)];
+            const legendary = DAILY_RELIC_LEGENDARY.includes(candidate);
+            if ((legendary && count(candidate) === 0) || (!legendary && count(candidate) < 2)) {
+                modifiers.push(candidate);
+                break;
+            }
+        }
+    }
+
+    return {
+        key: String(key),
+        price: PRICES.BUY_DAILY_RELIC,
+        slots,
+        modifiers,
+        startsAt: key * DAILY_RELIC_MS,
+        expiresAt: (key + 1) * DAILY_RELIC_MS
+    };
+}
+
 function queueShopAction(action) {
     const parsed = parseScopedViewerKey(action && action.viewer || "");
     const request = {
@@ -2965,6 +3022,82 @@ app.post("/shop/buy-trail", (req, res) => {
     res.json({ ok: true, request, wallet: spend });
 });
 app.post("/shop/trail", (req, res) => { req.body.companionName = req.body.companionName || req.body.viewer; return app._router.handle({ ...req, url: "/shop/buy-trail", method: "POST" }, res, () => {}); });
+
+app.get("/shop/daily-relic", (req, res) => {
+    const offer = currentDailyRelicOffer();
+    const viewer = scopeViewerFromRequest(req, req.query.viewer || "");
+    const companionName = String(req.query.companionName || "").trim();
+    let purchased = false;
+    if (viewer && companionName) {
+        const state = getTrainingState(viewer, companionName);
+        purchased = String(state?.dailyFeaturedRelicPurchaseKey || "") === offer.key;
+    }
+    res.json({ ok: true, offer: { ...offer, purchased } });
+});
+
+app.post("/shop/trade-fragments", (req, res) => {
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
+    const companionName = String(req.body.companionName || "").trim();
+    const direction = String(req.body.direction || "").trim().toLowerCase();
+    if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
+    const state = getTrainingState(viewer, companionName);
+    if (!state) return res.status(400).json({ ok: false, error: "Training state unavailable" });
+    state.relicFragments = Number(state.relicFragments || 0);
+    state.ancientRelicFragments = Number(state.ancientRelicFragments || 0);
+
+    if (direction === "relic_to_ancient") {
+        if (state.relicFragments < 5) return res.status(400).json({ ok: false, error: "You need 5 Relic Fragments." });
+        state.relicFragments -= 5;
+        state.ancientRelicFragments += 1;
+        addTrainingHistory(state, "Shop trade: 5 Relic Fragments → 1 Ancient Relic Fragment.");
+    } else if (direction === "ancient_to_relic") {
+        if (state.ancientRelicFragments < 1) return res.status(400).json({ ok: false, error: "You need 1 Ancient Relic Fragment." });
+        state.ancientRelicFragments -= 1;
+        state.relicFragments += 5;
+        addTrainingHistory(state, "Shop trade: 1 Ancient Relic Fragment → 5 Relic Fragments.");
+    } else {
+        return res.status(400).json({ ok: false, error: "Invalid fragment trade." });
+    }
+
+    state.updatedAt = new Date().toISOString();
+    saveTraining();
+    res.json({ ok: true, training: publicTrainingState(state) });
+});
+
+app.post("/shop/buy-daily-relic", (req, res) => {
+    const viewer = scopeViewerFromRequest(req, req.body.viewer);
+    const companionName = String(req.body.companionName || req.body.viewer || "").trim();
+    const slot = Number(req.body.slot);
+    if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion" });
+    if (!Number.isInteger(slot) || slot < 0 || slot > 3) return res.status(400).json({ ok: false, error: "Choose a valid normal relic slot." });
+
+    const offer = currentDailyRelicOffer();
+    const state = getTrainingState(viewer, companionName);
+    if (String(state?.dailyFeaturedRelicPurchaseKey || "") === offer.key) {
+        return res.status(400).json({ ok: false, error: "You already bought today's featured relic." });
+    }
+
+    const spend = spendDirt(viewer, offer.price, "buy_daily_relic");
+    if (!spend.ok) return res.status(400).json(spend);
+
+    state.dailyFeaturedRelicPurchaseKey = offer.key;
+    state.updatedAt = new Date().toISOString();
+    addTrainingHistory(state, `Bought Daily Relic (${offer.modifiers.length} modifiers) for ${offer.price} Dirt.`);
+    saveTraining();
+
+    const request = queueShopAction({
+        action: "buy_daily_relic",
+        viewer,
+        companionName,
+        ...shopCompanionFields(req),
+        slot,
+        modifiers: offer.modifiers,
+        dailyRelicKey: offer.key,
+        cost: offer.price
+    });
+    res.json({ ok: true, request, wallet: spend, training: publicTrainingState(state), offer });
+});
+
 app.post("/shop/buy-relic", (req, res) => {
     const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || req.body.viewer || "").trim();
