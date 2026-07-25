@@ -1500,17 +1500,17 @@ function resolveWalletKeyForChannel(requestedViewer, channelInput, serverIdOverr
     const raw = String(requestedViewer || "").trim();
     const wanted = normalizeViewer(raw);
 
-    if (!wanted) {
-        return { key: "", channelId: "", serverId: normalizeServerId(serverIdOverride), matchedBy: "missing" };
-    }
+    if (!wanted) return { key: "", channelId: "", serverId: normalizeServerId(serverIdOverride), matchedBy: "missing" };
 
     const parsedInput = parseScopedViewerKey(raw);
     const serverId = normalizeServerId(serverIdOverride || parsedInput.serverId || resolveServerIdFromChannel(channelInput));
     const channelId = resolveChannelIdInput(channelInput || parsedInput.channelId, serverId);
+    if (!channelId) return { key: "", channelId: "", serverId, matchedBy: "invalid_channel" };
 
-    if (!channelId) {
-        return { key: "", channelId: "", serverId, matchedBy: "invalid_channel" };
-    }
+    // Convert configured Twitch names (e.g. DjHilha) to their canonical numeric
+    // Twitch ID BEFORE resolving a wallet. This is the critical rule that keeps
+    // /mm dirt DjHilha 500 DjHilha on the same row created by the extension.
+    const canonicalViewerId = normalizeViewer(resolveViewerIdInput(raw, serverId) || parsedInput.viewerId || wanted);
 
     const channelWallets = Object.entries(wallets || {}).filter(([key, wallet]) => {
         if (!wallet) return false;
@@ -1519,44 +1519,26 @@ function resolveWalletKeyForChannel(requestedViewer, channelInput, serverIdOverr
             && normalizeChannelId(parsed.channelId || "") === channelId;
     });
 
-    // Exact display name must always win inside the requested channel.
-    const exactDisplayMatches = channelWallets.filter(([, wallet]) =>
-        normalizeViewer(wallet.displayName || "") === wanted
-    );
-
-    if (exactDisplayMatches.length === 1) {
-        return { key: exactDisplayMatches[0][0], channelId, serverId, matchedBy: "exact_display_name" };
-    }
-
-    if (exactDisplayMatches.length > 1) {
-        return { key: "", channelId, serverId, matchedBy: "ambiguous_display_name" };
-    }
-
-    // Exact scoped wallet key.
-    if (!wanted.includes("::")) {
-        const exactScoped = scopedViewerKey(raw, channelId, serverId);
-        if (wallets[exactScoped]) {
-            return { key: exactScoped, channelId, serverId, matchedBy: "exact_scoped_viewer" };
-        }
-    }
-
-    // Exact Twitch/viewer ID inside the requested channel.
-    const exactIdentityMatches = channelWallets.filter(([key, wallet]) => {
+    // Canonical numeric identity wins over display names/aliases.
+    const identityMatches = channelWallets.filter(([key, wallet]) => {
         const parsed = parseScopedViewerKey(wallet.viewer || key);
         const viewerId = normalizeViewer(parsed.viewerId || "");
         const twitchId = normalizeViewer(wallet.twitchId || "");
-        return viewerId === wanted || twitchId === wanted;
+        return viewerId === canonicalViewerId || twitchId === canonicalViewerId;
     });
+    if (identityMatches.length === 1) return { key: identityMatches[0][0], channelId, serverId, matchedBy: "canonical_twitch_id" };
+    if (identityMatches.length > 1) return { key: "", channelId, serverId, matchedBy: "ambiguous_canonical_identity" };
 
-    if (exactIdentityMatches.length === 1) {
-        return { key: exactIdentityMatches[0][0], channelId, serverId, matchedBy: "exact_identity" };
-    }
+    // Check the exact canonical scoped key used by extension-created wallets.
+    const canonicalScoped = scopedViewerKey(canonicalViewerId, channelId, serverId);
+    if (wallets[canonicalScoped]) return { key: canonicalScoped, channelId, serverId, matchedBy: "canonical_scoped_viewer" };
 
-    if (exactIdentityMatches.length > 1) {
-        return { key: "", channelId, serverId, matchedBy: "ambiguous_identity" };
-    }
+    // For ordinary viewer names (not configured broadcaster aliases), retain
+    // exact display-name convenience, but never let it beat a Twitch ID match.
+    const exactDisplayMatches = channelWallets.filter(([, wallet]) => normalizeViewer(wallet.displayName || "") === wanted);
+    if (exactDisplayMatches.length === 1) return { key: exactDisplayMatches[0][0], channelId, serverId, matchedBy: "exact_display_name" };
+    if (exactDisplayMatches.length > 1) return { key: "", channelId, serverId, matchedBy: "ambiguous_display_name" };
 
-    // Never resolve Dirt commands through companion/owner aliases.
     return { key: "", channelId, serverId, matchedBy: "not_found" };
 }
 
@@ -1587,7 +1569,7 @@ function publicWallet(wallet) {
         dirt: Number(wallet.dirt || 0),
         twitchId: String(wallet.twitchId || ""),
         displayName: String(wallet.displayName || wallet.viewer || ""),
-        serverId: linked.serverId || firstEnabledServerId(),
+        serverId: parseScopedViewerKey(wallet.viewer).serverId || linked.serverId || firstEnabledServerId(),
         ownerUuid: linked.ownerUuid || "",
         ownerName: linked.ownerName || "",
         minecraftName: linked.ownerName || "",
