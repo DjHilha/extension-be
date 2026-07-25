@@ -13,6 +13,7 @@ const QUEUE_FILE = path.join(DATA_DIR, "shop_queue.json");
 const WATCHERS_FILE = path.join(DATA_DIR, "watchers.json");
 const FORGERY_FILE = path.join(DATA_DIR, "forgery.json");
 const TRAINING_FILE = path.join(DATA_DIR, "training_center.json");
+const RESET_STATE_FILE = path.join(DATA_DIR, "reset_state.json");
 const STREAMER_CHANNELS_FILE = path.join(DATA_DIR, "streamer_channels.json");
 const STREAMER_CHANNELS_REPO_FILE = path.join(__dirname, "streamer_channels.json");
 
@@ -68,6 +69,7 @@ let watchers = {};
 let forgeryData = {};
 let trainingData = {};
 let streamerChannels = {};
+let backendResetState = { epoch: 0 };
 
 // streamer_channels.json is the single source of truth for servers, Twitch channels,
 // Minecraft owners and owner UUIDs. There are no streamer/server fallbacks in code.
@@ -294,10 +296,12 @@ function loadStreamerChannels() {
 }
 
 function firstEnabledServerId() {
-    for (const [serverId, config] of Object.entries(streamerChannels.servers || {})) {
-        if (config && config.enabled !== false) return serverId;
-    }
-    return "default";
+    // When several seasons remain configured (for example S3 + S4), use the
+    // last enabled entry as the fallback/current season. Explicit serverId
+    // values sent by the mod/extension still always win.
+    const enabled = Object.entries(streamerChannels.servers || {})
+        .filter(([, config]) => config && config.enabled !== false);
+    return enabled.length > 0 ? enabled[enabled.length - 1][0] : "default";
 }
 
 function firstChannelId(serverIdOverride = "") {
@@ -310,16 +314,33 @@ function firstChannelId(serverIdOverride = "") {
 
 function resolveServerIdFromChannel(channelId) {
     const wanted = String(channelId || "").trim();
+    let matchedServer = "";
+
+    // Old and new seasons can contain the same Twitch channels. Prefer the
+    // last matching enabled server instead of silently falling back to S3.
     for (const [serverId, config] of Object.entries(streamerChannels.servers || {})) {
         if (!config || config.enabled === false) continue;
         const channels = config.channels || {};
-        if (!wanted) return serverId;
-        if (Object.prototype.hasOwnProperty.call(channels, wanted)) return serverId;
+
+        if (!wanted) {
+            matchedServer = serverId;
+            continue;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(channels, wanted)) {
+            matchedServer = serverId;
+            continue;
+        }
+
         for (const name of Object.values(channels)) {
-            if (String(name || "").toLowerCase() === wanted.toLowerCase()) return serverId;
+            if (String(name || "").toLowerCase() === wanted.toLowerCase()) {
+                matchedServer = serverId;
+                break;
+            }
         }
     }
-    return firstEnabledServerId();
+
+    return matchedServer || firstEnabledServerId();
 }
 
 function normalizeOwnerName(value) {
@@ -629,6 +650,9 @@ async function loadPersistentData() {
     // survives Render restarts/redeploys.
     forgeryData = readJsonFile(FORGERY_FILE, {});
     trainingData = readJsonFile(TRAINING_FILE, {});
+    backendResetState = readJsonFile(RESET_STATE_FILE, { epoch: 0 });
+    if (!backendResetState || typeof backendResetState !== "object") backendResetState = { epoch: 0 };
+    backendResetState.epoch = Number(backendResetState.epoch || 0);
     for (const state of Object.values(trainingData || {})) migrateLegacyModifierKnowledge(state);
 
     await loadWalletsFromSupabase();
@@ -1500,17 +1524,28 @@ function resolveWalletKeyForChannel(requestedViewer, channelInput, serverIdOverr
     const raw = String(requestedViewer || "").trim();
     const wanted = normalizeViewer(raw);
 
-    if (!wanted) return { key: "", channelId: "", serverId: normalizeServerId(serverIdOverride), matchedBy: "missing" };
+    if (!wanted) {
+        return { key: "", channelId: "", serverId: normalizeServerId(serverIdOverride), matchedBy: "missing" };
+    }
 
-    const parsedInput = parseScopedViewerKey(raw);
-    const serverId = normalizeServerId(serverIdOverride || parsedInput.serverId || resolveServerIdFromChannel(channelInput));
-    const channelId = resolveChannelIdInput(channelInput || parsedInput.channelId, serverId);
-    if (!channelId) return { key: "", channelId: "", serverId, matchedBy: "invalid_channel" };
+    // A plain value such as "DjHilha" is NOT a scoped viewer key. Do not let
+    // parseScopedViewerKey() inject an old fallback server into admin commands.
+    const rawParts = wanted.split("::");
+    const hasExplicitScope = rawParts.length >= 3 && streamerChannels?.servers?.[rawParts[0]];
+    const explicitlyScopedServer = hasExplicitScope ? normalizeServerId(rawParts[0]) : "";
+    const explicitlyScopedChannel = hasExplicitScope ? normalizeChannelId(rawParts[1]) : "";
 
-    // Convert configured Twitch names (e.g. DjHilha) to their canonical numeric
-    // Twitch ID BEFORE resolving a wallet. This is the critical rule that keeps
-    // /mm dirt DjHilha 500 DjHilha on the same row created by the extension.
-    const canonicalViewerId = normalizeViewer(resolveViewerIdInput(raw, serverId) || parsedInput.viewerId || wanted);
+    const serverId = normalizeServerId(
+        serverIdOverride ||
+        explicitlyScopedServer ||
+        resolveServerIdFromChannel(channelInput)
+    );
+
+    const channelId = resolveChannelIdInput(channelInput || explicitlyScopedChannel, serverId);
+
+    if (!channelId) {
+        return { key: "", channelId: "", serverId, matchedBy: "invalid_channel" };
+    }
 
     const channelWallets = Object.entries(wallets || {}).filter(([key, wallet]) => {
         if (!wallet) return false;
@@ -1519,26 +1554,77 @@ function resolveWalletKeyForChannel(requestedViewer, channelInput, serverIdOverr
             && normalizeChannelId(parsed.channelId || "") === channelId;
     });
 
-    // Canonical numeric identity wins over display names/aliases.
-    const identityMatches = channelWallets.filter(([key, wallet]) => {
+    // Configured Twitch names are converted to the canonical numeric Twitch ID
+    // before display-name matching. Example: DjHilha -> 145555184.
+    const canonicalViewerId = normalizeViewer(resolveViewerIdInput(wanted, serverId) || "");
+
+    // Twitch identity is authoritative.
+    const exactIdentityMatches = channelWallets.filter(([key, wallet]) => {
         const parsed = parseScopedViewerKey(wallet.viewer || key);
         const viewerId = normalizeViewer(parsed.viewerId || "");
         const twitchId = normalizeViewer(wallet.twitchId || "");
-        return viewerId === canonicalViewerId || twitchId === canonicalViewerId;
+        return (
+            viewerId === wanted ||
+            twitchId === wanted ||
+            (canonicalViewerId && (viewerId === canonicalViewerId || twitchId === canonicalViewerId))
+        );
     });
-    if (identityMatches.length === 1) return { key: identityMatches[0][0], channelId, serverId, matchedBy: "canonical_twitch_id" };
-    if (identityMatches.length > 1) return { key: "", channelId, serverId, matchedBy: "ambiguous_canonical_identity" };
 
-    // Check the exact canonical scoped key used by extension-created wallets.
-    const canonicalScoped = scopedViewerKey(canonicalViewerId, channelId, serverId);
-    if (wallets[canonicalScoped]) return { key: canonicalScoped, channelId, serverId, matchedBy: "canonical_scoped_viewer" };
+    if (exactIdentityMatches.length === 1) {
+        return {
+            key: exactIdentityMatches[0][0],
+            channelId,
+            serverId,
+            matchedBy: canonicalViewerId ? "canonical_twitch_identity" : "exact_identity"
+        };
+    }
 
-    // For ordinary viewer names (not configured broadcaster aliases), retain
-    // exact display-name convenience, but never let it beat a Twitch ID match.
-    const exactDisplayMatches = channelWallets.filter(([, wallet]) => normalizeViewer(wallet.displayName || "") === wanted);
-    if (exactDisplayMatches.length === 1) return { key: exactDisplayMatches[0][0], channelId, serverId, matchedBy: "exact_display_name" };
-    if (exactDisplayMatches.length > 1) return { key: "", channelId, serverId, matchedBy: "ambiguous_display_name" };
+    if (exactIdentityMatches.length > 1) {
+        if (canonicalViewerId) {
+            const canonicalKey = scopedViewerKey(canonicalViewerId, channelId, serverId);
+            const canonical = exactIdentityMatches.find(([key]) =>
+                normalizeViewer(key) === normalizeViewer(canonicalKey)
+            );
+            if (canonical) {
+                return {
+                    key: canonical[0],
+                    channelId,
+                    serverId,
+                    matchedBy: "canonical_scoped_identity"
+                };
+            }
+        }
+        return { key: "", channelId, serverId, matchedBy: "ambiguous_identity" };
+    }
 
+    if (canonicalViewerId) {
+        const canonicalKey = scopedViewerKey(canonicalViewerId, channelId, serverId);
+        if (wallets[canonicalKey]) {
+            return { key: canonicalKey, channelId, serverId, matchedBy: "canonical_scoped_viewer" };
+        }
+    }
+
+    if (!wanted.includes("::")) {
+        const exactScoped = scopedViewerKey(raw, channelId, serverId);
+        if (wallets[exactScoped]) {
+            return { key: exactScoped, channelId, serverId, matchedBy: "exact_scoped_viewer" };
+        }
+    }
+
+    // Display-name aliases are only a fallback after canonical Twitch identity.
+    const exactDisplayMatches = channelWallets.filter(([, wallet]) =>
+        normalizeViewer(wallet.displayName || "") === wanted
+    );
+
+    if (exactDisplayMatches.length === 1) {
+        return { key: exactDisplayMatches[0][0], channelId, serverId, matchedBy: "exact_display_name" };
+    }
+
+    if (exactDisplayMatches.length > 1) {
+        return { key: "", channelId, serverId, matchedBy: "ambiguous_display_name" };
+    }
+
+    // Admin Dirt commands must never invent a second wallet.
     return { key: "", channelId, serverId, matchedBy: "not_found" };
 }
 
@@ -1561,15 +1647,16 @@ function walletKeysForChannel(channelInput, serverIdOverride = "") {
 function publicWallet(wallet) {
     if (!wallet) return null;
     const linked = parseCompanionLink(wallet.companionName);
+    const scoped = parseScopedViewerKey(wallet.viewer || "");
 
     return {
         viewer: wallet.viewer,
-        channelId: parseScopedViewerKey(wallet.viewer).channelId || "",
-        rawViewer: parseScopedViewerKey(wallet.viewer).viewerId || wallet.viewer,
+        channelId: scoped.channelId || "",
+        rawViewer: scoped.viewerId || wallet.viewer,
         dirt: Number(wallet.dirt || 0),
         twitchId: String(wallet.twitchId || ""),
         displayName: String(wallet.displayName || wallet.viewer || ""),
-        serverId: parseScopedViewerKey(wallet.viewer).serverId || linked.serverId || firstEnabledServerId(),
+        serverId: scoped.serverId || linked.serverId || firstEnabledServerId(),
         ownerUuid: linked.ownerUuid || "",
         ownerName: linked.ownerName || "",
         minecraftName: linked.ownerName || "",
@@ -2923,6 +3010,14 @@ app.post("/admin/migrate-server-wallets", requireApiKey, async (req, res) => {
     res.json({ ok: true, fromServer, toServer, migrated, created, updated, sourcePreserved: true, companionLinksMigrated: false });
 });
 
+app.get("/reset-state", (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json({
+        ok: true,
+        epoch: Number(backendResetState?.epoch || 0)
+    });
+});
+
 app.post("/admin/reset-backend", requireApiKey, async (req, res) => {
     const confirm = String(req.body.confirm || "").trim().toLowerCase();
     if (confirm !== "confirm") {
@@ -2949,6 +3044,20 @@ app.post("/admin/reset-backend", requireApiKey, async (req, res) => {
             await supabaseRequest('/wallets?viewer=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
             await supabaseRequest('/training_center?key=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
             await supabaseRequest('/forgery?key=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+
+            // Legacy viewer_links is no longer used, but wipe it too if the table
+            // still exists so a nuclear reset truly removes all old Twitch links.
+            try {
+                await supabaseRequest('/viewer_links?viewer=not.is.null', {
+                    method: 'DELETE',
+                    headers: { Prefer: 'return=minimal' }
+                });
+            } catch (viewerLinksError) {
+                // Deployments without the legacy table are fine.
+                if (!String(viewerLinksError?.message || viewerLinksError).includes('404')) {
+                    console.warn('[ADMIN] Could not clear legacy viewer_links table:', String(viewerLinksError?.message || viewerLinksError));
+                }
+            }
         } catch (error) {
             console.error('[ADMIN] Full backend reset failed while clearing Supabase.', error);
             return res.status(500).json({ ok: false, error: 'Failed clearing Supabase; local state was not reset.', detail: String(error.message || error) });
@@ -2971,8 +3080,20 @@ app.post("/admin/reset-backend", requireApiKey, async (req, res) => {
     writeJsonFile(WATCHERS_FILE, watchers);
     writeJsonFile(QUEUE_FILE, shopActionQueue);
 
-    console.log(`[ADMIN] FULL BACKEND RESET completed. Previous state: ${JSON.stringify(before)}`);
-    res.json({ ok: true, reset: 'everything', before, configurationPreserved: true });
+    // Persist a reset generation. Extension clients compare this value with the
+    // last generation they have seen; a change forces local companion/Twitch
+    // identity caches to be cleared exactly once.
+    backendResetState = { epoch: Date.now() };
+    writeJsonFile(RESET_STATE_FILE, backendResetState);
+
+    console.log(`[ADMIN] FULL BACKEND RESET completed. Previous state: ${JSON.stringify(before)} resetEpoch=${backendResetState.epoch}`);
+    res.json({
+        ok: true,
+        reset: 'everything',
+        before,
+        resetEpoch: backendResetState.epoch,
+        configurationPreserved: true
+    });
 });
 
 app.post("/admin/reset-player", requireApiKey, (req, res) => {
