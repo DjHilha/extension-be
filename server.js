@@ -2612,8 +2612,14 @@ app.get("/viewer-init/:viewer", (req, res) => {
     const requestedViewer = String(req.params.viewer || req.query.viewer || "").trim();
     const scopedViewer = requestedViewer ? scopeViewerFromRequest(req, requestedViewer) : "";
 
+    // STRICT multi-streamer isolation:
+    // when a channel is supplied, never fall back to the same viewer's wallet
+    // from another streamer/channel. A viewer can own one separate companion
+    // on Hilha, Paage, Rhaw, etc.
     let wallet = scopedViewer ? getWalletResolved(scopedViewer, false) : null;
-    if (!wallet && requestedViewer) wallet = getWalletResolved(requestedViewer, false);
+    if (!wallet && requestedViewer && !channelId) {
+        wallet = getWalletResolved(requestedViewer, false);
+    }
 
     let list = Array.isArray(companionsData.companions) ? companionsData.companions.slice() : [];
     list = list.filter(c => normalizeServerId(c.serverId || serverId) === serverId);
@@ -2743,8 +2749,13 @@ app.post("/tasks", requireApiKey, (req, res) => {
     res.json({ ok: true, serverId: scope.serverId, channelId: scope.channelId, active: scopedTasks.active, count: scopedTasks.tasks.length });
 });
 app.get("/wallet/:viewer", (req, res) => {
+    const channelId = req.query.channelId || req.headers["x-channel-id"] || "";
     const scopedViewer = scopeViewerFromRequest(req, req.params.viewer);
-    const wallet = getWalletResolved(scopedViewer, false) || getWalletResolved(req.params.viewer, false);
+
+    // Never let a wallet from another Twitch channel satisfy a channel-scoped
+    // request. This is critical for one-viewer / multiple-streamer companions.
+    let wallet = scopedViewer ? getWalletResolved(scopedViewer, false) : null;
+    if (!wallet && !channelId) wallet = getWalletResolved(req.params.viewer, false);
 
     if (!wallet) {
         return res.status(404).json({
@@ -3394,49 +3405,76 @@ app.get("/watch/:viewer", (req, res) => {
 
 
 app.post("/shop/create-companion", (req, res) => {
-    const viewer = scopeViewerFromRequest(req, req.body.viewer);
-    const companionName = String(req.body.companionName || "").trim();
-    const minecraftName = String(
-        req.body.minecraftName ||
-        req.body.minecraftNameOverride ||
-        req.body.ownerName ||
-        companionName
-    ).trim();
-    const channelId = req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || "";
-    const serverId = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(channelId));
+    const rawChannel = req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || "";
+    const requestedServer = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(rawChannel));
+    const configured = configuredStreamerOwner(requestedServer, rawChannel);
 
-    if (!viewer || !companionName) return res.status(400).json({ ok: false, error: "Missing viewer or companion name" });
-
-    if (companionNameExistsForOwner(serverId, minecraftName, companionName)) {
+    if (!configured.channelId) {
         return res.status(400).json({
             ok: false,
-            error: "You already have a companion with that name",
-            companionName,
-            minecraftName
+            error: "Unknown streamer channel. Check streamer_channels.json."
         });
     }
 
-    const spend = spendDirt(viewer, PRICES.CREATE_COMPANION, "create_companion");
+    if (!configured.ownerName) {
+        return res.status(400).json({
+            ok: false,
+            error: "No Minecraft owner configured for this streamer channel."
+        });
+    }
+
+    // Scope the viewer to THIS streamer before any wallet/companion checks.
+    const viewer = scopedViewerKey(req.body.viewer, configured.channelId, configured.serverId);
+    const companionName = String(req.body.companionName || "").trim();
+
+    if (!viewer || !companionName) {
+        return res.status(400).json({ ok: false, error: "Missing viewer or companion name" });
+    }
+
+    // The selected Twitch channel is the only authority for Minecraft ownership.
+    // Never trust minecraftName/ownerName sent by a stale extension client.
+    const minecraftOwner = configured.ownerName;
+
+    if (companionNameExistsForOwner(configured.serverId, minecraftOwner, companionName)) {
+        return res.status(400).json({
+            ok: false,
+            error: "A companion with that name already exists for this streamer",
+            companionName,
+            minecraftName: minecraftOwner,
+            channelId: configured.channelId,
+            serverId: configured.serverId
+        });
+    }
+
+    // Spend Dirt only from the wallet on THIS streamer/channel.
+    const spend = spendDirt(
+        viewer,
+        PRICES.CREATE_COMPANION,
+        "create_companion",
+        configured.channelId,
+        configured.serverId
+    );
     if (!spend.ok) return res.status(400).json(spend);
 
-    const linkedWallet =
-            linkWalletCompanion(
-                    viewer,
-                    req.body.twitchId || "",
-                    req.body.displayName || viewer,
-                    companionName,
-                    minecraftName,
-                    channelId,
-                    serverId
-            );
+    const linkedWallet = linkWalletCompanion(
+        viewer,
+        req.body.twitchId || "",
+        req.body.displayName || req.body.viewer || viewer,
+        companionName,
+        minecraftOwner,
+        configured.channelId,
+        configured.serverId
+    );
 
     const request = queueShopAction({
         action: "create_companion",
         viewer,
         companionName,
-        minecraftName,
-        ownerName: minecraftName,
-        serverId,
+        minecraftName: minecraftOwner,
+        ownerName: minecraftOwner,
+        ownerUuid: configured.ownerUuid,
+        channelId: configured.channelId,
+        serverId: configured.serverId,
         cost: PRICES.CREATE_COMPANION
     });
 
@@ -3450,6 +3488,7 @@ app.post("/shop/create-companion", (req, res) => {
         }
     });
 });
+
 app.post("/shop/buy-trail", (req, res) => {
     const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || req.body.viewer || "").trim();
@@ -5014,25 +5053,52 @@ app.post("/admin/academy/set", requireApiKey, (req, res) => {
 
 
 app.post("/viewer-link", (req, res) => {
-    const viewer = scopeViewerFromRequest(req, req.body.viewer);
+    const rawChannel = String(req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || "").trim();
+    const requestedServer = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(rawChannel));
+    const configured = configuredStreamerOwner(requestedServer, rawChannel);
+
+    if (!configured.channelId) {
+        return res.status(400).json({ ok: false, error: "Unknown streamer channel" });
+    }
+
+    const viewer = scopedViewerKey(req.body.viewer, configured.channelId, configured.serverId);
     const twitchId = String(req.body.twitchId || "").trim();
-    const displayName = String(req.body.displayName || viewer).trim();
+    const displayName = String(req.body.displayName || req.body.viewer || viewer).trim();
     const companionName = String(req.body.companionName || "").trim();
-    const minecraftName = String(req.body.minecraftName || req.body.ownerName || "").trim();
-    const channelId = String(req.body.channelId || "").trim();
-    const serverId = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(channelId));
 
     if (!viewer) {
         return res.status(400).json({ ok: false, error: "Missing viewer" });
     }
 
-    if (companionName && !minecraftName) {
-        return res.status(400).json({ ok: false, error: "Enter the Minecraft owner name too, so companions with the same name do not mix." });
+    // A viewer's linked companion is channel-specific. Its Minecraft owner is
+    // always the streamer configured for that channel.
+    const minecraftOwner = configured.ownerName;
+
+    if (companionName && !minecraftOwner) {
+        return res.status(400).json({
+            ok: false,
+            error: "No Minecraft owner configured for this streamer channel."
+        });
     }
 
-    const wallet = linkWalletCompanion(viewer, twitchId, displayName, companionName, minecraftName, channelId, serverId);
+    const wallet = linkWalletCompanion(
+        viewer,
+        twitchId,
+        displayName,
+        companionName,
+        minecraftOwner,
+        configured.channelId,
+        configured.serverId
+    );
 
-    res.json({ ok: true, serverId, wallet: publicWallet(wallet) });
+    res.json({
+        ok: true,
+        serverId: configured.serverId,
+        channelId: configured.channelId,
+        ownerName: minecraftOwner,
+        ownerUuid: configured.ownerUuid,
+        wallet: publicWallet(wallet)
+    });
 });
 
 app.post("/wallet/alias", requireApiKey, (req, res) => {
