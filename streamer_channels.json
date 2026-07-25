@@ -27,7 +27,6 @@
         }
       ]
     },
-
     "meowtys_s4": {
       "enabled": true,
       "name": "Meowtys S4",
@@ -40,6 +39,10 @@
         {
           "id": "133543020",
           "name": "HalosiaPaage"
+        },
+        {
+          "id": "137872876",
+          "name": "rhaw_g"
         }
       ],
       "owners": [
@@ -52,6 +55,11 @@
           "id": "133543020",
           "ingameName": "HalosiaPaage",
           "minecraftUuid": "bc5cd9bb-0fc5-4bbe-b6a1-b7e73ea7b608"
+        },
+        {
+          "id": "137872876",
+          "ingameName": "Rhaw_G",
+          "minecraftUuid": "850312d2-a8d4-426c-b964-cef26e27a0e2"
         }
       ]
     }
