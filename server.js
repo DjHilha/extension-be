@@ -2941,6 +2941,58 @@ app.post("/admin/migrate-server-wallets", requireApiKey, async (req, res) => {
     res.json({ ok: true, fromServer, toServer, migrated, created, updated, sourcePreserved: true, companionLinksMigrated: false });
 });
 
+app.post("/admin/reset-backend", requireApiKey, async (req, res) => {
+    const confirm = String(req.body.confirm || "").trim().toLowerCase();
+    if (confirm !== "confirm") {
+        return res.status(400).json({ ok: false, error: "Confirmation required" });
+    }
+
+    const before = {
+        wallets: Object.keys(wallets || {}).length,
+        training: Object.keys(trainingData || {}).length,
+        forgery: Object.keys(forgeryData || {}).length,
+        watchers: Object.keys(watchers || {}).length,
+        queuedActions: Array.isArray(shopActionQueue) ? shopActionQueue.length : 0,
+        companions: Array.isArray(companionsData?.companions) ? companionsData.companions.length : 0
+    };
+
+    // Cancel pending delayed writes first so old state cannot be written back after the wipe.
+    if (walletSyncTimer) { clearTimeout(walletSyncTimer); walletSyncTimer = null; }
+    if (trainingSyncTimer) { clearTimeout(trainingSyncTimer); trainingSyncTimer = null; }
+    if (forgerySyncTimer) { clearTimeout(forgerySyncTimer); forgerySyncTimer = null; }
+
+    if (USE_SUPABASE) {
+        try {
+            // PostgREST requires a filter for DELETE. These filters match all non-null keys.
+            await supabaseRequest('/wallets?viewer=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+            await supabaseRequest('/training_center?key=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+            await supabaseRequest('/forgery?key=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+        } catch (error) {
+            console.error('[ADMIN] Full backend reset failed while clearing Supabase.', error);
+            return res.status(500).json({ ok: false, error: 'Failed clearing Supabase; local state was not reset.', detail: String(error.message || error) });
+        }
+    }
+
+    // Clear every runtime/cache data store, but keep configuration such as streamer_channels.json.
+    wallets = {};
+    trainingData = {};
+    forgeryData = {};
+    watchers = {};
+    shopActionQueue = [];
+    companionsData = { companions: [] };
+    tasksData = { active: false, tasks: [] };
+    tasksDataByChannel = {};
+
+    writeJsonFile(WALLETS_FILE, wallets);
+    writeJsonFile(TRAINING_FILE, trainingData);
+    writeJsonFile(FORGERY_FILE, forgeryData);
+    writeJsonFile(WATCHERS_FILE, watchers);
+    writeJsonFile(QUEUE_FILE, shopActionQueue);
+
+    console.log(`[ADMIN] FULL BACKEND RESET completed. Previous state: ${JSON.stringify(before)}`);
+    res.json({ ok: true, reset: 'everything', before, configurationPreserved: true });
+});
+
 app.post("/admin/reset-player", requireApiKey, (req, res) => {
     const requestedViewer = String(req.body.viewer || req.body.twitchName || req.body.displayName || "").trim();
     const minecraftName = String(req.body.minecraftName || req.body.ownerName || requestedViewer || "").trim();
