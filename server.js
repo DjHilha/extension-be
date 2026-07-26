@@ -14,6 +14,7 @@ const WATCHERS_FILE = path.join(DATA_DIR, "watchers.json");
 const FORGERY_FILE = path.join(DATA_DIR, "forgery.json");
 const TRAINING_FILE = path.join(DATA_DIR, "training_center.json");
 const RESET_STATE_FILE = path.join(DATA_DIR, "reset_state.json");
+const ENCOUNTERS_FILE = path.join(DATA_DIR, "encounters.json");
 const STREAMER_CHANNELS_FILE = path.join(DATA_DIR, "streamer_channels.json");
 const STREAMER_CHANNELS_REPO_FILE = path.join(__dirname, "streamer_channels.json");
 
@@ -70,6 +71,7 @@ let forgeryData = {};
 let trainingData = {};
 let streamerChannels = {};
 let backendResetState = { epoch: 0 };
+let encountersData = {};
 
 // streamer_channels.json is the single source of truth for servers, Twitch channels,
 // Minecraft owners and owner UUIDs. There are no streamer/server fallbacks in code.
@@ -651,6 +653,7 @@ async function loadPersistentData() {
     forgeryData = readJsonFile(FORGERY_FILE, {});
     trainingData = readJsonFile(TRAINING_FILE, {});
     backendResetState = readJsonFile(RESET_STATE_FILE, { epoch: 0 });
+    encountersData = readJsonFile(ENCOUNTERS_FILE, {});
     if (!backendResetState || typeof backendResetState !== "object") backendResetState = { epoch: 0 };
     backendResetState.epoch = Number(backendResetState.epoch || 0);
     for (const state of Object.values(trainingData || {})) migrateLegacyModifierKnowledge(state);
@@ -674,6 +677,7 @@ function saveWallets() {
 
 function saveQueue() { writeJsonFile(QUEUE_FILE, shopActionQueue); }
 function saveWatchers() { writeJsonFile(WATCHERS_FILE, watchers); }
+function saveEncounters() { writeJsonFile(ENCOUNTERS_FILE, encountersData); }
 function saveForgery() {
     writeJsonFile(FORGERY_FILE, forgeryData);
     syncForgeryToSupabaseSoon();
@@ -3090,6 +3094,7 @@ app.post("/admin/reset-backend", requireApiKey, async (req, res) => {
     writeJsonFile(FORGERY_FILE, forgeryData);
     writeJsonFile(WATCHERS_FILE, watchers);
     writeJsonFile(QUEUE_FILE, shopActionQueue);
+    writeJsonFile(ENCOUNTERS_FILE, encountersData);
 
     // Persist a reset generation. Extension clients compare this value with the
     // last generation they have seen; a change forces local companion/Twitch
@@ -3404,6 +3409,77 @@ app.get("/watch/:viewer", (req, res) => {
 });
 
 
+
+function publicEncounter(e) {
+    if (!e) return null;
+    return {
+        id: String(e.id || ""),
+        type: String(e.type || ""),
+        state: String(e.state || "pending"),
+        serverId: String(e.serverId || ""),
+        channelId: String(e.channelId || ""),
+        viewer: String(e.viewer || ""),
+        viewerDisplayName: String(e.viewerDisplayName || ""),
+        companionName: String(e.companionName || ""),
+        x: Number(e.x || 0), y: Number(e.y || 0), z: Number(e.z || 0),
+        createdAt: e.createdAt || "", updatedAt: e.updatedAt || ""
+    };
+}
+
+app.get("/encounters", (req, res) => {
+    const serverId = normalizeServerId(req.query.serverId || firstEnabledServerId());
+    const channelId = resolveChannelIdInput(req.query.channelId || "", serverId);
+    const rawViewer = normalizeViewer(req.query.viewer || "");
+    const viewerId = rawViewer ? normalizeViewer(parseScopedViewerKey(rawViewer).viewerId || rawViewer) : "";
+    const list = Object.values(encountersData || {}).filter(e => {
+        if (!e || normalizeServerId(e.serverId || serverId) !== serverId) return false;
+        if (channelId && normalizeChannelId(e.channelId || "") !== channelId) return false;
+        if (viewerId) {
+            const ev = normalizeViewer(parseScopedViewerKey(e.viewer || "").viewerId || e.viewer || "");
+            if (ev !== viewerId && normalizeViewer(e.viewerDisplayName || "") !== rawViewer) return false;
+        }
+        return String(e.state || "") !== "completed";
+    }).map(publicEncounter);
+    res.json({ ok: true, encounters: list });
+});
+
+app.post("/encounters/update", requireApiKey, (req, res) => {
+    const id = String(req.body.id || "").trim();
+    if (!id) return res.status(400).json({ ok:false, error:"Missing encounter id" });
+    const previous = encountersData[id] || {};
+    const serverId = normalizeServerId(req.body.serverId || previous.serverId || firstEnabledServerId());
+    const channelId = resolveChannelIdInput(req.body.channelId || previous.channelId || "", serverId);
+    const state = String(req.body.state || previous.state || "pending");
+    const e = {
+        ...previous,
+        id,
+        type: String(req.body.type || previous.type || "rescue_meowty"),
+        state,
+        serverId,
+        channelId,
+        viewer: String(req.body.viewer || previous.viewer || ""),
+        viewerDisplayName: String(req.body.viewerDisplayName || previous.viewerDisplayName || ""),
+        companionName: String(req.body.companionName || previous.companionName || ""),
+        streamerUuid: String(req.body.streamerUuid || previous.streamerUuid || ""),
+        x: Number(req.body.x ?? previous.x ?? 0), y: Number(req.body.y ?? previous.y ?? 0), z: Number(req.body.z ?? previous.z ?? 0),
+        createdAt: previous.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+    };
+    encountersData[id] = e;
+
+    // Only after the physical rescue succeeds does the companion become linked
+    // to the viewer's wallet/extension. Until then the viewer owns no Codex companion.
+    if (state === "completed" && e.type === "rescue_meowty" && e.viewer && e.companionName && channelId) {
+        const configured = configuredStreamerOwner(serverId, channelId);
+        const scoped = scopedViewerKey(parseScopedViewerKey(e.viewer).viewerId || e.viewer, channelId, serverId);
+        const existing = getWalletResolved(scoped, false);
+        const displayName = e.viewerDisplayName || existing?.displayName || parseScopedViewerKey(e.viewer).viewerId || e.viewer;
+        linkWalletCompanion(scoped, existing?.twitchId || "", displayName, e.companionName, configured.ownerName, channelId, serverId);
+    }
+    saveEncounters();
+    res.json({ ok:true, encounter: publicEncounter(e) });
+});
+
 app.post("/shop/create-companion", (req, res) => {
     const rawChannel = req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || "";
     const requestedServer = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(rawChannel));
@@ -3435,6 +3511,30 @@ app.post("/shop/create-companion", (req, res) => {
     // Never trust minecraftName/ownerName sent by a stale extension client.
     const minecraftOwner = configured.ownerName;
 
+    const currentWallet = getWalletResolved(viewer, false);
+    if (currentWallet && parseCompanionLink(currentWallet.companionName || "").companionName) {
+        return res.status(400).json({
+            ok: false,
+            error: "You already have a companion on this stream."
+        });
+    }
+
+    const requestedViewerId = normalizeViewer(parseScopedViewerKey(viewer).viewerId || viewer);
+    const activeRescue = Object.values(encountersData || {}).find(e => {
+        if (!e || String(e.state || "") === "completed") return false;
+        if (normalizeServerId(e.serverId || configured.serverId) !== configured.serverId) return false;
+        if (normalizeChannelId(e.channelId || "") !== configured.channelId) return false;
+        const encounterViewerId = normalizeViewer(parseScopedViewerKey(e.viewer || "").viewerId || e.viewer || "");
+        return encounterViewerId === requestedViewerId;
+    });
+    if (activeRescue) {
+        return res.status(400).json({
+            ok: false,
+            error: "Rescue Meowty! is already active for this viewer on this stream.",
+            encounter: publicEncounter(activeRescue)
+        });
+    }
+
     if (companionNameExistsForOwner(configured.serverId, minecraftOwner, companionName)) {
         return res.status(400).json({
             ok: false,
@@ -3456,15 +3556,18 @@ app.post("/shop/create-companion", (req, res) => {
     );
     if (!spend.ok) return res.status(400).json(spend);
 
-    const linkedWallet = linkWalletCompanion(
-        viewer,
-        req.body.twitchId || "",
-        req.body.displayName || req.body.viewer || viewer,
-        companionName,
-        minecraftOwner,
-        configured.channelId,
-        configured.serverId
-    );
+    const existingWallet = getWalletResolved(viewer, false) || getWallet(viewer);
+    updateWalletIdentity(viewer, req.body.twitchId || "", req.body.displayName || req.body.viewer || viewer);
+
+    const encounterId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    encountersData[encounterId] = {
+        id: encounterId, type: "rescue_meowty", state: "pending",
+        serverId: configured.serverId, channelId: configured.channelId, viewer,
+        viewerDisplayName: String(req.body.displayName || req.body.viewer || ""),
+        companionName, streamerUuid: configured.ownerUuid || "",
+        x:0,y:0,z:0, createdAt:new Date().toISOString(), updatedAt:new Date().toISOString()
+    };
+    saveEncounters();
 
     const request = queueShopAction({
         action: "create_companion",
@@ -3475,15 +3578,18 @@ app.post("/shop/create-companion", (req, res) => {
         ownerUuid: configured.ownerUuid,
         channelId: configured.channelId,
         serverId: configured.serverId,
-        cost: PRICES.CREATE_COMPANION
+        cost: PRICES.CREATE_COMPANION,
+        encounterId,
+        displayName: String(req.body.displayName || req.body.viewer || "")
     });
 
     res.json({
         ok: true,
         request,
+        encounter: publicEncounter(encountersData[encounterId]),
         wallet: {
             ok: true,
-            ...publicWallet(linkedWallet || getWallet(viewer)),
+            ...publicWallet(getWalletResolved(viewer, false) || getWallet(viewer)),
             spent: spend.spent
         }
     });
