@@ -3434,11 +3434,15 @@ app.get("/encounters", (req, res) => {
     const list = Object.values(encountersData || {}).filter(e => {
         if (!e || normalizeServerId(e.serverId || serverId) !== serverId) return false;
         if (channelId && normalizeChannelId(e.channelId || "") !== channelId) return false;
-        if (viewerId) {
+        // Viewer-specific encounters (Rescue Meowty) stay private to that viewer.
+        // Global ship events such as Treasure Fleet / Mutiny intentionally have
+        // no viewer and must still be visible to everyone watching the channel.
+        if (viewerId && String(e.viewer || "").trim()) {
             const ev = normalizeViewer(parseScopedViewerKey(e.viewer || "").viewerId || e.viewer || "");
             if (ev !== viewerId && normalizeViewer(e.viewerDisplayName || "") !== rawViewer) return false;
         }
-        return String(e.state || "") !== "completed";
+        const encounterState = String(e.state || "");
+        return encounterState !== "completed" && encounterState !== "removed";
     }).map(publicEncounter);
     res.json({ ok: true, encounters: list });
 });
