@@ -2652,9 +2652,30 @@ app.get("/viewer-init/:viewer", (req, res) => {
         }
     }
 
-    // If the wallet was not linked yet but this stream owner has exactly one active
-    // companion with the same name as the viewer's selected companion, do not guess.
-    // Returning no companion is safer than name-only fallback across multi-streamer data.
+    // Self-heal old EMPTY rows after a companion snapshot has already arrived.
+    if (wallet && !wallet.companionName && list.length > 0) {
+        const scoped = parseScopedViewerKey(wallet.viewer || scopedViewer || requestedViewer);
+        const viewerNames = new Set([
+            normalizeViewer(wallet.displayName || ""),
+            normalizeViewer(scoped.viewerId || ""),
+            normalizeViewer(wallet.twitchId || "")
+        ].filter(Boolean));
+
+        const matches = list.filter(c => viewerNames.has(normalizeViewer(c.name || "")));
+        if (matches.length === 1 && matches[0].ownerUuid) {
+            const c = matches[0];
+            wallet.companionName = encodeCompanionLink(
+                serverId,
+                c.ownerUuid,
+                c.owner || c.ownerName || c.minecraftName || "",
+                c.name
+            );
+            wallet.updatedAt = new Date().toISOString();
+            saveWallets();
+            companion = c;
+            console.log(`[VIEWER-INIT] Auto-relinked EMPTY wallet ${wallet.displayName || requestedViewer} -> ${c.name}`);
+        }
+    }
 
     res.json({
         ok: true,
@@ -2666,6 +2687,65 @@ app.get("/viewer-init/:viewer", (req, res) => {
         clearedStaleCompanion
     });
 });
+
+function repairWalletCompanionLinksFromSnapshot(serverId, incomingCompanions) {
+    const sid = normalizeServerId(serverId);
+    const config = streamerChannels?.servers?.[sid] || {};
+    const owners = config.owners || {};
+    let repaired = 0;
+
+    for (const [key, wallet] of Object.entries(wallets || {})) {
+        if (!wallet) continue;
+        const scoped = parseScopedViewerKey(wallet.viewer || key);
+        if (normalizeServerId(scoped.serverId || sid) !== sid) continue;
+
+        const channelId = normalizeChannelId(scoped.channelId || "");
+        if (!channelId) continue;
+
+        const ownerName = normalizeOwnerName(owners[channelId] || "");
+        if (!ownerName) continue;
+
+        const existing = parseCompanionLink(wallet.companionName || "");
+        if (existing.companionName && exportedCompanionExistsForLink(existing)) continue;
+
+        // Companion creation uses the viewer's Twitch/display name as the Meowty name.
+        // Match only inside this channel's configured Minecraft owner, and only when
+        // exactly one companion matches. This repairs old EMPTY wallet rows without
+        // ever stealing a companion from another streamer.
+        const viewerNames = new Set([
+            normalizeViewer(wallet.displayName || ""),
+            normalizeViewer(scoped.viewerId || ""),
+            normalizeViewer(wallet.twitchId || "")
+        ].filter(Boolean));
+
+        const matches = (incomingCompanions || []).filter(c => {
+            if (normalizeServerId(c.serverId || sid) !== sid) return false;
+            if (companionOwnerName(c) !== ownerName) return false;
+            const companionName = normalizeViewer(c.name || "");
+            return companionName && viewerNames.has(companionName);
+        });
+
+        if (matches.length !== 1) continue;
+
+        const c = matches[0];
+        const ownerUuid = String(c.ownerUuid || "").trim();
+        if (!ownerUuid) continue;
+
+        wallet.companionName = encodeCompanionLink(
+            sid,
+            ownerUuid,
+            c.owner || c.ownerName || owners[channelId],
+            c.name
+        );
+        wallet.updatedAt = new Date().toISOString();
+        repaired++;
+        console.log(`[COMPANIONS] Auto-relinked ${wallet.displayName || scoped.viewerId} -> ${c.name} on ${sid}/${channelId}`);
+    }
+
+    if (repaired > 0) saveWallets();
+    return repaired;
+}
+
 app.post("/companions", requireApiKey, (req, res) => {
     if (!req.body || !Array.isArray(req.body.companions)) {
         return res.status(400).json({ ok: false, error: "Expected body with companions array" });
@@ -2702,9 +2782,18 @@ app.post("/companions", requireApiKey, (req, res) => {
         companions: existingOtherServers.concat(incoming)
     };
 
-    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}`);
+    const repairedWalletLinks = repairWalletCompanionLinksFromSnapshot(serverId, incoming);
 
-    res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace" });
+    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}, repaired wallet links: ${repairedWalletLinks}`);
+
+    res.json({
+        ok: true,
+        serverId,
+        count: companionsData.companions.length,
+        updated: incoming.length,
+        repairedWalletLinks,
+        mode: "replace"
+    });
 });
 function taskChannelScope(serverInput, channelInput) {
     const serverId = normalizeServerId(serverInput || resolveServerIdFromChannel(channelInput));
