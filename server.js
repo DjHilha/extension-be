@@ -3410,6 +3410,84 @@ app.get("/watch/:viewer", (req, res) => {
 
 
 
+
+const SHIP_VIEWER_REWARD = {
+    dirt: 250,
+    relicFragmentChance: 0.35,
+    ancientFragmentChance: 0.08
+};
+
+function rewardStreamerViewersForShipEncounter(encounter) {
+    if (!encounter || !encounter.id) return { ok: false, error: "Missing encounter" };
+
+    // Idempotency: completion/update retries must never award twice.
+    if (encounter.viewerRewardsApplied) {
+        return encounter.viewerRewardSummary || { ok: true, alreadyApplied: true };
+    }
+
+    const serverId = normalizeServerId(encounter.serverId || firstEnabledServerId());
+    const channelId = resolveChannelIdInput(encounter.channelId || "", serverId);
+    if (!channelId) {
+        return { ok: false, error: "No configured channel for encounter" };
+    }
+
+    const resolved = walletKeysForChannel(channelId, serverId);
+    const summary = {
+        ok: true,
+        dirtPerViewer: SHIP_VIEWER_REWARD.dirt,
+        walletsRewarded: 0,
+        relicFragmentsAwarded: 0,
+        ancientFragmentsAwarded: 0,
+        relicFragmentChance: SHIP_VIEWER_REWARD.relicFragmentChance,
+        ancientFragmentChance: SHIP_VIEWER_REWARD.ancientFragmentChance
+    };
+
+    for (const key of resolved.keys) {
+        const wallet = getWallet(key);
+        if (!wallet) continue;
+
+        wallet.dirt = Number(wallet.dirt || 0) + SHIP_VIEWER_REWARD.dirt;
+        wallet.updatedAt = new Date().toISOString();
+        summary.walletsRewarded++;
+
+        // Fragments belong to the viewer's channel-specific companion/Academy.
+        // A viewer without a linked companion still receives Dirt, but has no
+        // Training Center state to receive fragments yet.
+        const linked = parseCompanionLink(wallet.companionName || "");
+        const companionName = String(linked.companionName || "").trim();
+        if (!companionName) continue;
+
+        const training = getTrainingState(wallet.viewer, companionName);
+
+        if (Math.random() < SHIP_VIEWER_REWARD.relicFragmentChance) {
+            training.relicFragments = Math.max(0, Number(training.relicFragments || 0) + 1);
+            summary.relicFragmentsAwarded++;
+            addTrainingHistory(training, `${encounter.type === "mutiny" ? "Mutiny" : "Treasure Fleet"} reward: +1 Relic Fragment.`);
+        }
+
+        if (Math.random() < SHIP_VIEWER_REWARD.ancientFragmentChance) {
+            training.ancientRelicFragments = Math.max(0, Number(training.ancientRelicFragments || 0) + 1);
+            summary.ancientFragmentsAwarded++;
+            addTrainingHistory(training, `${encounter.type === "mutiny" ? "Mutiny" : "Treasure Fleet"} reward: +1 Ancient Relic Fragment.`);
+        }
+    }
+
+    saveWallets();
+    saveTraining();
+
+    encounter.viewerRewardsApplied = true;
+    encounter.viewerRewardsAppliedAt = new Date().toISOString();
+    encounter.viewerRewardSummary = summary;
+
+    console.log(
+        `[ENCOUNTER] ${encounter.type} ${encounter.id}: rewarded ${summary.walletsRewarded} wallet(s) ` +
+        `+${SHIP_VIEWER_REWARD.dirt} Dirt each; relic fragments=${summary.relicFragmentsAwarded}; ` +
+        `ancient fragments=${summary.ancientFragmentsAwarded}.`
+    );
+
+    return summary;
+}
+
 function publicEncounter(e) {
     if (!e) return null;
     return {
@@ -3422,6 +3500,8 @@ function publicEncounter(e) {
         viewerDisplayName: String(e.viewerDisplayName || ""),
         companionName: String(e.companionName || ""),
         x: Number(e.x || 0), y: Number(e.y || 0), z: Number(e.z || 0),
+        viewerRewardsApplied: !!e.viewerRewardsApplied,
+        viewerRewardSummary: e.viewerRewardSummary || null,
         createdAt: e.createdAt || "", updatedAt: e.updatedAt || ""
     };
 }
@@ -3470,6 +3550,18 @@ app.post("/encounters/update", requireApiKey, (req, res) => {
         updatedAt: new Date().toISOString()
     };
     encountersData[id] = e;
+
+    // Treasure Fleet / Mutiny pay the entire selected stream channel exactly
+    // once when the physical combat encounter transitions to completed.
+    const previousState = String(previous.state || "");
+    if (
+        state === "completed" &&
+        previousState !== "completed" &&
+        (e.type === "treasure_fleet" || e.type === "mutiny")
+    ) {
+        e.viewerRewardSummary = rewardStreamerViewersForShipEncounter(e);
+        encountersData[id] = e;
+    }
 
     // Only after the physical rescue succeeds does the companion become linked
     // to the viewer's wallet/extension. Until then the viewer owns no Codex companion.
