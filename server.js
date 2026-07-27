@@ -2652,30 +2652,9 @@ app.get("/viewer-init/:viewer", (req, res) => {
         }
     }
 
-    // Self-heal old EMPTY rows after a companion snapshot has already arrived.
-    if (wallet && !wallet.companionName && list.length > 0) {
-        const scoped = parseScopedViewerKey(wallet.viewer || scopedViewer || requestedViewer);
-        const viewerNames = new Set([
-            normalizeViewer(wallet.displayName || ""),
-            normalizeViewer(scoped.viewerId || ""),
-            normalizeViewer(wallet.twitchId || "")
-        ].filter(Boolean));
-
-        const matches = list.filter(c => viewerNames.has(normalizeViewer(c.name || "")));
-        if (matches.length === 1 && matches[0].ownerUuid) {
-            const c = matches[0];
-            wallet.companionName = encodeCompanionLink(
-                serverId,
-                c.ownerUuid,
-                c.owner || c.ownerName || c.minecraftName || "",
-                c.name
-            );
-            wallet.updatedAt = new Date().toISOString();
-            saveWallets();
-            companion = c;
-            console.log(`[VIEWER-INIT] Auto-relinked EMPTY wallet ${wallet.displayName || requestedViewer} -> ${c.name}`);
-        }
-    }
+    // If the wallet was not linked yet but this stream owner has exactly one active
+    // companion with the same name as the viewer's selected companion, do not guess.
+    // Returning no companion is safer than name-only fallback across multi-streamer data.
 
     res.json({
         ok: true,
@@ -2687,65 +2666,6 @@ app.get("/viewer-init/:viewer", (req, res) => {
         clearedStaleCompanion
     });
 });
-
-function repairWalletCompanionLinksFromSnapshot(serverId, incomingCompanions) {
-    const sid = normalizeServerId(serverId);
-    const config = streamerChannels?.servers?.[sid] || {};
-    const owners = config.owners || {};
-    let repaired = 0;
-
-    for (const [key, wallet] of Object.entries(wallets || {})) {
-        if (!wallet) continue;
-        const scoped = parseScopedViewerKey(wallet.viewer || key);
-        if (normalizeServerId(scoped.serverId || sid) !== sid) continue;
-
-        const channelId = normalizeChannelId(scoped.channelId || "");
-        if (!channelId) continue;
-
-        const ownerName = normalizeOwnerName(owners[channelId] || "");
-        if (!ownerName) continue;
-
-        const existing = parseCompanionLink(wallet.companionName || "");
-        if (existing.companionName && exportedCompanionExistsForLink(existing)) continue;
-
-        // Companion creation uses the viewer's Twitch/display name as the Meowty name.
-        // Match only inside this channel's configured Minecraft owner, and only when
-        // exactly one companion matches. This repairs old EMPTY wallet rows without
-        // ever stealing a companion from another streamer.
-        const viewerNames = new Set([
-            normalizeViewer(wallet.displayName || ""),
-            normalizeViewer(scoped.viewerId || ""),
-            normalizeViewer(wallet.twitchId || "")
-        ].filter(Boolean));
-
-        const matches = (incomingCompanions || []).filter(c => {
-            if (normalizeServerId(c.serverId || sid) !== sid) return false;
-            if (companionOwnerName(c) !== ownerName) return false;
-            const companionName = normalizeViewer(c.name || "");
-            return companionName && viewerNames.has(companionName);
-        });
-
-        if (matches.length !== 1) continue;
-
-        const c = matches[0];
-        const ownerUuid = String(c.ownerUuid || "").trim();
-        if (!ownerUuid) continue;
-
-        wallet.companionName = encodeCompanionLink(
-            sid,
-            ownerUuid,
-            c.owner || c.ownerName || owners[channelId],
-            c.name
-        );
-        wallet.updatedAt = new Date().toISOString();
-        repaired++;
-        console.log(`[COMPANIONS] Auto-relinked ${wallet.displayName || scoped.viewerId} -> ${c.name} on ${sid}/${channelId}`);
-    }
-
-    if (repaired > 0) saveWallets();
-    return repaired;
-}
-
 app.post("/companions", requireApiKey, (req, res) => {
     if (!req.body || !Array.isArray(req.body.companions)) {
         return res.status(400).json({ ok: false, error: "Expected body with companions array" });
@@ -2782,18 +2702,9 @@ app.post("/companions", requireApiKey, (req, res) => {
         companions: existingOtherServers.concat(incoming)
     };
 
-    const repairedWalletLinks = repairWalletCompanionLinksFromSnapshot(serverId, incoming);
+    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}`);
 
-    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}, repaired wallet links: ${repairedWalletLinks}`);
-
-    res.json({
-        ok: true,
-        serverId,
-        count: companionsData.companions.length,
-        updated: incoming.length,
-        repairedWalletLinks,
-        mode: "replace"
-    });
+    res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace" });
 });
 function taskChannelScope(serverInput, channelInput) {
     const serverId = normalizeServerId(serverInput || resolveServerIdFromChannel(channelInput));
@@ -3665,6 +3576,106 @@ app.post("/encounters/update", requireApiKey, (req, res) => {
     res.json({ ok:true, encounter: publicEncounter(e) });
 });
 
+
+app.post("/encounters/cancel-rescue", (req, res) => {
+    const serverId = normalizeServerId(req.body.serverId || firstEnabledServerId());
+    const channelId = resolveChannelIdInput(req.body.channelId || "", serverId);
+    const rawViewer = normalizeViewer(req.body.viewer || "");
+    const viewerId = normalizeViewer(parseScopedViewerKey(rawViewer).viewerId || rawViewer || "");
+    const encounterId = String(req.body.encounterId || "").trim();
+
+    if (!channelId || !viewerId) {
+        return res.status(400).json({ ok:false, error:"Missing channel/viewer" });
+    }
+
+    let encounter = null;
+
+    if (encounterId && encountersData[encounterId]) {
+        encounter = encountersData[encounterId];
+    } else {
+        encounter = Object.values(encountersData || {}).find(e => {
+            if (!e || e.type !== "rescue_meowty") return false;
+            if (String(e.state || "") !== "pending") return false;
+            if (normalizeServerId(e.serverId || serverId) !== serverId) return false;
+            if (normalizeChannelId(e.channelId || "") !== channelId) return false;
+
+            const encounterViewerId = normalizeViewer(
+                parseScopedViewerKey(e.viewer || "").viewerId || e.viewer || ""
+            );
+            return encounterViewerId === viewerId;
+        }) || null;
+    }
+
+    if (!encounter) {
+        return res.status(404).json({ ok:false, error:"No pending Rescue Meowty found." });
+    }
+
+    if (encounter.type !== "rescue_meowty") {
+        return res.status(400).json({ ok:false, error:"Encounter is not Rescue Meowty." });
+    }
+
+    // A physically spawned Rescue must be resolved in Minecraft, not cancelled
+    // from the viewer extension.
+    if (String(encounter.state || "") !== "pending") {
+        return res.status(409).json({
+            ok:false,
+            error:"This Rescue Meowty mission has already spawned and cannot be cancelled here.",
+            encounter: publicEncounter(encounter)
+        });
+    }
+
+    const encounterViewerId = normalizeViewer(
+        parseScopedViewerKey(encounter.viewer || "").viewerId || encounter.viewer || ""
+    );
+
+    if (
+        normalizeServerId(encounter.serverId || serverId) !== serverId ||
+        normalizeChannelId(encounter.channelId || "") !== channelId ||
+        encounterViewerId !== viewerId
+    ) {
+        return res.status(403).json({ ok:false, error:"This Rescue belongs to another viewer/stream." });
+    }
+
+    // Remove any unprocessed create_companion request tied to this rescue.
+    const beforeQueue = shopActionQueue.length;
+    shopActionQueue = shopActionQueue.filter(item =>
+        !(
+            item &&
+            item.action === "create_companion" &&
+            String(item.encounterId || "") === String(encounter.id || "")
+        )
+    );
+    if (shopActionQueue.length !== beforeQueue) saveQueue();
+
+    // Refund the create-companion price to the same scoped wallet exactly once.
+    const scoped = scopedViewerKey(viewerId, channelId, serverId);
+    const wallet = getWalletResolved(scoped, false) || getWallet(scoped);
+    const refund = Number(PRICES.CREATE_COMPANION || 0);
+
+    wallet.dirt = Number(wallet.dirt || 0) + refund;
+    saveWallets();
+    syncWalletToSupabase(wallet).catch(error =>
+        console.error("[SUPABASE] Failed syncing Rescue cancellation refund", error)
+    );
+
+    encounter.state = "removed";
+    encounter.cancelledAt = new Date().toISOString();
+    encounter.updatedAt = encounter.cancelledAt;
+    encounter.cancelRefund = refund;
+    saveEncounters();
+
+    console.log(
+        `[ENCOUNTER] Cancelled pending Rescue ${encounter.id} for ${scoped}; refunded ${refund} Dirt.`
+    );
+
+    return res.json({
+        ok:true,
+        refunded:refund,
+        dirt:Number(wallet.dirt || 0),
+        encounter:publicEncounter(encounter)
+    });
+});
+
 app.post("/shop/create-companion", (req, res) => {
     const rawChannel = req.body.channelId || req.query.channelId || req.headers["x-channel-id"] || "";
     const requestedServer = normalizeServerId(req.body.serverId || resolveServerIdFromChannel(rawChannel));
@@ -3706,7 +3717,8 @@ app.post("/shop/create-companion", (req, res) => {
 
     const requestedViewerId = normalizeViewer(parseScopedViewerKey(viewer).viewerId || viewer);
     const activeRescue = Object.values(encountersData || {}).find(e => {
-        if (!e || String(e.state || "") === "completed") return false;
+        const rescueState = String(e && e.state || "");
+        if (!e || (rescueState !== "pending" && rescueState !== "spawned")) return false;
         if (normalizeServerId(e.serverId || configured.serverId) !== configured.serverId) return false;
         if (normalizeChannelId(e.channelId || "") !== configured.channelId) return false;
         const encounterViewerId = normalizeViewer(parseScopedViewerKey(e.viewer || "").viewerId || e.viewer || "");
