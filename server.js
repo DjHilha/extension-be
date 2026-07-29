@@ -2816,6 +2816,16 @@ app.post("/wallet/add", requireApiKey, (req, res) => {
 
     saveWallets();
 
+    const dirtReasonLabels = {
+        vault_join: "Joined the quest",
+        correct_guess: "Correct quest prediction",
+        watchtime: "Watchtime reward",
+        captain_award: "Captain awarded you",
+        manual: "Captain awarded you"
+    };
+    const reasonLabel = dirtReasonLabels[reason] || String(reason || "Reward").replace(/_/g, " ");
+    addViewerActivity(wallet.viewer, "", `${reasonLabel}: +${added} Dirt.`, requestedChannel, requestedServer);
+
     console.log(`[WALLET] +${added} Dirt to ${wallet.viewer} via "${requestedViewer}" | Channel: ${requestedChannel || "any"} | Reason: ${reason} | Balance: ${wallet.dirt}`);
 
     res.json({
@@ -4415,6 +4425,24 @@ function validateTrainingBody(req) {
     return { ok: true, viewer, companionName, requestedViewer: String(req.body.viewer || "").trim() };
 }
 
+function addViewerActivity(viewerInput, companionNameInput, text, channelInput = "", serverInput = "") {
+    const textClean = String(text || "").trim();
+    if (!textClean) return false;
+    const resolved = channelInput
+        ? resolveWalletKeyForChannel(viewerInput, channelInput, serverInput)
+        : { key: resolveWalletKey(viewerInput), channelId: "", serverId: normalizeServerId(serverInput || firstEnabledServerId()) };
+    const wallet = resolved.key ? getWallet(resolved.key) : getWalletResolved(viewerInput, false);
+    if (!wallet) return false;
+    const linked = parseCompanionLink(wallet.companionName || "");
+    const companionName = String(companionNameInput || linked.companionName || "").trim();
+    if (!companionName) return false;
+    const state = getTrainingState(wallet.viewer, companionName);
+    if (!state) return false;
+    addTrainingHistory(state, textClean);
+    saveTraining();
+    return true;
+}
+
 function addTrainingHistory(state, text) {
     state.history = Array.isArray(state.history) ? state.history : [];
     state.history.push({ at: new Date().toISOString(), text });
@@ -5489,6 +5517,18 @@ app.get("/wallets", requireApiKey, (req, res) => {
 
 let taskVotes = {};
 
+app.post("/activity/add", requireApiKey, (req, res) => {
+    const viewer = String(req.body.viewer || "").trim();
+    const companionName = String(req.body.companionName || "").trim();
+    const text = String(req.body.text || "").trim();
+    const channel = String(req.body.channelId || req.body.channel || "").trim();
+    const serverId = String(req.body.serverId || "").trim();
+    if (!viewer || !text) return res.status(400).json({ ok: false, error: "Missing viewer or text" });
+    const added = addViewerActivity(viewer, companionName, text, channel, serverId);
+    if (!added) return res.status(404).json({ ok: false, error: "Linked companion/training state not found" });
+    res.json({ ok: true });
+});
+
 app.post("/tasks/join", (req, res) => {
     const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
@@ -5506,6 +5546,8 @@ app.post("/tasks/join", (req, res) => {
     if (twitchId || displayName) {
         updateWalletIdentity(viewer, twitchId, displayName || viewer);
     }
+
+    addViewerActivity(viewer, companionName, "Joined the current quest.", req.body.channelId || req.body.channel || "", req.body.serverId || "");
 
     const request = queueShopAction({
         action: "task_join",
@@ -5556,6 +5598,8 @@ app.post("/tasks/vote", (req, res) => {
     }
 
     taskVotes[voteKey][viewer] = vote;
+
+    addViewerActivity(viewer, companionName, vote === "support" ? "Backed the current quest." : "Challenged the current quest.", req.body.channelId || req.body.channel || "", req.body.serverId || "");
 
     const request = queueShopAction({
         action: "task_vote",
