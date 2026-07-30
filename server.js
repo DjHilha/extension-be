@@ -4425,7 +4425,7 @@ function validateTrainingBody(req) {
     return { ok: true, viewer, companionName, requestedViewer: String(req.body.viewer || "").trim() };
 }
 
-function addViewerActivity(viewerInput, companionNameInput, text, channelInput = "", serverInput = "") {
+function addViewerActivity(viewerInput, companionNameInput, text, channelInput = "", serverInput = "", details = {}) {
     const textClean = String(text || "").trim();
     if (!textClean) return false;
     const resolved = channelInput
@@ -4438,14 +4438,18 @@ function addViewerActivity(viewerInput, companionNameInput, text, channelInput =
     if (!companionName) return false;
     const state = getTrainingState(wallet.viewer, companionName);
     if (!state) return false;
-    addTrainingHistory(state, textClean);
+    addTrainingHistory(state, textClean, details);
     saveTraining();
     return true;
 }
 
-function addTrainingHistory(state, text) {
+function addTrainingHistory(state, text, details = {}) {
     state.history = Array.isArray(state.history) ? state.history : [];
-    state.history.push({ at: new Date().toISOString(), text });
+    state.history.push({
+        at: new Date().toISOString(),
+        text,
+        ...(details && typeof details === "object" ? details : {})
+    });
     state.history = state.history.slice(-30);
     state.updatedAt = new Date().toISOString();
 }
@@ -5617,6 +5621,36 @@ app.post("/tasks/vote", (req, res) => {
         vote,
         request
     });
+});
+
+app.post("/tasks/reward-result", requireApiKey, (req, res) => {
+    const viewer = String(req.body.viewer || "").trim();
+    const companionName = String(req.body.companionName || "").trim();
+    const channelId = String(req.body.channelId || req.body.channel || "").trim();
+    const serverId = String(req.body.serverId || "").trim();
+    const text = String(req.body.text || "").trim();
+    const xp = Math.max(0, Math.floor(Number(req.body.xp || req.body.companionXp || 0)));
+    const dirt = Math.max(0, Math.floor(Number(req.body.dirt || 0)));
+    const outcome = String(req.body.outcome || "").trim().toLowerCase();
+
+    if (!viewer || !text) {
+        return res.status(400).json({ ok: false, error: "Missing viewer or reward-result text." });
+    }
+
+    const recorded = addViewerActivity(
+        viewer,
+        companionName,
+        text,
+        channelId,
+        serverId,
+        { type: "quest_reward", outcome, xp, dirt }
+    );
+
+    if (!recorded) {
+        return res.status(404).json({ ok: false, error: "Viewer wallet or companion link was not found." });
+    }
+
+    res.json({ ok: true, viewer, companionName, outcome, xp, dirt });
 });
 
 
