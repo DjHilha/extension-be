@@ -5551,8 +5551,6 @@ app.post("/tasks/join", (req, res) => {
         updateWalletIdentity(viewer, twitchId, displayName || viewer);
     }
 
-    addViewerActivity(viewer, companionName, "Joined the current quest.", req.body.channelId || req.body.channel || "", req.body.serverId || "");
-
     const request = queueShopAction({
         action: "task_join",
         viewer,
@@ -5602,8 +5600,6 @@ app.post("/tasks/vote", (req, res) => {
     }
 
     taskVotes[voteKey][viewer] = vote;
-
-    addViewerActivity(viewer, companionName, vote === "support" ? "Backed the current quest." : "Challenged the current quest.", req.body.channelId || req.body.channel || "", req.body.serverId || "");
 
     const request = queueShopAction({
         action: "task_vote",
