@@ -2735,8 +2735,18 @@ app.post("/tasks", requireApiKey, (req, res) => {
     }
 
     const previous = tasksDataByChannel[scope.key] || emptyTasksForScope(scope);
+
+    // Some exporter updates briefly send active=true with an empty tasks array when
+    // the objective completes or while progress is being rebuilt. Keep the last
+    // known quest in that case so the Quest tab and Join button do not disappear.
+    // A real vault exit is still represented by active=false.
+    const incomingTasks = Array.isArray(req.body.tasks) ? req.body.tasks : [];
+    const effectiveTasks = req.body.active && incomingTasks.length === 0 && previous.active && Array.isArray(previous.tasks) && previous.tasks.length > 0
+        ? previous.tasks
+        : incomingTasks;
+
     const previousSignature = Array.isArray(previous.tasks) ? previous.tasks.map(task => task.description || "").join("|") : "";
-    const nextSignature = req.body.tasks.map(task => task.description || "").join("|");
+    const nextSignature = effectiveTasks.map(task => task.description || "").join("|");
     const incomingStartedAt = Number(req.body.startedAt || req.body.voteStartedAt || 0);
     const startedAt = req.body.active
         ? (incomingStartedAt > 0
@@ -2746,7 +2756,7 @@ app.post("/tasks", requireApiKey, (req, res) => {
                 : Date.now())
         : 0;
 
-    const scopedTasks = { ...req.body, serverId: scope.serverId, channelId: scope.channelId, startedAt };
+    const scopedTasks = { ...req.body, tasks: effectiveTasks, serverId: scope.serverId, channelId: scope.channelId, startedAt };
     tasksDataByChannel[scope.key] = scopedTasks;
     tasksData = scopedTasks;
 
@@ -5533,12 +5543,27 @@ app.post("/activity/add", requireApiKey, (req, res) => {
     res.json({ ok: true });
 });
 
+const TASK_VOTE_WINDOW_MS = 5 * 60 * 1000;
+
+function activeTasksForRequest(req) {
+    const scope = taskChannelScope(
+        req.body?.serverId || req.query?.serverId || "",
+        req.body?.channelId || req.body?.channel || req.query?.channelId || req.query?.channel || req.headers["x-channel-id"] || ""
+    );
+    return { scope, state: tasksDataByChannel[scope.key] || emptyTasksForScope(scope) };
+}
+
 app.post("/tasks/join", (req, res) => {
     const viewer = scopeViewerFromRequest(req, req.body.viewer);
     const companionName = String(req.body.companionName || "").trim();
     const displayName = String(req.body.displayName || "").trim();
     const twitchId = String(req.body.twitchId || "").trim();
     const voteKey = String(req.body.voteKey || "current");
+    const { state: activeTaskState } = activeTasksForRequest(req);
+
+    if (!activeTaskState.active || !Array.isArray(activeTaskState.tasks) || activeTaskState.tasks.length === 0) {
+        return res.status(409).json({ ok: false, error: "There is no active vault quest to join." });
+    }
 
     if (!viewer) {
         return res.status(400).json({
@@ -5575,6 +5600,16 @@ app.post("/tasks/vote", (req, res) => {
     const twitchId = String(req.body.twitchId || "").trim();
     const vote = String(req.body.vote || "").toLowerCase();
     const voteKey = String(req.body.voteKey || "current");
+    const { state: activeTaskState } = activeTasksForRequest(req);
+
+    if (!activeTaskState.active || !Array.isArray(activeTaskState.tasks) || activeTaskState.tasks.length === 0) {
+        return res.status(409).json({ ok: false, error: "There is no active vault quest to vote on." });
+    }
+
+    const voteStartedAt = Number(activeTaskState.startedAt || activeTaskState.voteStartedAt || 0);
+    if (voteStartedAt > 0 && Date.now() - voteStartedAt >= TASK_VOTE_WINDOW_MS) {
+        return res.status(409).json({ ok: false, error: "Voting is closed for this quest." });
+    }
 
     if (!viewer || !["support", "doubt"].includes(vote)) {
         return res.status(400).json({
