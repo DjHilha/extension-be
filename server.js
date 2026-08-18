@@ -665,6 +665,7 @@ async function loadPersistentData() {
     await purgeInvalidChannelWalletsFromSupabase();
     await loadTrainingFromSupabase();
     await loadForgeryFromSupabase();
+    await loadProgressionFromSupabase();
 
     console.log(`[DATA] Loaded ${Object.keys(wallets).length} wallets, ${Object.keys(trainingData).length} training states, ${Object.keys(forgeryData).length} forgery states and ${shopActionQueue.length} queued shop actions and ${Object.keys(watchers).length} watchers.`);
 }
@@ -2367,6 +2368,12 @@ function spendDirt(viewer, amount, reason, channelInput = "", serverIdOverride =
     }
     wallet.dirt -= cost;
     saveWallets();
+    const walletScope = parseScopedViewerKey(wallet.viewer || viewer);
+    recordProgressionMetric({
+        serverId: normalizeServerId(walletScope.serverId || serverIdOverride || firstEnabledServerId()),
+        channelId: normalizeChannelId(walletScope.channelId || resolveChannelIdInput(channelInput, serverIdOverride)),
+        viewer: normalizeViewer(walletScope.viewerId || viewer)
+    }, "dirt_spent", cost, { displayName: wallet.displayName });
     console.log(`[WALLET] -${cost} Dirt from ${wallet.viewer} | Reason: ${reason} | Balance: ${wallet.dirt}`);
     return {
         ok: true,
@@ -2760,6 +2767,10 @@ app.post("/tasks", requireApiKey, (req, res) => {
     tasksDataByChannel[scope.key] = scopedTasks;
     tasksData = scopedTasks;
 
+    if (previous.active && !scopedTasks.active) {
+        progressionVaultParticipants.delete(`${scope.serverId}::${scope.channelId}`);
+    }
+
     res.json({ ok: true, serverId: scope.serverId, channelId: scope.channelId, active: scopedTasks.active, count: scopedTasks.tasks.length });
 });
 app.get("/wallet/:viewer", (req, res) => {
@@ -3065,7 +3076,11 @@ app.post("/admin/reset-backend", requireApiKey, async (req, res) => {
         forgery: Object.keys(forgeryData || {}).length,
         watchers: Object.keys(watchers || {}).length,
         queuedActions: Array.isArray(shopActionQueue) ? shopActionQueue.length : 0,
-        companions: Array.isArray(companionsData?.companions) ? companionsData.companions.length : 0
+        companions: Array.isArray(companionsData?.companions) ? companionsData.companions.length : 0,
+        profiles: progressionProfiles.size,
+        bountyStates: progressionBounties.size,
+        achievements: progressionAchievements.size,
+        titles: progressionTitles.size
     };
 
     // Cancel pending delayed writes first so old state cannot be written back after the wipe.
@@ -3079,6 +3094,12 @@ app.post("/admin/reset-backend", requireApiKey, async (req, res) => {
             await supabaseRequest('/wallets?viewer=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
             await supabaseRequest('/training_center?key=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
             await supabaseRequest('/forgery?key=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+            await supabaseRequest('/bounty_history?id=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+            await supabaseRequest('/bounty_state?viewer=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+            await supabaseRequest('/achievements?viewer=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+            await supabaseRequest('/titles?viewer=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+            await supabaseRequest('/profile_statistics?viewer=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+            await supabaseRequest('/profiles?viewer=not.is.null', { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
 
             // Legacy viewer_links is no longer used, but wipe it too if the table
             // still exists so a nuclear reset truly removes all old Twitch links.
@@ -3108,6 +3129,12 @@ app.post("/admin/reset-backend", requireApiKey, async (req, res) => {
     companionsData = { companions: [] };
     tasksData = { active: false, tasks: [] };
     tasksDataByChannel = {};
+    encountersData = {};
+    progressionProfiles.clear();
+    progressionStats.clear();
+    progressionBounties.clear();
+    progressionAchievements.clear();
+    progressionTitles.clear();
 
     writeJsonFile(WALLETS_FILE, wallets);
     writeJsonFile(TRAINING_FILE, trainingData);
@@ -3132,7 +3159,7 @@ app.post("/admin/reset-backend", requireApiKey, async (req, res) => {
     });
 });
 
-app.post("/admin/reset-player", requireApiKey, (req, res) => {
+app.post("/admin/reset-player", requireApiKey, async (req, res) => {
     const requestedViewer = String(req.body.viewer || req.body.twitchName || req.body.displayName || "").trim();
     const minecraftName = String(req.body.minecraftName || req.body.ownerName || requestedViewer || "").trim();
     const scopedViewer = requestedViewer ? scopeViewerFromRequest(req, requestedViewer) : "";
@@ -3159,6 +3186,7 @@ app.post("/admin/reset-player", requireApiKey, (req, res) => {
     const removedCompanions = beforeCompanions - companionsData.companions.length;
 
     let removedTraining = 0;
+    const removedTrainingKeys = [];
     for (const key of Object.keys(trainingData || {})) {
         const state = trainingData[key] || {};
         if (
@@ -3166,11 +3194,13 @@ app.post("/admin/reset-player", requireApiKey, (req, res) => {
             String(state.companionName || "").trim().toLowerCase() === wantedMinecraft
         ) {
             delete trainingData[key];
+            removedTrainingKeys.push(key);
             removedTraining++;
         }
     }
 
     let removedForgery = 0;
+    const removedForgeryKeys = [];
     for (const key of Object.keys(forgeryData || {})) {
         const state = forgeryData[key] || {};
         if (
@@ -3178,6 +3208,7 @@ app.post("/admin/reset-player", requireApiKey, (req, res) => {
             String(state.companionName || "").trim().toLowerCase() === wantedMinecraft
         ) {
             delete forgeryData[key];
+            removedForgeryKeys.push(key);
             removedForgery++;
         }
     }
@@ -3185,6 +3216,17 @@ app.post("/admin/reset-player", requireApiKey, (req, res) => {
     saveWallets();
     saveTraining();
     saveForgery();
+
+    const resetScope = progressionScope(req, requestedViewer);
+    if (resetScope.viewer && resetScope.channelId) {
+        if (USE_SUPABASE) {
+            const base = `server_id=eq.${encodeURIComponent(resetScope.serverId)}&channel_id=eq.${encodeURIComponent(resetScope.channelId)}`;
+            await supabaseRequest(`/wallets?${base}&viewer=eq.${encodeURIComponent(resetScope.viewer)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+            for (const key of removedTrainingKeys) await supabaseRequest(`/training_center?${base}&key=eq.${encodeURIComponent(key)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+            for (const key of removedForgeryKeys) await supabaseRequest(`/forgery?${base}&key=eq.${encodeURIComponent(key)}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+        }
+        await deleteProgressionForScope(resetScope);
+    }
 
     console.log(`[ADMIN] Reset player. viewer=${requestedViewer} minecraftName=${minecraftName} walletDeleted=${walletDeleted} companionsRemoved=${removedCompanions}`);
 
@@ -3328,6 +3370,11 @@ app.post("/watch/heartbeat", (req, res) => {
 
         saveWallets();
         saveWatchers();
+
+        const watchScope = progressionScope(req, req.body.viewer);
+        recordProgressionMetric(watchScope, "watch_minutes", 5, { displayName: watcher.displayName });
+        recordProgressionMetric(watchScope, "watch_dirt", 1, { displayName: watcher.displayName });
+        recordProgressionMetric(watchScope, "dirt_earned", 1, { displayName: watcher.displayName });
 
         console.log(`[WATCH] +1 Dirt to ${viewer} for watchtime. Balance: ${wallet.dirt}`);
 
@@ -4792,6 +4839,9 @@ app.post("/training/expedition", (req, res) => {
         const sparBonus = addSparringRatingBonus(state, "expedition");
         addTrainingHistory(state, (ancientFound ? "Expedition complete: found 1 Relic Fragment and 1 Ancient Relic Fragment." : "Expedition complete: found 1 Relic Fragment.") + (sparBonus ? ` Sparring rating +${sparBonus}.` : ""));
         saveTraining();
+        const expeditionScope = parseScopedViewerKey(valid.viewer);
+        recordProgressionMetric({ serverId: expeditionScope.serverId, channelId: expeditionScope.channelId, viewer: expeditionScope.viewerId }, "relic_fragments_earned", 1, { companionName: valid.companionName });
+        if (ancientFound) recordProgressionMetric({ serverId: expeditionScope.serverId, channelId: expeditionScope.channelId, viewer: expeditionScope.viewerId }, "ancient_fragments_earned", 1, { companionName: valid.companionName });
         return res.json({ ok: true, completed: true, reward: { relicFragments: 1, ancientRelicFragments: ancientFound ? 1 : 0, ancientChance: chance }, training: publicTrainingState(state) });
     }
 
@@ -4962,6 +5012,7 @@ app.post("/training/spar", (req, res) => {
     addTrainingHistory(state, `Sparring vs ${opponent}: ${won ? "won" : "lost"}. Rating ${challengerRating.roll} vs ${opponentRating.roll}. ${Math.round(xpPercent * 100)}% TNL XP queued. ${bonusLabel} sparring rating +${sparBonus}.${studyText}`);
 
     saveTraining();
+    recordProgressionMetric({ serverId: sparScope.serverId, channelId: sparScope.channelId, viewer: parseScopedViewerKey(valid.viewer).viewerId }, "academy_spars", 1, { companionName: valid.companionName });
     res.json({
         ok: true,
         won,
@@ -5530,6 +5581,7 @@ app.get("/wallets", requireApiKey, (req, res) => {
 });
 
 let taskVotes = {};
+const progressionVaultParticipants = new Map();
 
 app.post("/activity/add", requireApiKey, (req, res) => {
     const viewer = String(req.body.viewer || "").trim();
@@ -5586,6 +5638,12 @@ app.post("/tasks/join", (req, res) => {
         cost: 0
     });
 
+    recordProgressionMetric(progressionScope(req, req.body.viewer), "vaults_joined", 1, { displayName, companionName });
+    const participantScope = progressionScope(req, req.body.viewer);
+    const participantKey = `${participantScope.serverId}::${participantScope.channelId}`;
+    if (!progressionVaultParticipants.has(participantKey)) progressionVaultParticipants.set(participantKey, new Map());
+    progressionVaultParticipants.get(participantKey).set(participantScope.viewer, { ...participantScope, displayName, companionName });
+
     res.json({
         ok: true,
         joined: true,
@@ -5635,6 +5693,9 @@ app.post("/tasks/vote", (req, res) => {
     }
 
     taskVotes[voteKey][viewer] = vote;
+    const voteScope = progressionScope(req, req.body.viewer);
+    recordProgressionMetric(voteScope, "votes_total", 1, { displayName, companionName });
+    recordProgressionMetric(voteScope, vote === "support" ? "back_votes" : "challenge_votes", 1, { displayName, companionName });
 
     const request = queueShopAction({
         action: "task_vote",
@@ -5681,6 +5742,14 @@ app.post("/tasks/reward-result", requireApiKey, (req, res) => {
         return res.status(404).json({ ok: false, error: "Viewer wallet or companion link was not found." });
     }
 
+    const resultScope = progressionScope(req, viewer);
+    if (outcome === "joined_success") recordProgressionMetric(resultScope, "vaults_completed", 1, { companionName });
+    if (outcome === "joined_failed") recordProgressionMetric(resultScope, "vaults_failed", 1, { companionName });
+    if (outcome === "correct" || outcome === "success" || outcome === "won") recordProgressionMetric(resultScope, "predictions_correct", 1, { companionName });
+    if (outcome === "incorrect" || outcome === "wrong" || outcome === "failed" || outcome === "lost") recordProgressionMetric(resultScope, "predictions_incorrect", 1, { companionName });
+    if (xp > 0) recordProgressionMetric(resultScope, "companion_xp", xp, { companionName });
+    if (dirt > 0) recordProgressionMetric(resultScope, "dirt_earned", dirt, { companionName });
+
     res.json({ ok: true, viewer, companionName, outcome, xp, dirt });
 });
 
@@ -5699,6 +5768,188 @@ app.post("/shop/trail/queue/clear", requireApiKey, (req, res) => {
     saveQueue();
     res.json({ ok: true, remaining: shopActionQueue.length });
 });
+
+// ============================================================
+// CREW PROGRESSION — profiles, bounties, achievements and titles
+// ============================================================
+
+const progressionProfiles = new Map();
+const progressionStats = new Map();
+const progressionBounties = new Map();
+const progressionAchievements = new Map();
+const progressionTitles = new Map();
+
+const DAILY_BOUNTY_POOL = [
+    { id:"treasure_seeker", name:"Treasure Seeker", objectives:[o("chests_opened",50,"Open 50 Vault Chests"),o("ores_mined",5,"Mine 5 Vault Ores"),o("vaults_joined",1,"Join 1 Vault")], reward:{dirt:75,relicFragments:1} },
+    { id:"monster_hunter", name:"Monster Hunter", objectives:[o("mobs_killed",75,"Kill 75 Vault Mobs"),o("chests_opened",25,"Open 25 Vault Chests"),o("vaults_joined",1,"Join 1 Vault")], reward:{dirt:80,relicFragments:1} },
+    { id:"loyal_deckhand", name:"Loyal Deckhand", objectives:[o("watch_minutes",60,"Watch for 60 Minutes"),o("vaults_joined",1,"Join 1 Vault"),o("votes_total",1,"Vote Once")], reward:{dirt:70} },
+    { id:"vault_prophet", name:"Vault Prophet", objectives:[o("votes_total",1,"Vote Once"),o("predictions_correct",1,"Predict Correctly Once"),o("vaults_joined",1,"Join 1 Vault")], reward:{dirt:80} },
+    { id:"safe_passage", name:"Safe Passage", objectives:[o("vaults_joined",2,"Join 2 Vaults"),o("vaults_completed",1,"Complete 1 Vault"),o("watch_minutes",30,"Watch for 30 Minutes")], reward:{dirt:85} },
+    { id:"academy_student", name:"Academy Student", requiresCompanion:true, objectives:[o("academy_spars",1,"Spar Once"),o("companion_xp",10000,"Gain 10,000 Companion XP"),o("watch_minutes",30,"Watch for 30 Minutes")], reward:{dirt:65,relicFragments:1} },
+    { id:"growing_meowty", name:"Growing Meowty", requiresCompanion:true, objectives:[o("companion_xp",15000,"Gain 15,000 Companion XP"),o("vaults_joined",1,"Join 1 Vault"),o("vaults_completed",1,"Complete 1 Vault")], reward:{dirt:80} },
+    { id:"ornate_obsession", name:"Ornate Obsession", objectives:[o("ornate_chests",20,"Open 20 Ornate Chests"),o("chests_opened",50,"Open 50 Vault Chests"),o("vaults_completed",1,"Complete 1 Vault")], reward:{dirt:85} },
+    { id:"gilded_voyage", name:"Gilded Voyage", objectives:[o("gilded_chests",25,"Open 25 Gilded Chests"),o("ores_mined",3,"Mine 3 Vault Ores"),o("vaults_joined",1,"Join 1 Vault")], reward:{dirt:80} },
+    { id:"living_harvest", name:"Living Harvest", requiresCompanion:true, objectives:[o("living_chests",20,"Open 20 Living Chests"),o("mobs_killed",40,"Kill 40 Vault Mobs"),o("companion_xp",5000,"Gain 5,000 Companion XP")], reward:{dirt:80} },
+    { id:"wooden_work", name:"Wooden Work", objectives:[o("wooden_chests",35,"Open 35 Wooden Chests"),o("chests_opened",60,"Open 60 Vault Chests"),o("votes_total",1,"Vote Once")], reward:{dirt:70} },
+    { id:"coin_collector", name:"Coin Collector", objectives:[o("coin_piles",15,"Open 15 Coin Piles"),o("watch_dirt",25,"Earn 25 Watch-time Dirt"),o("vaults_joined",1,"Join 1 Vault")], reward:{dirt:75} },
+    { id:"big_spender", name:"Big Spender", objectives:[o("dirt_spent",100,"Spend 100 Dirt"),o("watch_minutes",45,"Watch for 45 Minutes"),o("votes_total",1,"Vote Once")], reward:{dirt:65} },
+    { id:"relic_apprentice", name:"Relic Apprentice", requiresCompanion:true, objectives:[o("relic_fragments_earned",1,"Earn 1 Relic Fragment"),o("academy_spars",1,"Spar Once"),o("companion_xp",5000,"Gain 5,000 Companion XP")], reward:{dirt:70} },
+    { id:"captains_supporter", name:"Captain's Supporter", objectives:[o("back_votes",1,"Back a Quest"),o("vaults_joined",1,"Join its Vault"),o("watch_minutes",30,"Watch for 30 Minutes")], reward:{dirt:65} },
+    { id:"agent_of_chaos", name:"Agent of Chaos", objectives:[o("challenge_votes",1,"Challenge a Quest"),o("vaults_joined",1,"Join its Vault"),o("mobs_killed",30,"Kill 30 Vault Mobs")], reward:{dirt:70} },
+    { id:"ore_prospector", name:"Ore Prospector", objectives:[o("ores_mined",8,"Mine 8 Vault Ores"),o("chests_opened",25,"Open 25 Vault Chests"),o("mobs_killed",25,"Kill 25 Vault Mobs")], reward:{dirt:90} },
+    { id:"full_hold", name:"Full Hold", objectives:[o("wooden_chests",20,"Open 20 Wooden Chests"),o("gilded_chests",15,"Open 15 Gilded Chests"),o("living_chests",10,"Open 10 Living Chests")], reward:{dirt:85} },
+    { id:"dedicated_sailor", name:"Dedicated Sailor", objectives:[o("watch_minutes",90,"Watch for 90 Minutes"),o("watch_dirt",18,"Earn 18 Watch-time Dirt"),o("votes_total",1,"Vote Once")], reward:{dirt:80} },
+    { id:"risky_voyage", name:"Risky Voyage", objectives:[o("challenge_votes",1,"Challenge a Quest"),o("predictions_correct",1,"Predict Correctly"),o("vaults_completed",1,"Complete the Vault")], reward:{dirt:100,relicFragments:1} }
+];
+
+const WEEKLY_BOUNTY_POOL = [
+    { id:"veteran_sailor", name:"Veteran Sailor", objectives:[o("vaults_joined",8,"Join 8 Vaults"),o("vaults_completed",5,"Complete 5 Vaults"),o("active_days",3,"Watch on 3 Different Days")], reward:{dirt:300} },
+    { id:"master_looter", name:"Master Looter", objectives:[o("chests_opened",600,"Open 600 Vault Chests"),o("chest_types",4,"Open All 4 Chest Types"),o("vaults_joined",5,"Join 5 Vaults")], reward:{dirt:350,relicFragments:3} },
+    { id:"slayer_deep", name:"Slayer of the Deep", objectives:[o("mobs_killed",600,"Kill 600 Vault Mobs"),o("ores_mined",25,"Mine 25 Vault Ores"),o("vaults_completed",4,"Complete 4 Vaults")], reward:{dirt:375,relicFragments:3} },
+    { id:"vault_prophet_weekly", name:"Vault Prophet", objectives:[o("predictions_correct",5,"Make 5 Correct Predictions"),o("votes_total",8,"Vote 8 Times"),o("vaults_joined",8,"Join 8 Vaults")], reward:{dirt:350,relicFragments:3} },
+    { id:"gem_hoarder", name:"Gem Hoarder", objectives:[o("ores_mined",50,"Mine 50 Vault Ores"),o("chests_opened",300,"Open 300 Vault Chests"),o("vaults_completed",4,"Complete 4 Vaults")], reward:{dirt:400,relicFragments:3} },
+    { id:"academy_regular", name:"Academy Regular", requiresCompanion:true, objectives:[o("academy_spars",5,"Spar 5 Times"),o("companion_xp",100000,"Gain 100,000 Companion XP"),o("vaults_joined",5,"Join 5 Vaults")], reward:{dirt:325,relicFragments:4} },
+    { id:"bounty_streak", name:"Bounty Streak", objectives:[o("daily_bounties_completed",3,"Complete 3 Daily Bounties"),o("vaults_joined",5,"Join 5 Vaults"),o("active_days",3,"Watch on 3 Different Days")], reward:{dirt:400,ancientFragments:1} },
+    { id:"ornate_raider", name:"Ornate Raider", objectives:[o("ornate_chests",150,"Open 150 Ornate Chests"),o("mobs_killed",300,"Kill 300 Vault Mobs"),o("vaults_completed",4,"Complete 4 Vaults")], reward:{dirt:375,relicFragments:3} },
+    { id:"gilded_fortune", name:"Gilded Fortune", objectives:[o("gilded_chests",175,"Open 175 Gilded Chests"),o("ores_mined",30,"Mine 30 Vault Ores"),o("vaults_joined",5,"Join 5 Vaults")], reward:{dirt:375,relicFragments:3} },
+    { id:"living_expedition", name:"Living Expedition", requiresCompanion:true, objectives:[o("living_chests",125,"Open 125 Living Chests"),o("companion_xp",75000,"Gain 75,000 Companion XP"),o("mobs_killed",250,"Kill 250 Vault Mobs")], reward:{dirt:350,relicFragments:3} },
+    { id:"wooden_armada", name:"Wooden Armada", objectives:[o("wooden_chests",250,"Open 250 Wooden Chests"),o("chests_opened",600,"Open 600 Vault Chests"),o("vaults_joined",6,"Join 6 Vaults")], reward:{dirt:325,relicFragments:3} },
+    { id:"coin_conqueror", name:"Coin Conqueror", objectives:[o("coin_piles",100,"Open 100 Coin Piles"),o("dirt_spent",500,"Spend 500 Dirt"),o("active_days",3,"Watch on 3 Different Days")], reward:{dirt:350} },
+    { id:"trusted_first_mate", name:"Trusted First Mate", objectives:[o("back_votes",8,"Back 8 Quests"),o("predictions_correct",5,"Be Correct 5 Times"),o("vaults_completed",5,"Complete 5 Vaults")], reward:{dirt:375,ancientFragments:1} },
+    { id:"master_mutineer", name:"Master Mutineer", objectives:[o("challenge_votes",8,"Challenge 8 Quests"),o("predictions_correct",4,"Be Correct 4 Times"),o("mobs_killed",400,"Kill 400 Vault Mobs")], reward:{dirt:400,ancientFragments:1} },
+    { id:"relic_scholar", name:"Relic Scholar", requiresCompanion:true, objectives:[o("relic_fragments_earned",8,"Earn 8 Relic Fragments"),o("academy_spars",4,"Spar 4 Times"),o("companion_xp",75000,"Gain 75,000 Companion XP")], reward:{dirt:350,ancientFragments:1} },
+    { id:"dedicated_crew", name:"Dedicated Crew", objectives:[o("active_days",4,"Watch on 4 Different Days"),o("watch_minutes",480,"Watch for 8 Hours"),o("vaults_joined",6,"Join 6 Vaults")], reward:{dirt:325} },
+    { id:"successful_voyage", name:"Successful Voyage", objectives:[o("vaults_completed",6,"Complete 6 Vaults"),o("predictions_correct",4,"Make 4 Correct Predictions"),o("ores_mined",25,"Mine 25 Vault Ores")], reward:{dirt:375,relicFragments:3} },
+    { id:"balanced_adventurer", name:"Balanced Adventurer", objectives:[o("chest_types_100",4,"Open 100 of Every Chest Type"),o("mobs_killed",400,"Kill 400 Vault Mobs"),o("ores_mined",30,"Mine 30 Vault Ores")], reward:{dirt:425,ancientFragments:1} },
+    { id:"companions_journey", name:"Companion's Journey", requiresCompanion:true, objectives:[o("companion_xp",150000,"Gain 150,000 Companion XP"),o("vaults_completed",5,"Complete 5 Vaults"),o("daily_bounties_completed",3,"Complete 3 Daily Bounties")], reward:{dirt:400,ancientFragments:1} },
+    { id:"captains_challenge", name:"Captain's Challenge", objectives:[o("vaults_completed",8,"Complete 8 Vaults"),o("predictions_correct",6,"Make 6 Correct Predictions"),o("mobs_killed",750,"Kill 750 Vault Mobs")], reward:{dirt:500,ancientFragments:2} }
+];
+
+const ACHIEVEMENT_DEFINITIONS = [
+    achievement("set_sail","Set Sail","vaults_joined",[1,10,50,200],"Veteran Sailor"),
+    achievement("safe_return","Safe Return","vaults_completed",[1,10,50,150],"Survivor"),
+    achievement("treasure_hunter","Treasure Hunter","chests_opened",[100,1000,5000,20000],"Master Looter"),
+    achievement("monster_hunter","Monster Hunter","mobs_killed",[100,1000,5000,20000],"Slayer of the Deep"),
+    achievement("gem_collector","Gem Collector","ores_mined",[25,250,1000,5000],"Gem Hoarder"),
+    achievement("wooden_worker","Wooden Worker","wooden_chests",[100,1000,5000,15000],"Master Carpenter"),
+    achievement("gilded_fortune","Gilded Fortune","gilded_chests",[100,1000,5000,15000],"Gilded Baron"),
+    achievement("living_harvest","Living Harvest","living_chests",[100,1000,5000,15000],"Keeper of Life"),
+    achievement("ornate_obsession","Ornate Obsession","ornate_chests",[100,1000,5000,15000],"Ornate Raider"),
+    achievement("coin_collector","Coin Collector","coin_piles",[50,500,2500,10000],"Treasure Hoarder"),
+    achievement("fortune_teller","Fortune Teller","predictions_correct",[1,10,50,200],"Vault Prophet"),
+    achievement("loyal_captain","Loyal to the Captain","back_votes",[10,50,250,1000],"Captain's Supporter"),
+    achievement("agent_chaos","Agent of Chaos","challenge_votes",[10,50,250,1000],"Master Mutineer"),
+    achievement("bounty_hunter","Bounty Hunter","bounties_completed",[1,10,50,200],"Bounty Hunter"),
+    achievement("daily_duty","Daily Duty","daily_bounties_completed",[5,25,100,365],"Never Off Duty"),
+    achievement("weekly_contract","Weekly Contract","weekly_bounties_completed",[1,10,25,100],"Contract Master"),
+    achievement("growing_meowty","Growing Meowty","companion_xp",[10000,1000000,10000000,50000000],"Seasoned Companion"),
+    achievement("dirt_collector","Dirt Collector","dirt_earned",[1000,10000,50000,250000],"Dirt Baron"),
+    achievement("big_spender","Big Spender","dirt_spent",[1000,10000,50000,250000],"Merchant's Favourite"),
+    achievement("on_deck","On Deck","watch_minutes",[60,1500,6000,30000],"Always on Deck"),
+    achievement("returning_crew","Returning Crew","active_days",[3,30,100,365],"Loyal Crew"),
+    achievement("academy_student","Academy Student","academy_spars",[1,10,50,250],"Sparring Partner"),
+    achievement("fragment_finder","Fragment Finder","relic_fragments_earned",[1,10,50,100],"Fragment Finder"),
+    achievement("ancient_power","Ancient Power","ancient_relics",[1,5,20,100],"Ancient One")
+];
+
+function o(metric, target, label) { return { metric, target, label }; }
+function achievement(id,name,metric,targets,title) { return {id,name,metric,targets,title}; }
+function progressionKey(serverId, channelId, viewer) { return `${normalizeServerId(serverId)}::${normalizeChannelId(channelId)}::${normalizeViewer(viewer)}`; }
+function progressionScope(req, viewerInput) {
+    const scoped = parseScopedViewerKey(scopeViewerFromRequest(req, viewerInput));
+    return { serverId:normalizeServerId(req.body?.serverId||req.query?.serverId||scoped.serverId||firstEnabledServerId()), channelId:normalizeChannelId(req.body?.channelId||req.body?.channel||req.query?.channelId||scoped.channelId||""), viewer:normalizeViewer(scoped.viewerId||viewerInput) };
+}
+function parisDateParts(date = new Date()) {
+    const parts = new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Paris",year:"numeric",month:"2-digit",day:"2-digit",weekday:"short"}).formatToParts(date);
+    return Object.fromEntries(parts.map(p=>[p.type,p.value]));
+}
+function dailyPeriodKey() { const p=parisDateParts(); return `${p.year}-${p.month}-${p.day}`; }
+function weeklyPeriodKey() {
+    const p=parisDateParts(); const d=new Date(`${p.year}-${p.month}-${p.day}T12:00:00Z`); const day=(d.getUTCDay()+6)%7; d.setUTCDate(d.getUTCDate()-day);
+    return `week-${d.toISOString().slice(0,10)}`;
+}
+function deterministicOffers(pool, seed, hasCompanion) {
+    const eligible=pool.filter(b=>hasCompanion||!b.requiresCompanion).map(b=>JSON.parse(JSON.stringify(b)));
+    let h=2166136261; for(const c of seed){h^=c.charCodeAt(0);h=Math.imul(h,16777619)}
+    for(let i=eligible.length-1;i>0;i--){h^=h<<13;h^=h>>>17;h^=h<<5;const j=Math.abs(h)%(i+1);[eligible[i],eligible[j]]=[eligible[j],eligible[i]]}
+    return eligible.slice(0,3);
+}
+function ensureProgression(scope, displayName="", companionName="") {
+    const key=progressionKey(scope.serverId,scope.channelId,scope.viewer); const now=new Date().toISOString();
+    if(!progressionProfiles.has(key)) progressionProfiles.set(key,{...scope,displayName,companionName,selectedTitleId:"",achievementPoints:0,profileCreatedAt:now,updatedAt:now});
+    const profile=progressionProfiles.get(key); if(displayName)profile.displayName=displayName;if(companionName)profile.companionName=companionName;
+    if(!progressionStats.has(key)) progressionStats.set(key,{...scope,statistics:{},companionStatistics:{},updatedAt:now});
+    if(!progressionAchievements.has(key)) progressionAchievements.set(key,{});
+    if(!progressionTitles.has(key)) progressionTitles.set(key,{});
+    return {key,profile,stats:progressionStats.get(key),achievements:progressionAchievements.get(key),titles:progressionTitles.get(key)};
+}
+function ensureBountyState(scope, type, hasCompanion) {
+    const key=`${progressionKey(scope.serverId,scope.channelId,scope.viewer)}::${type}`; const periodKey=type==="daily"?dailyPeriodKey():weeklyPeriodKey(); let state=progressionBounties.get(key);
+    if(!state||state.periodKey!==periodKey){
+        if(state?.selectedBounty){const p=ensureProgression(scope);if(state.status==="completed"&&!state.rewardClaimed){grantProgressionReward(p.profile,state.selectedBounty.reward||{},`${type}_bounty_auto_claim`);state.rewardClaimed=true;state.claimedAt=new Date().toISOString();}archiveBountyState(state).catch(()=>{});}
+        const pool=type==="daily"?DAILY_BOUNTY_POOL:WEEKLY_BOUNTY_POOL;state={...scope,periodType:type,periodKey,choices:deterministicOffers(pool,`${key}:${periodKey}`,hasCompanion),selectedBountyId:"",selectedBounty:null,progress:{},status:"choosing",rewardClaimed:false,updatedAt:new Date().toISOString()};progressionBounties.set(key,state);syncBountyState(state).catch(()=>{});
+    }
+    return state;
+}
+function publicBountyState(state){return {...state,progress:{...(state.progress||{})}};}
+function recordProgressionMetric(scope, metric, amount=1, meta={}) {
+    amount=Number(amount||0);if(!scope.viewer||!metric||!Number.isFinite(amount)||amount===0)return;
+    const wallet=getWalletResolved(scopedViewerKey(scope.viewer,scope.channelId,scope.serverId),false);const linked=parseCompanionLink(wallet?.companionName||"");
+    const p=ensureProgression(scope,wallet?.displayName||meta.displayName||scope.viewer,linked.companionName||meta.companionName||"");
+    const stats=p.stats.statistics;stats[metric]=Math.max(0,Number(stats[metric]||0)+amount);p.stats.updatedAt=new Date().toISOString();
+    const changes={[metric]:amount};
+    if(metric==="watch_minutes"){
+        const day=dailyPeriodKey();const previousDays=new Set(stats.activeDayKeys||[]);const wasNew=!previousDays.has(day);previousDays.add(day);stats.activeDayKeys=Array.from(previousDays).slice(-400);stats.active_days=stats.activeDayKeys.length;if(wasNew)changes.active_days=1;
+    }
+    if(["wooden_chests","gilded_chests","living_chests","ornate_chests"].includes(metric)){
+        const chestMetrics=["wooden_chests","gilded_chests","living_chests","ornate_chests"];
+        stats.chest_types=chestMetrics.filter(name=>Number(stats[name]||0)>0).length;
+        stats.chest_types_100=chestMetrics.filter(name=>Number(stats[name]||0)>=100).length;
+        changes.chest_types=stats.chest_types;changes.chest_types_100=stats.chest_types_100;
+    }
+    for(const type of ["daily","weekly"]){const state=ensureBountyState(scope,type,!!p.profile.companionName);if(state.status!=="active"||!state.selectedBounty)continue;for(const objective of state.selectedBounty.objectives||[]){if(!(objective.metric in changes))continue;const delta=["chest_types","chest_types_100"].includes(objective.metric)?Number(changes[objective.metric]):Number(changes[objective.metric]||0);state.progress[objective.metric]=["chest_types","chest_types_100"].includes(objective.metric)?Math.min(objective.target,delta):Math.min(objective.target,Math.max(0,Number(state.progress[objective.metric]||0)+delta));}const complete=(state.selectedBounty.objectives||[]).every(x=>Number(state.progress[x.metric]||0)>=Number(x.target||0));if(complete){state.status="completed";state.completedAt=new Date().toISOString();}state.updatedAt=new Date().toISOString();syncBountyState(state).catch(()=>{});}
+    evaluateAchievements(p);syncProgressionProfile(p).catch(()=>{});
+}
+function evaluateAchievements(p){
+    const stats=p.stats.statistics;
+    for(const def of ACHIEVEMENT_DEFINITIONS){const value=Number(stats[def.metric]||0);def.targets.forEach((target,index)=>{const tier=["common","rare","epic","omega"][index];const id=`${def.id}:${tier}`;if(value<target||p.achievements[id]?.unlocked)return;p.achievements[id]={achievementId:def.id,name:def.name,tier,progress:value,target,unlocked:true,rewardClaimed:true,unlockedAt:new Date().toISOString()};p.profile.achievementPoints+=([10,25,75,200][index]);grantAchievementReward(p.profile,tier);if(tier==="omega"&&def.title){p.titles[def.id]={titleId:def.id,titleName:def.title,sourceAchievementId:def.id,unlockedAt:new Date().toISOString()};syncTitle(p.profile,p.titles[def.id]).catch(()=>{});}syncAchievement(p.profile,p.achievements[id]).catch(()=>{});});}
+}
+async function loadProgressionFromSupabase(){
+    if(!USE_SUPABASE)return;
+    try{
+        const [profiles,stats,bounties,achievements,titles]=await Promise.all([
+            supabaseRequest("/profiles?select=*",{method:"GET"}),
+            supabaseRequest("/profile_statistics?select=*",{method:"GET"}),
+            supabaseRequest("/bounty_state?select=*",{method:"GET"}),
+            supabaseRequest("/achievements?select=*",{method:"GET"}),
+            supabaseRequest("/titles?select=*",{method:"GET"})
+        ]);
+        for(const row of profiles||[]){const scope={serverId:row.server_id,channelId:row.channel_id,viewer:row.viewer};progressionProfiles.set(progressionKey(scope.serverId,scope.channelId,scope.viewer),{...scope,displayName:row.display_name||row.viewer,companionName:row.companion_name||"",selectedTitleId:row.selected_title_id||"",achievementPoints:Number(row.achievement_points||0),profileCreatedAt:row.profile_created_at||new Date().toISOString(),updatedAt:row.updated_at});}
+        for(const row of stats||[]){const scope={serverId:row.server_id,channelId:row.channel_id,viewer:row.viewer};progressionStats.set(progressionKey(scope.serverId,scope.channelId,scope.viewer),{...scope,statistics:row.statistics||{},companionStatistics:row.companion_statistics||{},updatedAt:row.updated_at});}
+        for(const row of bounties||[]){const scope={serverId:row.server_id,channelId:row.channel_id,viewer:row.viewer};progressionBounties.set(`${progressionKey(scope.serverId,scope.channelId,scope.viewer)}::${row.period_type}`,{...scope,periodType:row.period_type,periodKey:row.period_key,choices:row.choices||[],selectedBountyId:row.selected_bounty_id||"",selectedBounty:row.selected_bounty||null,progress:row.progress||{},status:row.status||"choosing",rewardClaimed:!!row.reward_claimed,selectedAt:row.selected_at,completedAt:row.completed_at,claimedAt:row.claimed_at,updatedAt:row.updated_at});}
+        for(const row of achievements||[]){const key=progressionKey(row.server_id,row.channel_id,row.viewer);if(!progressionAchievements.has(key))progressionAchievements.set(key,{});progressionAchievements.get(key)[`${row.achievement_id}:${row.tier}`]={achievementId:row.achievement_id,tier:row.tier,progress:Number(row.progress||0),target:Number(row.target||1),unlocked:!!row.unlocked,rewardClaimed:!!row.reward_claimed,unlockedAt:row.unlocked_at};}
+        for(const row of titles||[]){const key=progressionKey(row.server_id,row.channel_id,row.viewer);if(!progressionTitles.has(key))progressionTitles.set(key,{});progressionTitles.get(key)[row.title_id]={titleId:row.title_id,titleName:row.title_name,sourceAchievementId:row.source_achievement_id||"",unlockedAt:row.unlocked_at};}
+        console.log(`[PROGRESSION] Loaded ${profiles?.length||0} profiles, ${bounties?.length||0} bounty states, ${achievements?.length||0} achievements and ${titles?.length||0} titles.`);
+    }catch(error){console.error("[PROGRESSION] Failed loading Supabase progression data.",error);}
+}
+function grantAchievementReward(profile,tier){const reward={common:{dirt:50},rare:{dirt:100,relicFragments:1},epic:{dirt:250,relicFragments:3},omega:{dirt:500,ancientFragments:1}}[tier];grantProgressionReward(profile,reward,`achievement_${tier}`);}
+function grantProgressionReward(profile,reward,reason){const scoped=scopedViewerKey(profile.viewer,profile.channelId,profile.serverId);const wallet=getWalletResolved(scoped,false)||getWallet(scoped);wallet.dirt=Number(wallet.dirt||0)+Number(reward?.dirt||0);wallet.updatedAt=new Date().toISOString();saveWallets();if(reward?.relicFragments||reward?.ancientFragments){const state=getTrainingState(scoped,profile.companionName||"");state.relicFragments=Number(state.relicFragments||0)+Number(reward.relicFragments||0);state.ancientRelicFragments=Number(state.ancientRelicFragments||0)+Number(reward.ancientFragments||0);addTrainingHistory(state,`Progression reward: ${reason}.`);saveTraining();}}
+async function syncProgressionProfile(p){if(!USE_SUPABASE)return;const base={server_id:p.profile.serverId,channel_id:p.profile.channelId,viewer:p.profile.viewer};await Promise.all([supabaseRequest("/profiles?on_conflict=server_id,channel_id,viewer",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify([{...base,twitch_id:p.profile.viewer,display_name:p.profile.displayName||p.profile.viewer,companion_name:p.profile.companionName||"",selected_title_id:p.profile.selectedTitleId||null,achievement_points:p.profile.achievementPoints||0,profile_created_at:p.profile.profileCreatedAt,updated_at:new Date().toISOString()}])}),supabaseRequest("/profile_statistics?on_conflict=server_id,channel_id,viewer",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify([{...base,statistics:p.stats.statistics||{},companion_statistics:p.stats.companionStatistics||{},current_daily_streak:Number(p.stats.statistics?.current_daily_streak||0),best_daily_streak:Number(p.stats.statistics?.best_daily_streak||0),current_watch_streak:Number(p.stats.statistics?.current_watch_streak||0),best_watch_streak:Number(p.stats.statistics?.best_watch_streak||0),first_activity_at:p.stats.statistics?.first_activity_at||null,last_activity_at:new Date().toISOString(),updated_at:new Date().toISOString()}])})]);}
+async function syncBountyState(s){if(!USE_SUPABASE)return;await supabaseRequest("/bounty_state?on_conflict=server_id,channel_id,viewer,period_type",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify([{server_id:s.serverId,channel_id:s.channelId,viewer:s.viewer,period_type:s.periodType,period_key:s.periodKey,choices:s.choices||[],selected_bounty_id:s.selectedBountyId||null,selected_bounty:s.selectedBounty||null,progress:s.progress||{},status:s.status,reward_claimed:!!s.rewardClaimed,selected_at:s.selectedAt||null,completed_at:s.completedAt||null,claimed_at:s.claimedAt||null,updated_at:new Date().toISOString()}])});}
+async function archiveBountyState(s){if(!USE_SUPABASE||!s?.selectedBounty)return;await supabaseRequest("/bounty_history",{method:"POST",headers:{Prefer:"return=minimal"},body:JSON.stringify([{server_id:s.serverId,channel_id:s.channelId,viewer:s.viewer,period_type:s.periodType,period_key:s.periodKey,bounty_id:s.selectedBountyId,bounty_data:s.selectedBounty,final_progress:s.progress||{},completed:["completed","claimed"].includes(s.status),reward_claimed:!!s.rewardClaimed,reward_data:s.selectedBounty.reward||{},selected_at:s.selectedAt||null,completed_at:s.completedAt||null,claimed_at:s.claimedAt||null}])});}
+async function syncAchievement(profile,a){if(!USE_SUPABASE)return;await supabaseRequest("/achievements?on_conflict=server_id,channel_id,viewer,achievement_id,tier",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify([{server_id:profile.serverId,channel_id:profile.channelId,viewer:profile.viewer,achievement_id:a.achievementId,tier:a.tier,progress:a.progress,target:a.target,unlocked:a.unlocked,reward_claimed:a.rewardClaimed,reward_data:{},unlocked_at:a.unlockedAt,updated_at:new Date().toISOString()}])});}
+async function syncTitle(profile,t){if(!USE_SUPABASE)return;await supabaseRequest("/titles?on_conflict=server_id,channel_id,viewer,title_id",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify([{server_id:profile.serverId,channel_id:profile.channelId,viewer:profile.viewer,title_id:t.titleId,title_name:t.titleName,source_achievement_id:t.sourceAchievementId||null,unlocked_at:t.unlockedAt,updated_at:new Date().toISOString()}])});}
+
+app.get("/profile/:viewer",async(req,res)=>{const scope=progressionScope(req,req.params.viewer);if(!scope.viewer||!scope.channelId)return res.status(400).json({ok:false,error:"Missing viewer or channel"});const wallet=getWalletResolved(scopedViewerKey(scope.viewer,scope.channelId,scope.serverId),false);const linked=parseCompanionLink(wallet?.companionName||"");const p=ensureProgression(scope,wallet?.displayName||scope.viewer,linked.companionName||"");const daily=ensureBountyState(scope,"daily",!!p.profile.companionName);const weekly=ensureBountyState(scope,"weekly",!!p.profile.companionName);res.set("Cache-Control","no-store");res.json({ok:true,profile:p.profile,statistics:p.stats.statistics,achievements:p.achievements,titles:p.titles,achievementDefinitions:ACHIEVEMENT_DEFINITIONS,daily:publicBountyState(daily),weekly:publicBountyState(weekly)});});
+app.post("/bounties/select",async(req,res)=>{const scope=progressionScope(req,req.body.viewer);const type=String(req.body.periodType||"").toLowerCase();const bountyId=String(req.body.bountyId||"");if(!["daily","weekly"].includes(type))return res.status(400).json({ok:false,error:"Invalid bounty period"});const p=ensureProgression(scope,req.body.displayName||"",req.body.companionName||"");const state=ensureBountyState(scope,type,!!p.profile.companionName);if(state.status!=="choosing"||state.selectedBountyId)return res.status(409).json({ok:false,error:"A bounty is already selected"});const selected=(state.choices||[]).find(b=>b.id===bountyId);if(!selected)return res.status(400).json({ok:false,error:"Bounty is not one of the offered choices"});state.selectedBountyId=selected.id;state.selectedBounty=selected;state.progress={};state.status="active";state.selectedAt=new Date().toISOString();state.updatedAt=state.selectedAt;await syncBountyState(state);res.json({ok:true,bounty:publicBountyState(state)});});
+app.post("/bounties/claim",async(req,res)=>{const scope=progressionScope(req,req.body.viewer);const type=String(req.body.periodType||"").toLowerCase();const p=ensureProgression(scope,req.body.displayName||"",req.body.companionName||"");const state=ensureBountyState(scope,type,!!p.profile.companionName);if(state.status!=="completed"||state.rewardClaimed)return res.status(409).json({ok:false,error:"Bounty is not ready to claim"});grantProgressionReward(p.profile,state.selectedBounty.reward||{},`${type}_bounty`);state.rewardClaimed=true;state.status="claimed";state.claimedAt=new Date().toISOString();const metric=type==="daily"?"daily_bounties_completed":"weekly_bounties_completed";recordProgressionMetric(scope,metric,1);recordProgressionMetric(scope,"bounties_completed",1);await syncBountyState(state);res.json({ok:true,bounty:publicBountyState(state),reward:state.selectedBounty.reward});});
+app.post("/profile/title",async(req,res)=>{const scope=progressionScope(req,req.body.viewer);const p=ensureProgression(scope,req.body.displayName||"",req.body.companionName||"");const titleId=String(req.body.titleId||"");if(titleId&&!p.titles[titleId])return res.status(403).json({ok:false,error:"Title is not unlocked"});p.profile.selectedTitleId=titleId;p.profile.updatedAt=new Date().toISOString();await syncProgressionProfile(p);res.json({ok:true,selectedTitleId:titleId});});
+app.post("/progression/activity",requireApiKey,(req,res)=>{const scope=progressionScope(req,req.body.viewer);const metric=String(req.body.metric||"").trim();const amount=Number(req.body.amount||1);if(!scope.viewer||!scope.channelId||!metric||!Number.isFinite(amount))return res.status(400).json({ok:false,error:"Invalid progression activity"});recordProgressionMetric(scope,metric,amount,req.body);res.json({ok:true,metric,amount});});
+app.post("/progression/vault-activity",requireApiKey,(req,res)=>{const serverId=normalizeServerId(req.body.serverId||firstEnabledServerId());const channelId=normalizeChannelId(req.body.channelId||req.body.channel||"");const metric=String(req.body.metric||"").trim();const amount=Number(req.body.amount||1);if(!channelId||!metric||!Number.isFinite(amount))return res.status(400).json({ok:false,error:"Invalid vault activity"});const participants=progressionVaultParticipants.get(`${serverId}::${channelId}`)||new Map();for(const scope of participants.values())recordProgressionMetric(scope,metric,amount,scope);res.json({ok:true,metric,amount,participants:participants.size});});
+
+async function deleteProgressionForScope(scope){if(USE_SUPABASE){const filter=`server_id=eq.${encodeURIComponent(scope.serverId)}&channel_id=eq.${encodeURIComponent(scope.channelId)}&viewer=eq.${encodeURIComponent(scope.viewer)}`;for(const table of ["bounty_history","bounty_state","achievements","titles","profile_statistics","profiles"])await supabaseRequest(`/${table}?${filter}`,{method:"DELETE",headers:{Prefer:"return=minimal"}});}const prefix=progressionKey(scope.serverId,scope.channelId,scope.viewer);for(const map of [progressionProfiles,progressionStats,progressionAchievements,progressionTitles])map.delete(prefix);for(const key of Array.from(progressionBounties.keys()))if(key.startsWith(prefix+"::"))progressionBounties.delete(key);}
+app.post("/admin/progression/reset-player",requireApiKey,async(req,res)=>{const scope=progressionScope(req,req.body.viewer);if(String(req.body.confirm||"").toLowerCase()!=="confirm")return res.status(400).json({ok:false,error:"Confirmation required"});await deleteProgressionForScope(scope);res.json({ok:true,reset:"progression",...scope});});
+app.post("/admin/bounties/reset",requireApiKey,async(req,res)=>{const scope=progressionScope(req,req.body.viewer);if(String(req.body.confirm||"").toLowerCase()!=="confirm")return res.status(400).json({ok:false,error:"Confirmation required"});const type=String(req.body.periodType||"all");const filterBase=`server_id=eq.${encodeURIComponent(scope.serverId)}&channel_id=eq.${encodeURIComponent(scope.channelId)}&viewer=eq.${encodeURIComponent(scope.viewer)}`;if(USE_SUPABASE)await supabaseRequest(`/bounty_state?${filterBase}${type!=="all"?`&period_type=eq.${type}`:""}`,{method:"DELETE",headers:{Prefer:"return=minimal"}});const prefix=progressionKey(scope.serverId,scope.channelId,scope.viewer);for(const key of Array.from(progressionBounties.keys()))if(key.startsWith(prefix+"::")&&(type==="all"||key.endsWith(`::${type}`)))progressionBounties.delete(key);res.json({ok:true,reset:"bounties",periodType:type,...scope});});
 process.on("uncaughtException", error => {
     console.error("[FATAL] Uncaught exception:", error);
 });
