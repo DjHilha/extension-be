@@ -5594,6 +5594,82 @@ app.get("/wallets", requireApiKey, (req, res) => {
 
 let taskVotes = {};
 const progressionVaultParticipants = new Map();
+const progressionVaultSessions = new Map();
+
+function progressionCompanionUuidsFromBody(body) {
+    const raw = Array.isArray(body?.companionUuids)
+        ? body.companionUuids
+        : Array.isArray(body?.party)
+            ? body.party.map(item => typeof item === "object" ? (item.uuid || item.companionUuid) : item)
+            : [];
+    return Array.from(new Set(raw.map(value => String(value || "").trim().toLowerCase()).filter(Boolean)));
+}
+
+function walletsForProgressionCompanion(serverId, channelId, companion) {
+    if (!companion) return [];
+    const wantedName = String(companion.name || "").trim().toLowerCase();
+    const wantedUuid = String(companion.uuid || companion.companionUuid || "").trim().toLowerCase();
+    const ownerUuid = String(companion.ownerUuid || "").trim().toLowerCase();
+    const ownerName = companionOwnerName(companion);
+    if (!wantedName || !wantedUuid) return [];
+
+    const matches = [];
+    for (const [key, wallet] of Object.entries(wallets || {})) {
+        if (!wallet) continue;
+        const scoped = parseScopedViewerKey(wallet.viewer || key);
+        if (normalizeServerId(scoped.serverId || serverId) !== serverId) continue;
+        if (normalizeChannelId(scoped.channelId || "") !== channelId) continue;
+
+        const linked = parseCompanionLink(wallet.companionName || "");
+        const linkedName = String(linked.companionName || "").trim().toLowerCase();
+        const linkedOwnerUuid = String(linked.ownerUuid || "").trim().toLowerCase();
+        const linkedOwnerName = String(linked.ownerName || "").trim().toLowerCase();
+
+        if (linkedName !== wantedName) continue;
+        const ownerMatches =
+            (ownerUuid && linkedOwnerUuid && linkedOwnerUuid === ownerUuid) ||
+            (ownerName && linkedOwnerName && linkedOwnerName === ownerName) ||
+            (!linkedOwnerUuid && !linkedOwnerName && ownerName);
+        if (!ownerMatches) continue;
+
+        matches.push({
+            serverId,
+            channelId,
+            viewer: normalizeViewer(scoped.viewerId || wallet.viewer),
+            displayName: safeDisplayName(wallet.displayName, scoped.viewerId || wallet.viewer),
+            companionName: String(companion.name || linked.companionName || "").trim(),
+            companionUuid: wantedUuid
+        });
+    }
+    return matches;
+}
+
+function progressionParticipantsForCompanionUuids(serverId, channelId, companionUuids) {
+    const participants = new Map();
+    const wanted = new Set((companionUuids || []).map(value => String(value || "").trim().toLowerCase()).filter(Boolean));
+    if (!wanted.size) return participants;
+
+    for (const companion of (Array.isArray(companionsData.companions) ? companionsData.companions : [])) {
+        const cServer = normalizeServerId(companion?.serverId || serverId);
+        const cUuid = String(companion?.uuid || companion?.companionUuid || "").trim().toLowerCase();
+        if (cServer !== serverId || !wanted.has(cUuid)) continue;
+        for (const participant of walletsForProgressionCompanion(serverId, channelId, companion)) {
+            participants.set(participant.viewer, participant);
+        }
+    }
+    return participants;
+}
+
+function progressionStreamerMatchesChannel(serverId, channelId, streamerUuid) {
+    const configured = configuredStreamerOwner(serverId, channelId);
+    const wanted = String(streamerUuid || "").trim().toLowerCase();
+    if (!wanted || !configured.ownerUuid) return true;
+    return wanted === configured.ownerUuid.toLowerCase();
+}
+
+function progressionVaultPartyKey(serverId, channelId) {
+    return `${serverId}::${channelId}`;
+}
 
 app.post("/activity/add", requireApiKey, (req, res) => {
     const viewer = String(req.body.viewer || "").trim();
@@ -5649,12 +5725,6 @@ app.post("/tasks/join", (req, res) => {
         voteKey,
         cost: 0
     });
-
-    recordProgressionMetric(progressionScope(req, req.body.viewer), "vaults_joined", 1, { displayName, companionName });
-    const participantScope = progressionScope(req, req.body.viewer);
-    const participantKey = `${participantScope.serverId}::${participantScope.channelId}`;
-    if (!progressionVaultParticipants.has(participantKey)) progressionVaultParticipants.set(participantKey, new Map());
-    progressionVaultParticipants.get(participantKey).set(participantScope.viewer, { ...participantScope, displayName, companionName });
 
     res.json({
         ok: true,
@@ -5755,7 +5825,6 @@ app.post("/tasks/reward-result", requireApiKey, (req, res) => {
     }
 
     const resultScope = progressionScope(req, viewer);
-    if (outcome === "joined_success") recordProgressionMetric(resultScope, "vaults_completed", 1, { companionName });
     if (outcome === "joined_failed") recordProgressionMetric(resultScope, "vaults_failed", 1, { companionName });
     if (outcome === "correct" || outcome === "success" || outcome === "won") recordProgressionMetric(resultScope, "predictions_correct", 1, { companionName });
     if (outcome === "incorrect" || outcome === "wrong" || outcome === "failed" || outcome === "lost") recordProgressionMetric(resultScope, "predictions_incorrect", 1, { companionName });
@@ -6106,6 +6175,64 @@ app.post("/notifications/slot-unlock",(req,res)=>{const scope=progressionScope(r
 app.get("/notifications/:viewer",(req,res)=>{const scope=progressionScope(req,req.params.viewer);if(!scope.viewer||!scope.channelId)return res.status(400).json({ok:false,error:"Missing viewer or channel"});const after=String(req.query.after||"");const limit=Math.max(1,Math.min(100,Number(req.query.limit||50)));let notices=notificationList(scope).slice();if(after){const afterTime=Date.parse(after);if(Number.isFinite(afterTime))notices=notices.filter(n=>Date.parse(n.createdAt)>afterTime);}res.set("Cache-Control","no-store");res.json({ok:true,notifications:notices.slice(0,limit),unread:notificationList(scope).filter(n=>!n.readAt).length});});
 app.post("/notifications/read",async(req,res)=>{const scope=progressionScope(req,req.body.viewer);const ids=Array.isArray(req.body.ids)?new Set(req.body.ids.map(String)):null;const readAt=new Date().toISOString();const changed=notificationList(scope).filter(n=>!n.readAt&&(!ids||ids.has(n.id)));for(const n of changed)n.readAt=readAt;if(USE_SUPABASE&&changed.length){const filter=`server_id=eq.${encodeURIComponent(scope.serverId)}&channel_id=eq.${encodeURIComponent(scope.channelId)}&viewer=eq.${encodeURIComponent(scope.viewer)}`;await supabaseRequest(`/notifications?${filter}`,{method:"PATCH",headers:{Prefer:"return=minimal"},body:JSON.stringify({read_at:readAt})});}res.json({ok:true,read:changed.length});});
 app.post("/profile/title",async(req,res)=>{const scope=progressionScope(req,req.body.viewer);const p=ensureProgression(scope,req.body.displayName||"",req.body.companionName||"");const titleId=String(req.body.titleId||"");if(titleId&&!p.titles[titleId])return res.status(403).json({ok:false,error:"Title is not unlocked"});p.profile.selectedTitleId=titleId;p.profile.updatedAt=new Date().toISOString();await syncProgressionProfile(p);res.json({ok:true,selectedTitleId:titleId});});
+app.post("/progression/vault-party",requireApiKey,(req,res)=>{
+    const serverId=normalizeServerId(req.body.serverId||firstEnabledServerId());
+    const channelId=normalizeChannelId(req.body.channelId||req.body.channel||"");
+    const event=String(req.body.event||req.body.phase||"update").trim().toLowerCase();
+    const sessionId=String(req.body.sessionId||"").trim();
+    const streamerUuid=String(req.body.streamerUuid||req.body.ownerUuid||"").trim().toLowerCase();
+    const companionUuids=progressionCompanionUuidsFromBody(req.body);
+    if(!channelId||!streamerUuid||!progressionStreamerMatchesChannel(serverId,channelId,streamerUuid)){
+        return res.status(403).json({ok:false,error:"Streamer does not match the configured channel owner."});
+    }
+    const key=progressionVaultPartyKey(serverId,channelId);
+
+    if(event==="start"){
+        const existing=progressionVaultSessions.get(key);
+        if(existing && existing.sessionId && existing.sessionId!==sessionId){
+            return res.status(409).json({ok:false,error:"A Vault session is already active for this streamer/channel."});
+        }
+        const participants=progressionParticipantsForCompanionUuids(serverId,channelId,companionUuids);
+        progressionVaultSessions.set(key,{sessionId:sessionId||`${Date.now()}-${Math.random().toString(16).slice(2)}`,serverId,channelId,streamerUuid,startedAt:Date.now(),startedCompanionUuids:companionUuids});
+        progressionVaultParticipants.set(key,participants);
+        for(const scope of participants.values()) recordProgressionMetric(scope,"vaults_joined",1,{companionName:scope.companionName});
+        console.log(`[PROGRESSION] Vault started ${key}; companion participants=${participants.size}.`);
+        return res.json({ok:true,event:"start",sessionId:progressionVaultSessions.get(key).sessionId,participants:participants.size,companionUuids});
+    }
+
+    const session=progressionVaultSessions.get(key);
+    if(!session){
+        return res.status(409).json({ok:false,error:"No tracked Vault session is active for this streamer/channel."});
+    }
+    if(sessionId && session.sessionId!==sessionId){
+        return res.status(409).json({ok:false,error:"Vault session id does not match the active session."});
+    }
+
+    const participants=progressionParticipantsForCompanionUuids(serverId,channelId,companionUuids);
+    progressionVaultParticipants.set(key,participants);
+
+    if(event==="complete"){
+        let completed=0;
+        for(const scope of participants.values()){
+            recordProgressionMetric(scope,"vaults_completed",1,{companionName:scope.companionName,streamerUuid});
+            completed++;
+        }
+        progressionVaultSessions.delete(key);
+        progressionVaultParticipants.delete(key);
+        console.log(`[PROGRESSION] Vault completed ${key}; credited ${completed} companion participant(s).`);
+        return res.json({ok:true,event:"complete",participants:completed,companionUuids});
+    }
+
+    if(event==="end"||event==="failed"||event==="abort"){
+        progressionVaultSessions.delete(key);
+        progressionVaultParticipants.delete(key);
+        console.log(`[PROGRESSION] Vault session ended without completion ${key}.`);
+        return res.json({ok:true,event:"end",participants:participants.size});
+    }
+
+    return res.json({ok:true,event:"update",participants:participants.size,companionUuids});
+});
+
 app.post("/progression/activity",requireApiKey,(req,res)=>{const scope=progressionScope(req,req.body.viewer);const metric=String(req.body.metric||"").trim();const amount=Number(req.body.amount||1);if(!scope.viewer||!scope.channelId||!metric||!Number.isFinite(amount))return res.status(400).json({ok:false,error:"Invalid progression activity"});recordProgressionMetric(scope,metric,amount,req.body);res.json({ok:true,metric,amount});});
 app.post("/progression/vault-activity",requireApiKey,(req,res)=>{const serverId=normalizeServerId(req.body.serverId||firstEnabledServerId());const channelId=normalizeChannelId(req.body.channelId||req.body.channel||"");const metric=String(req.body.metric||"").trim();const amount=Number(req.body.amount||1);if(!channelId||!metric||!Number.isFinite(amount))return res.status(400).json({ok:false,error:"Invalid vault activity"});const participants=progressionVaultParticipants.get(`${serverId}::${channelId}`)||new Map();for(const scope of participants.values())recordProgressionMetric(scope,metric,amount,scope);res.json({ok:true,metric,amount,participants:participants.size});});
 
