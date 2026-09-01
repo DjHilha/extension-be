@@ -5826,8 +5826,6 @@ app.post("/tasks/reward-result", requireApiKey, (req, res) => {
 
     const resultScope = progressionScope(req, viewer);
     if (outcome === "joined_failed") recordProgressionMetric(resultScope, "vaults_failed", 1, { companionName });
-    if (outcome === "correct" || outcome === "success" || outcome === "won") recordProgressionMetric(resultScope, "predictions_correct", 1, { companionName });
-    if (outcome === "incorrect" || outcome === "wrong" || outcome === "failed" || outcome === "lost") recordProgressionMetric(resultScope, "predictions_incorrect", 1, { companionName });
     if (xp > 0) recordProgressionMetric(resultScope, "companion_xp", xp, { companionName });
     if (dirt > 0) recordProgressionMetric(resultScope, "dirt_earned", dirt, { companionName });
 
@@ -6217,10 +6215,26 @@ app.post("/progression/vault-party",requireApiKey,(req,res)=>{
             recordProgressionMetric(scope,"vaults_completed",1,{companionName:scope.companionName,streamerUuid});
             completed++;
         }
+
+        // Prediction correctness is determined by the completed Vault result,
+        // but does not require the viewer's Companion to be in the party.
+        const correctPredictions = Array.isArray(req.body.predictionCorrectViewers)
+            ? req.body.predictionCorrectViewers
+            : [];
+        let predictionsCredited = 0;
+        for(const viewer of correctPredictions){
+            const predictionViewer = String(viewer || "").trim();
+            if(!predictionViewer) continue;
+            const scope = progressionScope(req, predictionViewer);
+            if(!scope.viewer || !scope.channelId) continue;
+            recordProgressionMetric(scope,"predictions_correct",1,{streamerUuid});
+            predictionsCredited++;
+        }
+
         progressionVaultSessions.delete(key);
         progressionVaultParticipants.delete(key);
         console.log(`[PROGRESSION] Vault completed ${key}; credited ${completed} companion participant(s).`);
-        return res.json({ok:true,event:"complete",participants:completed,companionUuids});
+        return res.json({ok:true,event:"complete",participants:completed,companionUuids,predictionsCredited});
     }
 
     if(event==="end"||event==="failed"||event==="abort"){
