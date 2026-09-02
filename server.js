@@ -5826,6 +5826,11 @@ app.post("/tasks/reward-result", requireApiKey, (req, res) => {
 
     const resultScope = progressionScope(req, viewer);
     if (outcome === "joined_failed") recordProgressionMetric(resultScope, "vaults_failed", 1, { companionName });
+    // Prediction result is authoritative here: TaskRewardManager knows whether
+    // Back or Challenge actually won after the Vault ends. Keep this independent
+    // from Companion Party membership.
+    if (outcome === "correct") recordProgressionMetric(resultScope, "predictions_correct", 1, { companionName });
+    if (outcome === "wrong") recordProgressionMetric(resultScope, "predictions_incorrect", 1, { companionName });
     if (xp > 0) recordProgressionMetric(resultScope, "companion_xp", xp, { companionName });
     if (dirt > 0) recordProgressionMetric(resultScope, "dirt_earned", dirt, { companionName });
 
@@ -6187,8 +6192,12 @@ app.post("/progression/vault-party",requireApiKey,(req,res)=>{
 
     if(event==="start"){
         const existing=progressionVaultSessions.get(key);
-        if(existing && existing.sessionId && existing.sessionId!==sessionId){
-            return res.status(409).json({ok:false,error:"A Vault session is already active for this streamer/channel."});
+        if(existing){
+            // A previous crash/redeploy or missed end event must never block every
+            // future Vault. A new start from the configured streamer replaces it.
+            progressionVaultSessions.delete(key);
+            progressionVaultParticipants.delete(key);
+            console.log(`[PROGRESSION] Replacing stale Vault session ${key}.`);
         }
         const participants=progressionParticipantsForCompanionUuids(serverId,channelId,companionUuids);
         progressionVaultSessions.set(key,{sessionId:sessionId||`${Date.now()}-${Math.random().toString(16).slice(2)}`,serverId,channelId,streamerUuid,startedAt:Date.now(),startedCompanionUuids:companionUuids});
