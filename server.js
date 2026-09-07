@@ -2673,6 +2673,102 @@ app.get("/viewer-init/:viewer", (req, res) => {
         clearedStaleCompanion
     });
 });
+
+function companionProgressionIdentityKey(companion, serverIdOverride = "") {
+    const serverId = normalizeServerId(companion?.serverId || serverIdOverride || firstEnabledServerId());
+    const uuid = String(companion?.uuid || companion?.companionUuid || "").trim().toLowerCase();
+    const ownerUuid = String(companion?.ownerUuid || "").trim().toLowerCase();
+    const ownerName = companionOwnerName(companion);
+    const name = String(companion?.name || "").trim().toLowerCase();
+    return `${serverId}::${ownerUuid || ownerName}::${uuid || name}`;
+}
+
+function channelForExportedCompanion(serverIdInput, companion) {
+    const serverId = normalizeServerId(serverIdInput || companion?.serverId || firstEnabledServerId());
+    const config = streamerChannels?.servers?.[serverId] || {};
+    const wantedOwnerUuid = String(companion?.ownerUuid || "").trim().toLowerCase();
+    const wantedOwnerName = companionOwnerName(companion);
+
+    for (const [channelIdRaw, profile] of Object.entries(config.ownerProfiles || {})) {
+        const channelId = normalizeChannelId(channelIdRaw);
+        const profileUuid = String(profile?.minecraftUuid || profile?.uuid || profile?.ownerUuid || "").trim().toLowerCase();
+        const profileName = normalizeOwnerName(profile?.ingameName || profile?.name || profile?.ownerName || config.owners?.[channelId] || "");
+        if ((wantedOwnerUuid && profileUuid && wantedOwnerUuid === profileUuid) || (wantedOwnerName && profileName && wantedOwnerName === profileName)) {
+            return channelId;
+        }
+    }
+
+    for (const [channelIdRaw, ownerName] of Object.entries(config.owners || {})) {
+        if (wantedOwnerName && normalizeOwnerName(ownerName) === wantedOwnerName) return normalizeChannelId(channelIdRaw);
+    }
+    return "";
+}
+
+function progressionScopesForExportedCompanion(serverIdInput, companion) {
+    const serverId = normalizeServerId(serverIdInput || companion?.serverId || firstEnabledServerId());
+    const channelId = channelForExportedCompanion(serverId, companion);
+    const companionName = String(companion?.name || "").trim();
+    const wantedOwnerUuid = String(companion?.ownerUuid || "").trim().toLowerCase();
+    const wantedOwnerName = companionOwnerName(companion);
+    if (!channelId || !companionName) return [];
+
+    const scopes = [];
+    const seen = new Set();
+    for (const wallet of Object.values(wallets || {})) {
+        if (!wallet) continue;
+        const parsed = parseScopedViewerKey(wallet.viewer || "");
+        if (normalizeServerId(parsed.serverId || serverId) !== serverId) continue;
+        if (normalizeChannelId(parsed.channelId || "") !== channelId) continue;
+
+        const linked = parseCompanionLink(wallet.companionName || "");
+        if (!linked?.companionName || String(linked.companionName).trim().toLowerCase() !== companionName.toLowerCase()) continue;
+        const linkedOwnerUuid = String(linked.ownerUuid || "").trim().toLowerCase();
+        const linkedOwnerName = normalizeOwnerName(linked.ownerName || "");
+        if (wantedOwnerUuid && linkedOwnerUuid && wantedOwnerUuid !== linkedOwnerUuid) continue;
+        if (!wantedOwnerUuid && wantedOwnerName && linkedOwnerName && wantedOwnerName !== linkedOwnerName) continue;
+
+        const viewer = normalizeViewer(parsed.viewerId || wallet.twitchId || wallet.viewer || "");
+        if (!viewer) continue;
+        const key = `${serverId}::${channelId}::${viewer}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        scopes.push({ serverId, channelId, viewer, companionName });
+    }
+    return scopes;
+}
+
+function recordExportedCompanionXpDeltas(serverIdInput, previousCompanions, incomingCompanions) {
+    const serverId = normalizeServerId(serverIdInput || firstEnabledServerId());
+    const previous = new Map();
+    for (const companion of previousCompanions || []) {
+        previous.set(companionProgressionIdentityKey(companion, serverId), companion);
+    }
+
+    let companionsChanged = 0;
+    let xpCredited = 0;
+    let viewerCredits = 0;
+    for (const companion of incomingCompanions || []) {
+        const old = previous.get(companionProgressionIdentityKey(companion, serverId));
+        // No old snapshot means this is the baseline after a backend restart/deploy.
+        if (!old) continue;
+        const before = Number(old.xp);
+        const after = Number(companion.xp);
+        if (!Number.isFinite(before) || !Number.isFinite(after) || after <= before) continue;
+        const delta = Math.floor(after - before);
+        if (delta <= 0) continue;
+
+        const scopes = progressionScopesForExportedCompanion(serverId, companion);
+        for (const scope of scopes) {
+            recordProgressionMetric(scope, "companion_xp", delta, { companionName: scope.companionName, source: "companion_export_delta" });
+            viewerCredits++;
+        }
+        companionsChanged++;
+        xpCredited += delta;
+        console.log(`[PROGRESSION] Companion XP +${delta} for ${companion.name || companion.uuid}; linked viewers=${scopes.length}.`);
+    }
+    return { companionsChanged, xpCredited, viewerCredits };
+}
+
 app.post("/companions", requireApiKey, (req, res) => {
     if (!req.body || !Array.isArray(req.body.companions)) {
         return res.status(400).json({ ok: false, error: "Expected body with companions array" });
@@ -2697,7 +2793,15 @@ app.post("/companions", requireApiKey, (req, res) => {
             return (ownerUuid && configuredOwnerUuids.has(ownerUuid)) || (ownerName && configuredOwnerNames.has(ownerName));
         });
 
-    // The Minecraft exporter sends the FULL current companion list.
+    // The Minecraft exporter sends the FULL current companion list. Compare XP
+    // against the previous export BEFORE replacing the cache. This catches every
+    // source of real Companion XP (vaults, training, support rewards, admin grants,
+    // etc.) instead of relying on one reward endpoint to remember to report it.
+    const previousServerCompanions = Array.isArray(companionsData.companions)
+        ? companionsData.companions.filter(c => normalizeServerId(c.serverId || serverId) === serverId)
+        : [];
+    const xpTracking = recordExportedCompanionXpDeltas(serverId, previousServerCompanions, incoming);
+
     // Replace this server's cached list instead of merging, otherwise deleted
     // companions stay cached on Render forever.
     const existingOtherServers = Array.isArray(companionsData.companions)
@@ -2709,9 +2813,9 @@ app.post("/companions", requireApiKey, (req, res) => {
         companions: existingOtherServers.concat(incoming)
     };
 
-    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}`);
+    console.log(`[COMPANIONS] Replaced companion list for ${serverId}. Incoming: ${incoming.length}, total cached: ${companionsData.companions.length}; XP delta=${xpTracking.xpCredited}, viewer credits=${xpTracking.viewerCredits}`);
 
-    res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace" });
+    res.json({ ok: true, serverId, count: companionsData.companions.length, updated: incoming.length, mode: "replace", xpTracking });
 });
 function taskChannelScope(serverInput, channelInput) {
     const serverId = normalizeServerId(serverInput || resolveServerIdFromChannel(channelInput));
@@ -3538,16 +3642,25 @@ function rewardStreamerViewersForShipEncounter(encounter) {
 
         const training = getTrainingState(wallet.viewer, companionName);
 
+        const walletParsed = parseScopedViewerKey(wallet.viewer || "");
+        const rewardScope = {
+            serverId: normalizeServerId(walletParsed.serverId || serverId),
+            channelId: normalizeChannelId(walletParsed.channelId || channelId),
+            viewer: normalizeViewer(walletParsed.viewerId || wallet.twitchId || wallet.viewer || "")
+        };
+
         if (Math.random() < SHIP_VIEWER_REWARD.relicFragmentChance) {
             training.relicFragments = Math.max(0, Number(training.relicFragments || 0) + 1);
             summary.relicFragmentsAwarded++;
             addTrainingHistory(training, `${encounter.type === "mutiny" ? "Mutiny" : "Treasure Fleet"} reward: +1 Relic Fragment.`);
+            recordProgressionMetric(rewardScope, "relic_fragments_earned", 1, { companionName, source: encounter.type });
         }
 
         if (Math.random() < SHIP_VIEWER_REWARD.ancientFragmentChance) {
             training.ancientRelicFragments = Math.max(0, Number(training.ancientRelicFragments || 0) + 1);
             summary.ancientFragmentsAwarded++;
             addTrainingHistory(training, `${encounter.type === "mutiny" ? "Mutiny" : "Treasure Fleet"} reward: +1 Ancient Relic Fragment.`);
+            recordProgressionMetric(rewardScope, "ancient_fragments_earned", 1, { companionName, source: encounter.type });
         }
     }
 
@@ -5256,6 +5369,9 @@ app.post("/admin/fragments/grant", requireApiKey, (req, res) => {
     state.ancientRelicFragments = Math.max(0, Number(state.ancientRelicFragments || 0) + ancientRelicFragments);
     addTrainingHistory(state, `Admin: granted ${relicFragments} Relic Fragment(s) and ${ancientRelicFragments} Ancient Relic Fragment(s).`);
     saveTraining();
+    const adminFragmentScope = { serverId: valid.serverId, channelId: valid.channelId, viewer: parseScopedViewerKey(valid.viewer).viewerId || valid.viewer };
+    if (relicFragments > 0) recordProgressionMetric(adminFragmentScope, "relic_fragments_earned", relicFragments, { companionName: valid.companionName, source: "admin_fragment_grant" });
+    if (ancientRelicFragments > 0) recordProgressionMetric(adminFragmentScope, "ancient_fragments_earned", ancientRelicFragments, { companionName: valid.companionName, source: "admin_fragment_grant" });
     res.json({ ok: true, training: publicTrainingState(state) });
 });
 
@@ -5611,7 +5727,10 @@ function walletsForProgressionCompanion(serverId, channelId, companion) {
     const wantedUuid = String(companion.uuid || companion.companionUuid || "").trim().toLowerCase();
     const ownerUuid = String(companion.ownerUuid || "").trim().toLowerCase();
     const ownerName = companionOwnerName(companion);
-    if (!wantedName || !wantedUuid) return [];
+    // UUID is preferred, but older/stale companion exports can temporarily miss it.
+    // Name + configured streamer owner is still sufficient because wallets are
+    // already isolated by server + Twitch channel.
+    if (!wantedName) return [];
 
     const matches = [];
     for (const [key, wallet] of Object.entries(wallets || {})) {
@@ -5647,16 +5766,46 @@ function walletsForProgressionCompanion(serverId, channelId, companion) {
 function progressionParticipantsForCompanionUuids(serverId, channelId, companionUuids) {
     const participants = new Map();
     const wanted = new Set((companionUuids || []).map(value => String(value || "").trim().toLowerCase()).filter(Boolean));
-    if (!wanted.size) return participants;
+    const configured = configuredStreamerOwner(serverId, channelId);
+    const configuredOwnerUuid = String(configured.ownerUuid || "").trim().toLowerCase();
+    const configuredOwnerName = normalizeOwnerName(configured.ownerName || "");
+    const companions = Array.isArray(companionsData.companions) ? companionsData.companions : [];
 
-    for (const companion of (Array.isArray(companionsData.companions) ? companionsData.companions : [])) {
-        const cServer = normalizeServerId(companion?.serverId || serverId);
-        const cUuid = String(companion?.uuid || companion?.companionUuid || "").trim().toLowerCase();
-        if (cServer !== serverId || !wanted.has(cUuid)) continue;
+    const addCompanion = companion => {
         for (const participant of walletsForProgressionCompanion(serverId, channelId, companion)) {
             participants.set(participant.viewer, participant);
         }
+    };
+
+    // Primary path: exact Companion UUIDs sent by the mod.
+    if (wanted.size) {
+        for (const companion of companions) {
+            const cServer = normalizeServerId(companion?.serverId || serverId);
+            const cUuid = String(companion?.uuid || companion?.companionUuid || "").trim().toLowerCase();
+            if (cServer !== serverId || !cUuid || !wanted.has(cUuid)) continue;
+            addCompanion(companion);
+        }
     }
+
+    // IMPORTANT fallback: if UUID matching produced zero viewers, use the latest
+    // Companion Codex export's inParty/runningVault flags for THIS streamer.
+    // This is also what keeps mobs/ores/chests progressing when the party UUID
+    // payload and exported companion UUID format disagree.
+    if (participants.size === 0) {
+        for (const companion of companions) {
+            const cServer = normalizeServerId(companion?.serverId || serverId);
+            if (cServer !== serverId) continue;
+            const cOwnerUuid = String(companion?.ownerUuid || "").trim().toLowerCase();
+            const cOwnerName = companionOwnerName(companion);
+            const ownerMatches =
+                (configuredOwnerUuid && cOwnerUuid && configuredOwnerUuid === cOwnerUuid) ||
+                (configuredOwnerName && cOwnerName && configuredOwnerName === cOwnerName);
+            if (!ownerMatches) continue;
+            if (!(companion?.inParty === true || companion?.runningVault === true)) continue;
+            addCompanion(companion);
+        }
+    }
+
     return participants;
 }
 
@@ -5831,7 +5980,9 @@ app.post("/tasks/reward-result", requireApiKey, (req, res) => {
     // from Companion Party membership.
     if (outcome === "correct") recordProgressionMetric(resultScope, "predictions_correct", 1, { companionName });
     if (outcome === "wrong") recordProgressionMetric(resultScope, "predictions_incorrect", 1, { companionName });
-    if (xp > 0) recordProgressionMetric(resultScope, "companion_xp", xp, { companionName });
+    // Companion XP progression is tracked from the authoritative Companion Codex
+    // XP delta on /companions. Do not count this reward payload as well or quest XP
+    // would be double-counted when the exporter syncs the updated companion.
     if (dirt > 0) recordProgressionMetric(resultScope, "dirt_earned", dirt, { companionName });
 
     res.json({ ok: true, viewer, companionName, outcome, xp, dirt });
@@ -6138,7 +6289,25 @@ async function loadProgressionFromSupabase(){
     }catch(error){console.error("[PROGRESSION] Failed loading Supabase progression data.",error);}
 }
 function grantAchievementReward(profile,tier){const reward={common:{dirt:50},rare:{dirt:100,relicFragments:1},epic:{dirt:250,relicFragments:3},omega:{dirt:500,ancientFragments:1}}[tier];grantProgressionReward(profile,reward,`achievement_${tier}`);}
-function grantProgressionReward(profile,reward,reason){const scoped=scopedViewerKey(profile.viewer,profile.channelId,profile.serverId);const wallet=getWalletResolved(scoped,false)||getWallet(scoped);wallet.dirt=Number(wallet.dirt||0)+Number(reward?.dirt||0);wallet.updatedAt=new Date().toISOString();saveWallets();if(reward?.relicFragments||reward?.ancientFragments){const state=getTrainingState(scoped,profile.companionName||"");state.relicFragments=Number(state.relicFragments||0)+Number(reward.relicFragments||0);state.ancientRelicFragments=Number(state.ancientRelicFragments||0)+Number(reward.ancientFragments||0);addTrainingHistory(state,`Progression reward: ${reason}.`);saveTraining();}}
+function grantProgressionReward(profile,reward,reason){
+    const scoped=scopedViewerKey(profile.viewer,profile.channelId,profile.serverId);
+    const wallet=getWalletResolved(scoped,false)||getWallet(scoped);
+    wallet.dirt=Number(wallet.dirt||0)+Number(reward?.dirt||0);
+    wallet.updatedAt=new Date().toISOString();
+    saveWallets();
+    const relicFragments=Math.max(0,Number(reward?.relicFragments||0));
+    const ancientFragments=Math.max(0,Number(reward?.ancientFragments||0));
+    if(relicFragments||ancientFragments){
+        const state=getTrainingState(scoped,profile.companionName||"");
+        state.relicFragments=Number(state.relicFragments||0)+relicFragments;
+        state.ancientRelicFragments=Number(state.ancientRelicFragments||0)+ancientFragments;
+        addTrainingHistory(state,`Progression reward: ${reason}.`);
+        saveTraining();
+        const rewardScope={serverId:profile.serverId,channelId:profile.channelId,viewer:profile.viewer};
+        if(relicFragments>0)recordProgressionMetric(rewardScope,"relic_fragments_earned",relicFragments,{companionName:profile.companionName||"",source:reason});
+        if(ancientFragments>0)recordProgressionMetric(rewardScope,"ancient_fragments_earned",ancientFragments,{companionName:profile.companionName||"",source:reason});
+    }
+}
 async function syncProgressionProfile(p){if(!USE_SUPABASE)return;const base={server_id:p.profile.serverId,channel_id:p.profile.channelId,viewer:p.profile.viewer};await Promise.all([supabaseRequest("/profiles?on_conflict=server_id,channel_id,viewer",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify([{...base,twitch_id:p.profile.viewer,display_name:p.profile.displayName||p.profile.viewer,companion_name:p.profile.companionName||"",selected_title_id:p.profile.selectedTitleId||null,achievement_points:p.profile.achievementPoints||0,profile_created_at:p.profile.profileCreatedAt,updated_at:new Date().toISOString()}])}),supabaseRequest("/profile_statistics?on_conflict=server_id,channel_id,viewer",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify([{...base,statistics:p.stats.statistics||{},companion_statistics:p.stats.companionStatistics||{},current_daily_streak:Number(p.stats.statistics?.current_daily_streak||0),best_daily_streak:Number(p.stats.statistics?.best_daily_streak||0),current_watch_streak:Number(p.stats.statistics?.current_watch_streak||0),best_watch_streak:Number(p.stats.statistics?.best_watch_streak||0),first_activity_at:p.stats.statistics?.first_activity_at||null,last_activity_at:new Date().toISOString(),updated_at:new Date().toISOString()}])})]);}
 async function syncBountyState(s){if(!USE_SUPABASE)return;await supabaseRequest("/bounty_state?on_conflict=server_id,channel_id,viewer,period_type",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify([{server_id:s.serverId,channel_id:s.channelId,viewer:s.viewer,period_type:s.periodType,period_key:s.periodKey,choices:s.choices||[],reroll_count:Number(s.rerollCount||0),selected_bounty_id:s.selectedBountyId||null,selected_bounty:s.selectedBounty||null,progress:s.progress||{},status:s.status,reward_claimed:!!s.rewardClaimed,selected_at:s.selectedAt||null,completed_at:s.completedAt||null,claimed_at:s.claimedAt||null,updated_at:new Date().toISOString()}])});}
 async function archiveBountyState(s){if(!USE_SUPABASE||!s?.selectedBounty)return;const identity=`server_id=eq.${encodeURIComponent(s.serverId)}&channel_id=eq.${encodeURIComponent(s.channelId)}&viewer=eq.${encodeURIComponent(s.viewer)}&period_type=eq.${encodeURIComponent(s.periodType)}&period_key=eq.${encodeURIComponent(s.periodKey)}`;await supabaseRequest(`/bounty_history?${identity}`,{method:"DELETE",headers:{Prefer:"return=minimal"}});await supabaseRequest("/bounty_history",{method:"POST",headers:{Prefer:"return=minimal"},body:JSON.stringify([{server_id:s.serverId,channel_id:s.channelId,viewer:s.viewer,period_type:s.periodType,period_key:s.periodKey,bounty_id:s.selectedBountyId,bounty_data:{...s.selectedBounty,tier:bountyRewardTier(s.periodType,s.selectedBounty)},final_progress:s.progress||{},completed:["completed","claimed"].includes(s.status),reward_claimed:!!s.rewardClaimed,reward_data:s.selectedBounty.reward||{},selected_at:s.selectedAt||null,completed_at:s.completedAt||null,claimed_at:s.claimedAt||null}])});}
@@ -6203,7 +6372,7 @@ app.post("/progression/vault-party",requireApiKey,(req,res)=>{
         progressionVaultSessions.set(key,{sessionId:sessionId||`${Date.now()}-${Math.random().toString(16).slice(2)}`,serverId,channelId,streamerUuid,startedAt:Date.now(),startedCompanionUuids:companionUuids});
         progressionVaultParticipants.set(key,participants);
         for(const scope of participants.values()) recordProgressionMetric(scope,"vaults_joined",1,{companionName:scope.companionName});
-        console.log(`[PROGRESSION] Vault started ${key}; companion participants=${participants.size}.`);
+        console.log(`[PROGRESSION] Vault started ${key}; companion UUIDs=${companionUuids.length}, resolved viewers=${participants.size}.`);
         return res.json({ok:true,event:"start",sessionId:progressionVaultSessions.get(key).sessionId,participants:participants.size,companionUuids});
     }
 
@@ -6242,7 +6411,7 @@ app.post("/progression/vault-party",requireApiKey,(req,res)=>{
 
         progressionVaultSessions.delete(key);
         progressionVaultParticipants.delete(key);
-        console.log(`[PROGRESSION] Vault completed ${key}; credited ${completed} companion participant(s).`);
+        console.log(`[PROGRESSION] Vault completed ${key}; companion UUIDs=${companionUuids.length}, credited viewers=${completed}.`);
         return res.json({ok:true,event:"complete",participants:completed,companionUuids,predictionsCredited});
     }
 
