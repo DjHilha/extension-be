@@ -1181,12 +1181,69 @@ function publicWatchState(watcher) {
 }
 
 
+function recoverExistingWalletForScopedKey(key) {
+    const requested = parseScopedViewerKey(key);
+    if (!requested.channelId || !requested.viewerId) return null;
+
+    const requestedViewer = normalizeViewer(requested.viewerId);
+    const requestedChannel = normalizeChannelId(requested.channelId);
+    let best = null;
+    let bestScore = -1;
+
+    for (const [candidateKey, candidate] of Object.entries(wallets || {})) {
+        if (!candidate || normalizeViewer(candidateKey) === normalizeViewer(key)) continue;
+
+        const parsed = parseScopedViewerKey(candidate.viewer || candidateKey);
+        const candidateViewer = normalizeViewer(parsed.viewerId || candidate.twitchId || candidate.viewer || candidateKey);
+        const candidateTwitch = normalizeViewer(candidate.twitchId || "");
+        if (candidateViewer !== requestedViewer && candidateTwitch !== requestedViewer) continue;
+
+        const candidateChannel = normalizeChannelId(parsed.channelId || candidate.channelId || "");
+
+        // Wallets are channel-specific. Never steal/copy Dirt from another streamer's channel.
+        if (candidateChannel && candidateChannel !== requestedChannel) continue;
+
+        // Same channel is authoritative even if the server/season id changed.
+        // Legacy unscoped wallets are the fallback for pre-channel-scoping data.
+        let score = candidateChannel === requestedChannel ? 100 : 50;
+        if (String(candidate.twitchId || "").trim()) score += 10;
+        if (String(candidate.companionName || "").trim()) score += 5;
+        if (Number(candidate.dirt || 0) > 0) score += 1;
+
+        if (score > bestScore) {
+            best = candidate;
+            bestScore = score;
+        }
+    }
+
+    if (!best) return null;
+
+    const recovered = {
+        ...best,
+        viewer: key,
+        dirt: Number(best.dirt || 0),
+        twitchId: String(best.twitchId || requestedViewer || ""),
+        displayName: String(best.displayName || requestedViewer || key),
+        companionName: String(best.companionName || ""),
+        manualAlias: !!best.manualAlias,
+        updatedAt: new Date().toISOString()
+    };
+
+    console.log(`[WALLET] Recovered existing wallet for ${key} instead of creating a 0-Dirt wallet (Dirt=${recovered.dirt}).`);
+    return recovered;
+}
+
 function getWallet(viewer) {
     const key = normalizeViewer(viewer);
     if (!key) return null;
 
     if (!wallets[key]) {
-        wallets[key] = {
+        // IMPORTANT: extension identity runs on every load. A new scoped key must
+        // recover the viewer's existing wallet for THIS Twitch channel instead of
+        // silently creating a fresh 0-Dirt wallet. This also survives server/season
+        // id changes while keeping DjHilha / HalosiaPaage wallets separate.
+        const recovered = recoverExistingWalletForScopedKey(key);
+        wallets[key] = recovered || {
             viewer: key,
             dirt: 0,
             twitchId: "",
