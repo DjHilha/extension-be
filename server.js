@@ -6247,18 +6247,26 @@ function seasonStatsKey(scope,seasonKey=monthlySeasonKey()){return `${progressio
 function configuredSeasonName(serverId){
     const id = normalizeServerId(serverId);
 
-    if (activeLeaderboardSeasons.has(id)) {
-        return String(activeLeaderboardSeasons.get(id));
-    }
-
+    // streamer_channels.json is the source of truth for the CURRENT server/season.
+    // Never let a stale leaderboard_season_config row (for example Meowtys S4)
+    // override the configured S5 name after a fresh-season reset.
     const configuredName = String(streamerChannels?.servers?.[id]?.name || "").trim();
     if (configuredName) {
         return configuredName;
     }
 
-    return id
-        .replace(/^meowtys_s/i, "Meowtys S")
-        .replace(/_/g, " ");
+    // If the config has no display name, derive the normal Meowtys season label
+    // directly from the server id before considering legacy persisted state.
+    const match = id.match(/^meowtys_s(\d+)$/i);
+    if (match) {
+        return `Meowtys S${match[1]}`;
+    }
+
+    if (activeLeaderboardSeasons.has(id)) {
+        return String(activeLeaderboardSeasons.get(id));
+    }
+
+    return id.replace(/_/g, " ");
 }
 function recordSeasonMetric(scope,metric,amount){let result=null;for(const seasonKey of [monthlySeasonKey(),`season:${configuredSeasonName(scope.serverId)}`]){const key=seasonStatsKey(scope,seasonKey);if(!progressionSeasonStats.has(key))progressionSeasonStats.set(key,{...scope,seasonKey,statistics:{},updatedAt:new Date().toISOString()});const state=progressionSeasonStats.get(key);state.statistics[metric]=Math.max(0,Number(state.statistics[metric]||0)+Number(amount||0));state.updatedAt=new Date().toISOString();syncSeasonStats(state).catch(()=>{});result=state;}return result;}
 function weeklyPeriodKey() {
