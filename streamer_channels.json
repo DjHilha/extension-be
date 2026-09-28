@@ -1,7 +1,7 @@
 {
   "servers": {
     "meowtys_s3": {
-      "enabled": true,
+      "enabled": false,
       "name": "Meowtys S3",
       "uuid": "",
       "channels": [
@@ -12,10 +12,6 @@
         {
           "id": "133543020",
           "name": "HalosiaPaage"
-        },
-        {
-          "id": "809292746",
-          "name": "Mistrleo"
         }
       ],
       "owners": [
@@ -28,16 +24,11 @@
           "id": "133543020",
           "ingameName": "HalosiaPaage",
           "minecraftUuid": "bc5cd9bb-0fc5-4bbe-b6a1-b7e73ea7b608"
-        },
-        {
-          "id": "809292746",
-          "ingameName": "Mistrleo",
-          "minecraftUuid": "5b8a2042-139a-4f14-8d1a-51f727ab74da"
         }
       ]
     },
     "meowtys_s4": {
-      "enabled": true,
+      "enabled": false,
       "name": "Meowtys S4",
       "uuid": "",
       "channels": [
@@ -52,10 +43,6 @@
         {
           "id": "137872876",
           "name": "rhaw_g"
-        },
-        {
-          "id": "809292746",
-          "name": "Mistrleo"
         }
       ],
       "owners": [
@@ -73,11 +60,42 @@
           "id": "137872876",
           "ingameName": "Rhaw_G",
           "minecraftUuid": "850312d2-a8d4-426c-b964-cef26e27a0e2"
+        }
+      ]
+    },
+    "meowtys_s5": {
+      "enabled": true,
+      "name": "Meowtys S5",
+      "uuid": "",
+      "channels": [
+        {
+          "id": "145555184",
+          "name": "DjHilha"
         },
         {
-          "id": "809292746",
-          "ingameName": "Mistrleo",
-          "minecraftUuid": "5b8a2042-139a-4f14-8d1a-51f727ab74da"
+          "id": "133543020",
+          "name": "HalosiaPaage"
+        },
+        {
+          "id": "137872876",
+          "name": "rhaw_g"
+        }
+      ],
+      "owners": [
+        {
+          "id": "145555184",
+          "ingameName": "Hilha",
+          "minecraftUuid": "4c48aee5-182a-4645-a0dd-ebb021df99ef"
+        },
+        {
+          "id": "133543020",
+          "ingameName": "HalosiaPaage",
+          "minecraftUuid": "bc5cd9bb-0fc5-4bbe-b6a1-b7e73ea7b608"
+        },
+        {
+          "id": "137872876",
+          "ingameName": "Rhaw_G",
+          "minecraftUuid": "850312d2-a8d4-426c-b964-cef26e27a0e2"
         }
       ]
     }
