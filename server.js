@@ -6244,7 +6244,22 @@ function parisDateParts(date = new Date()) {
 function dailyPeriodKey() { const p=parisDateParts(); return `${p.year}-${p.month}-${p.day}`; }
 function monthlySeasonKey(){const p=parisDateParts();return `${p.year}-${p.month}`;}
 function seasonStatsKey(scope,seasonKey=monthlySeasonKey()){return `${progressionKey(scope.serverId,scope.channelId,scope.viewer)}::${seasonKey}`;}
-function configuredSeasonName(serverId){const id=normalizeServerId(serverId);return String(activeLeaderboardSeasons.get(id)||"Meowtys S4");}
+function configuredSeasonName(serverId){
+    const id = normalizeServerId(serverId);
+
+    if (activeLeaderboardSeasons.has(id)) {
+        return String(activeLeaderboardSeasons.get(id));
+    }
+
+    const configuredName = String(streamerChannels?.servers?.[id]?.name || "").trim();
+    if (configuredName) {
+        return configuredName;
+    }
+
+    return id
+        .replace(/^meowtys_s/i, "Meowtys S")
+        .replace(/_/g, " ");
+}
 function recordSeasonMetric(scope,metric,amount){let result=null;for(const seasonKey of [monthlySeasonKey(),`season:${configuredSeasonName(scope.serverId)}`]){const key=seasonStatsKey(scope,seasonKey);if(!progressionSeasonStats.has(key))progressionSeasonStats.set(key,{...scope,seasonKey,statistics:{},updatedAt:new Date().toISOString()});const state=progressionSeasonStats.get(key);state.statistics[metric]=Math.max(0,Number(state.statistics[metric]||0)+Number(amount||0));state.updatedAt=new Date().toISOString();syncSeasonStats(state).catch(()=>{});result=state;}return result;}
 function weeklyPeriodKey() {
     const p=parisDateParts(); const d=new Date(`${p.year}-${p.month}-${p.day}T12:00:00Z`); const day=(d.getUTCDay()+6)%7; d.setUTCDate(d.getUTCDate()-day);
