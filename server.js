@@ -2974,6 +2974,29 @@ app.post("/wallet/add", requireApiKey, (req, res) => {
         wallet = getWalletResolved(requestedViewer, false);
     }
 
+    // On a brand-new season, allow a configured broadcaster to initialize
+    // ONLY their own Twitch wallet via the authenticated mod API.
+    // Never create arbitrary viewer wallets or cross-channel wallets here.
+    if (!wallet && requestedChannel && channelResolution?.matchedBy === "not_found") {
+        const sid = channelResolution.serverId;
+        const cid = channelResolution.channelId;
+        const config = streamerChannels?.servers?.[sid];
+        const broadcasterName = String(config?.channels?.[cid] || "").trim();
+        const broadcasterId = normalizeViewer(cid);
+        const requested = normalizeViewer(requestedViewer);
+        if (config?.enabled !== false && broadcasterName &&
+            (requested === broadcasterId || requested === normalizeViewer(broadcasterName))) {
+            const key = scopedViewerKey(broadcasterId, cid, sid);
+            wallet = getWallet(key);
+            wallet.twitchId = broadcasterId;
+            wallet.displayName = broadcasterName;
+            wallet.updatedAt = new Date().toISOString();
+            saveWallets();
+            channelResolution = { ...channelResolution, key, matchedBy: "initialized_broadcaster_wallet" };
+            console.log(`[WALLET] Initialized broadcaster wallet ${key} for S5 admin Dirt award.`);
+        }
+    }
+
     if (!wallet) {
         return res.status(404).json({
             ok: false,
