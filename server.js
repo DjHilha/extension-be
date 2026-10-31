@@ -780,13 +780,49 @@ async function syncAllWalletsToSupabase() {
         return;
     }
 
-    const rows = Object.values(wallets)
-        .filter(wallet => {
-            return String(wallet.twitchId || "").trim()
-                || String(wallet.companionName || "").trim()
-                || /^\d+$/.test(String(wallet.viewer || ""));
+    const localWallets = Object.values(wallets).filter(wallet => {
+        return String(wallet.twitchId || "").trim()
+            || String(wallet.companionName || "").trim()
+            || /^\d+$/.test(String(wallet.viewer || ""));
+    });
+
+    if (localWallets.length === 0) {
+        return;
+    }
+
+    // Supabase is authoritative for display_name. A Render process can have an
+    // older wallet object in memory (for example, before an admin edits a name
+    // directly in Supabase). Read the current names immediately before upserting
+    // so a Dirt/companion save cannot restore that stale name.
+    const existingRows = await supabaseRequest(
+        "/wallets?select=server_id,channel_id,viewer,display_name",
+        { method: "GET" }
+    );
+    const displayNamesByWallet = new Map();
+
+    if (Array.isArray(existingRows)) {
+        for (const row of existingRows) {
+            const key = `${normalizeServerId(row.server_id)}::${normalizeChannelId(row.channel_id)}::${normalizeViewer(row.viewer)}`;
+            const name = safeDisplayName(row.display_name, "");
+            if (name) displayNamesByWallet.set(key, name);
+        }
+    }
+
+    const rows = localWallets
+        .map(wallet => {
+            const row = walletToSupabaseRow(wallet);
+            const key = `${row.server_id}::${row.channel_id}::${row.viewer}`;
+            const authoritativeName = displayNamesByWallet.get(key);
+
+            if (authoritativeName) {
+                // Keep the in-memory cache aligned too, preventing later saves
+                // from carrying an obsolete display name.
+                wallet.displayName = authoritativeName;
+                row.display_name = authoritativeName;
+            }
+
+            return row;
         })
-        .map(walletToSupabaseRow)
         .filter(row => isAllowedChannelId(row.channel_id, row.server_id));
 
     if (rows.length === 0) {
@@ -801,7 +837,7 @@ async function syncAllWalletsToSupabase() {
         body: JSON.stringify(rows)
     });
 
-    console.log(`[SUPABASE] Synced ${rows.length} wallet(s).`);
+    console.log(`[SUPABASE] Synced ${rows.length} wallet(s) (preserving Supabase display names).`);
 }
 
 async function syncViewerLinkToSupabase(wallet) {
