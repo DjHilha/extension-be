@@ -800,6 +800,9 @@ async function syncAllWalletsToSupabase() {
     );
     const displayNamesByWallet = new Map();
 
+    if (!Array.isArray(existingRows)) {
+        throw new Error("Cannot sync wallets: failed to read existing Supabase rows.");
+    }
     if (Array.isArray(existingRows)) {
         for (const row of existingRows) {
             const key = `${normalizeServerId(row.server_id)}::${normalizeChannelId(row.channel_id)}::${normalizeViewer(row.viewer)}`;
@@ -856,12 +859,20 @@ async function loadWalletsFromSupabase() {
     }
 
     try {
-        const rows = await supabaseRequest("/wallets?select=*", {
-            method: "GET"
-        });
+        const rows = [];
+        const pageSize = 500;
+        for (let offset = 0; ; offset += pageSize) {
+            const page = await supabaseRequest("/wallets?select=*&order=server_id.asc,channel_id.asc,viewer.asc", {
+                method: "GET",
+                headers: { Range: `${offset}-${offset + pageSize - 1}` }
+            });
+            if (!Array.isArray(page)) throw new Error("Invalid wallet page returned by Supabase.");
+            rows.push(...page);
+            if (page.length < pageSize) break;
+        }
 
         if (!Array.isArray(rows)) {
-            return;
+            throw new Error("Supabase returned an invalid wallets response.");
         }
 
         for (const row of rows) {
@@ -884,12 +895,12 @@ async function loadWalletsFromSupabase() {
         }
 
         writeJsonFile(WALLETS_FILE, wallets);
-        syncWalletsToSupabaseSoon();
-
+        // Loading is read-only. Never upsert the whole cache on startup.
         console.log(`[SUPABASE] Loaded ${rows.length} wallet(s).`);
 
     } catch (error) {
-        console.error("[SUPABASE] Failed loading wallets. Falling back to local JSON.", error);
+        console.error("[SUPABASE] Failed loading wallets; refusing unsafe startup.", error);
+        throw error;
     }
 }
 
@@ -6641,14 +6652,14 @@ process.on("unhandledRejection", error => {
     console.error("[FATAL] Unhandled rejection:", error);
 });
 
-app.listen(PORT, () => {
-    console.log(`Meowtys backend running on port ${PORT}`);
-
-    loadPersistentData()
-        .then(() => {
-            console.log("[DATA] Startup data loaded.");
-        })
-        .catch(error => {
-            console.error("[DATA] Failed during startup. Server will keep running with fallback data.", error);
-        });
-});
+// Fail closed: never serve fresh 0-Dirt wallets when Supabase is unavailable.
+(async function startBackend() {
+    try {
+        await loadPersistentData();
+        console.log("[DATA] Startup data loaded.");
+        app.listen(PORT, () => console.log(`Meowtys backend running on port ${PORT}`));
+    } catch (error) {
+        console.error("[FATAL] Wallet data could not be restored; refusing to start to protect balances.", error);
+        process.exitCode = 1;
+    }
+})();
