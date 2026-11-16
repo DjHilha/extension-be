@@ -3044,6 +3044,48 @@ app.post("/wallet/add", requireApiKey, (req, res) => {
         }
     }
 
+    // Channel-point redemptions can arrive before a viewer opens the extension
+    // on a newly added broadcaster's channel. Resolve their *identity* from
+    // existing wallets, but never transfer Dirt or companion links across channels.
+    if (!wallet && requestedChannel && channelResolution?.matchedBy === "not_found") {
+        const sid = channelResolution.serverId;
+        const cid = channelResolution.channelId;
+        const config = streamerChannels?.servers?.[sid];
+        if (config?.enabled !== false && Object.prototype.hasOwnProperty.call(config?.channels || {}, cid)) {
+            const wanted = normalizeViewer(requestedViewer);
+            const identities = new Map();
+            const addIdentity = (id, name) => {
+                const cleanId = normalizeViewer(id);
+                if (!/^\d+$/.test(cleanId)) return;
+                if (!identities.has(cleanId)) identities.set(cleanId, safeDisplayName(name, ""));
+            };
+            if (/^\d+$/.test(wanted)) addIdentity(wanted, "");
+            for (const [id, name] of Object.entries(config.channels)) {
+                if (normalizeViewer(name) === wanted || normalizeViewer(id) === wanted) addIdentity(id, name);
+            }
+            for (const existing of Object.values(wallets)) {
+                const parsed = parseScopedViewerKey(existing?.viewer || "");
+                const id = normalizeViewer(existing?.twitchId || parsed.viewerId || "");
+                if (normalizeViewer(existing?.displayName) === wanted || id === wanted) {
+                    addIdentity(id, existing.displayName);
+                }
+            }
+            if (identities.size === 1) {
+                const [id, name] = [...identities.entries()][0];
+                const key = scopedViewerKey(id, cid, sid);
+                wallet = getWallet(key);
+                wallet.twitchId = id;
+                wallet.displayName = name || safeDisplayName(requestedViewer, id) || id;
+                wallet.updatedAt = new Date().toISOString();
+                saveWallets();
+                channelResolution = { ...channelResolution, key, matchedBy: "initialized_verified_twitch_identity" };
+                console.log(`[WALLET] Initialized channel-specific wallet ${key} for redemption.`);
+            } else {
+                console.warn(`[WALLET] Cannot initialize redemption wallet: identity ${wanted} has ${identities.size} verified Twitch ID matches.`);
+            }
+        }
+    }
+
     if (!wallet) {
         return res.status(404).json({
             ok: false,
